@@ -1,0 +1,10 @@
+# Rust build output — the only thing a build writes into the tree. The grammar
+# cache is not here: it goes to $XDG_DATA_HOME/agent/grammars, and the
+# conversation log to ~/.config/agent/ by default.
+/target
+
+# Editor and OS noise.
+*~
+*.swp
+*.swo
+.DS_Store

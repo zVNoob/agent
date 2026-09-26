@@ -1,0 +1,36 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+async-stream = "0.3"
+libc = "0.2"
+anyhow = "1"
+ratatui = "0.30.2"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+
+# Runtime grammar acquisition (see `src/grammars.rs`): the tree-sitter core is
+# a cargo dep, but grammar *code* is never — it is fetched from the registry,
+# compiled with the system C compiler, and dlopen'd at runtime.
+tree-sitter = "0.26"
+tree-sitter-language = "0.1"
+tree-sitter-highlight = "0.26"
+libloading = "0.8"
+flate2 = "1"
+tar = "0.4"
+
+# Lua policy substrate (see `src/seccomp.rs` module docs): the sandbox is
+# exposed to Lua *only*; LuaJIT is embedded via mlua. `vendored` compiles
+# LuaJIT from source (the C compiler and `make` grammar acquisition already
+# require), so no system LuaJIT install is needed.
+mlua = { version = "0.12", features = ["luajit", "vendored"] }
+
+[[bin]]
+name = "test_trace"
+path = "src/test_trace.rs"

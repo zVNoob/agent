@@ -1,0 +1,52 @@
+-- mcps.lua — every shipped MCP connection, as one registry.
+--
+--   agent.mcps = require("mcps")            -- the whole shipped tool set
+--   agent.mode.new("mine", {                -- …or as a mode's tool set
+--     mcps = require("mcps"),
+--     system_prompt = [[…]],
+--   })
+--
+-- ## What a connection is
+--
+-- A connection is a table of tools, `{ name = "...", tools = { … } }`, and it is
+-- the only place a tool can come from — there are no built-ins, and the shell is
+-- a connection like any other. `agent.mcps` is a *registry* of them, keyed by
+-- name, and Rust reindexes that table per request, so what is in it is what the
+-- model is offered on the very next turn.
+--
+-- So this module is a registry, not a tool: `require("mcps").fs` is the whole
+-- file-tool connection, and `require("mcps").bash` the whole shell.
+--
+--   fs     `lua/fs.lua`       read_file, list_dir, write_file, apply_patch.
+--                            Each asks before it touches anything, and "always"
+--                            remembers the path (see `lua/lib/ask.lua`). The
+--                            working directory is trusted by `lua/init.lua`, so
+--                            work inside this repository asks for nothing.
+--   bash   `lua/bash_tool.lua`  a shell, under the default policy in `lua/policy.lua`:
+--                            every file it opens and every endpoint it reaches
+--                            is asked about first, with the working directory
+--                            trusted. Seccomp-filtered, not namespaced.
+--
+-- ## The plural is load-bearing
+--
+-- `require("mcps")`, not `require("mcp")`. `lua/lib/mcp.lua` is the *client* —
+-- `agent.mcp(name, func)`, which opens a connection to an MCP server you run
+-- elsewhere — and `lib/` comes first on `package.path`, so a root `mcp.lua`
+-- would be shadowed by it: the file would sit there unreachable and
+-- `require("mcp")` would hand you the client instead, silently. The plural also
+-- describes what comes back: several connections keyed by name, the shape
+-- `agent.mcps` holds. The client keeps the singular.
+--
+-- ## When to use this, and when to use "all"
+--
+-- This is the *shipped* set, by name. A connection you register yourself is not
+-- in here, and one registered later is not either. If what you want is "whatever
+-- this session has", say so with `mcps = "all"` instead (see `lua/lib/mode.lua`):
+-- it is read at switch time, so it cannot go stale against a config that adds a
+-- tool after this module was written. Use this module when you want exactly
+-- these two, and can say so.
+
+return {
+  fs = require("fs"),
+  bash = require("bash_tool"),
+}

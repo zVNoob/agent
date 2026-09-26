@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/LuaLS/lua.github.io/master/schema/settings.json",
+  "runtime": {
+    "path": [
+      "lua/lib/?.lua",
+      "lua/lib/?/init.lua",
+      "lua/?.lua",
+      "lua/?/init.lua",
+      "?.lua",
+      "?/init.lua"
+    ],
+    "metaFiles": [
+      "lua/agent_api.meta.lua"
+    ]
+  },
+  "diagnostics": {
+    "globals": [
+      "agent"
+    ],
+    "disable": [
+      "duplicate-set-field"
+    ]
+  },
+  "workspace": {
+    "checkThirdParty": false,
+    "ignoreDir": [
+      "target",
+      ".git"
+    ],
+    "library": []
+  }
+}

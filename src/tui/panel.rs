@@ -1,0 +1,2691 @@
+//! The turn panel: one distinct component owning the conversation and how it
+//! renders.
+//!
+//! Each message body is highlighted as markdown when grammars are loaded
+//! (see [`super::highlight`]): at push time the body is parsed with the
+//! runtime-loaded markdown grammar (fenced bash/json and inline formatting
+//! injected), producing styled byte segments — and the concealed marker
+//! ranges — cached on the [`Message`]. Three rendering pipelines consume
+//! them: the original [`TurnPanel::build_lines`] (clips/wraps the segments
+//! against the raw text, untouched), the dedicated [`ChatRenderer`], which
+//! when markup conceal is on renders the *display* text (markers hidden)
+//! with the same styles, and the [`BorderedRenderer`], a composition
+//! "subclass" of the base path that frames opted-in messages in a titled
+//! border for tool-call visuals (raw text inside, never concealed) and
+//! collapses on click. Layout (tag, continuation indent, row heights) is
+//! identical across pipelines — without a highlighter messages render plain.
+//!
+//! The component is deliberately dumb about its environment: it renders into
+//! whatever [`Rect`] it is given, owns its own scroll state, and knows nothing
+//! about keys — the shell decides when scrolling happens and calls
+//! [`TurnPanel::scroll_up`] & co.
+//!
+//! The transcript keeps every message in memory (from the start of the session
+//! up to compaction, which replaces history with a shorter summary) — but it
+//! *renders* only the visible window. Each message caches its wrapped row
+//! count ([`Message::rows`], invalidated when its text or box state changes,
+//! or wholesale on a resize / conceal toggle), so scrolling, the scrollbar,
+//! and the viewport are O(retained) integer arithmetic per frame, and the
+//! only wrapping done per frame touches the messages actually on screen.
+//! Tens of thousands of archived lines therefore cost no more per frame than a
+//! few dozen; everything older stays safe in the append-only conversation log
+//! (`crate::memory`) regardless.
+
+use std::collections::HashMap;
+
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+
+use super::highlight::{MarkdownHighlighter, Segment, style_for_spec};
+use super::wrap_lines;
+use crate::panels::PanelOp;
+
+/// Cols reserved for the role tag (e.g. `assistant `) at the start of a
+/// message's first row. Continuation rows are indented by the same amount.
+const TAG_COLS: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+impl Role {
+    fn tag(&self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        }
+    }
+
+    fn style(&self) -> Style {
+        match self {
+            Role::User => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            Role::Assistant => Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Message {
+    pub role: Role,
+    pub text: String,
+    /// Styled byte ranges covering `text` (empty = plain). Calculated once at
+    /// push time by the panel's highlighter, so per-frame rendering only
+    /// clips and wraps them.
+    pub(crate) segs: Vec<Segment>,
+    /// Lua panel regions ([`crate::panels::PanelOp::Highlight`]) — user-set
+    /// styled byte ranges merged into `segs` after every markdown
+    /// re-highlight, so they survive appends. Sorted by start; empty for
+    /// plain messages and for Lua-unused messages.
+    pub(crate) user_segs: Vec<Segment>,
+    /// Source byte ranges hidden from the rendered output — ATX heading `#`
+    /// markers, inline delimiter runs, and fence `` ``` `` delimiters
+    /// (see [`ChatRenderer`]). Sorted and disjoint; empty for plain messages
+    /// and when no highlighter is installed.
+    pub(crate) conceal: Vec<(usize, usize)>,
+    /// When set, the message renders inside a bordered "tool-call" box titled
+    /// with the value (e.g. the tool name) — unless the title is a borderless
+    /// block (`"reasoning"`/`"response"`, see [`is_borderless_box`]), which
+    /// renders like a plain message without a frame. Any role may be boxed; a
+    /// framed box uses the original (non-conceal) base rendering, so markers
+    /// stay visible inside it.
+    pub(crate) boxed: Option<String>,
+    /// Declared highlighting language (e.g. `"json"`): when set, the
+    /// highlighter runs that grammar *directly* on `text` instead of the
+    /// markdown pipeline (see [`PanelOp::SetLang`]). `None` = markdown, the
+    /// default for every message.
+    pub(crate) lang: Option<String>,
+    /// When `boxed` is set, whether the box's *content* follows the markup-
+    /// conceal toggle like plain messages (the reasoning/response blocks) —
+    /// `false` for tool-call boxes, whose raw content must keep markers
+    /// visible no matter the toggle. Borderless blocks always follow the
+    /// toggle (they render through the plain-message path).
+    pub(crate) conceal_box: bool,
+    /// Display state: a boxed message collapsed to just its title and bottom
+    /// border rows. Toggled by clicking the box (see [`TurnPanel::handle_click`]).
+    pub(crate) collapsed: bool,
+    /// When set, a boxed message draws a user-permission overlay at the bottom
+    /// *inside* its box: a compact framed panel with the ask description and
+    /// an allow/deny key prompt. Set and cleared via [`PanelOp::Overlay`];
+    /// only boxed messages render it (see [`overlay_rows`]).
+    pub(crate) overlay: Option<String>,
+    /// When set, the message is a *split* panel ([`PanelOp::Split`]): the box
+    /// renders `panes` as framed sub-regions — side-by-side columns when the
+    /// width allows, stacked below a rule when it doesn't — instead of one
+    /// body. `text`/`segs`/`lang`/`conceal` are unused (each pane carries its
+    /// own). Always boxed; collapse/overlay work as on any boxed message.
+    pub(crate) panes: Option<Vec<PaneContent>>,
+    /// Cached wrapped row count for the panel's current (width, conceal)
+    /// view ([`TurnPanel::ensure_measured`]). Only meaningful while the
+    /// panel's `measure_w`/`measure_conceal` match; invalidated wholesale on a
+    /// resize or conceal toggle, or per-message by setting `dirty`.
+    pub(crate) rows: usize,
+    /// The message gained text, box state, panes, or an overlay since its
+    /// `rows` was measured. Cleared by [`TurnPanel::ensure_measured`]; also
+    /// set by the toggle paths (conceal, collapse) so the whole cache stays
+    /// cheap to refresh — the transcript keeps every message in memory (up to
+    /// the compaction point or the start of the session) and only *renders*
+    /// the visible window, so this stale flag is what keeps per-frame work
+    /// O(viewport) instead of O(retained).
+    pub(crate) dirty: bool,
+}
+
+/// The dedicated chat renderer. With markup conceal enabled (the default) it
+/// renders each message's *display* text (the message minus its concealed
+/// marker ranges) with the cached [`Segment`] styles, so `# Plan` shows as
+/// `Plan` and `` `code` `` as `code`. The original segment path
+/// ([`TurnPanel::build_lines`]) is untouched and handles the off state, so
+/// the toggle switches between two independent pipelines.
+#[derive(Debug)]
+pub struct ChatRenderer {
+    conceal: bool,
+}
+
+impl Default for ChatRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ChatRenderer {
+    pub fn new() -> Self {
+        Self { conceal: true } // markup conceal is on by default
+    }
+
+    pub fn set_conceal(&mut self, on: bool) {
+        self.conceal = on;
+    }
+
+    pub fn conceal_enabled(&self) -> bool {
+        self.conceal
+    }
+
+    /// Turn every message into styled, wrapped rows with markers concealed.
+    /// Messages without conceal ranges render exactly as the original path
+    /// ([`wrap_segments`]) — same bytes, same boundaries; concealed messages
+    /// wrap on the display text with boundaries mapped through the conceal
+    /// map, matching [`message_rows`] with conceal enabled so heights agree.
+    pub fn lines(&self, messages: &[Message], content_w: usize) -> Vec<Line<'static>> {
+        let text_w = content_w.saturating_sub(TAG_COLS + 1);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for msg in messages {
+            lines.extend(message_lines(msg, text_w, self.conceal));
+        }
+        if lines.is_empty() {
+            lines.push(Line::raw("(no messages yet)"));
+        }
+        lines
+    }
+}
+
+/// Whether `msg` is a *borderless* streamed block — the "reasoning" and
+/// "response" blocks the agent loop streams via
+/// [`TurnPanel::stream_append_boxed`]. They render (and measure) like plain
+/// messages: no frame, no click-to-collapse — and the reasoning one is
+/// dimmed so the model's thinking reads quieter than the answer. Tool-call
+/// boxes and Lua panels keep their borders.
+fn is_borderless_box(msg: &Message) -> bool {
+    msg.boxed
+        .as_deref()
+        .is_some_and(|t| matches!(t, "reasoning" | "response"))
+}
+
+/// Lay [`Modifier::DIM`] onto every span of `lines` (the reasoning block's
+/// "darker than normal" look): each span keeps its own style — role tag,
+/// highlight colors, bold — with DIM layered on top.
+fn dim_spans(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|mut line| {
+            for span in &mut line.spans {
+                span.style = span.style.add_modifier(Modifier::DIM);
+            }
+            line
+        })
+        .collect()
+}
+
+/// A composition "subclass" of the chat renderer's *base* path: messages
+/// that opted into a box [`Message::boxed`] are framed in a bordered title
+/// bar (`┌─ tool −…─┐` … `└─…─┘`) for tool-call visuals — except the
+/// borderless "reasoning"/"response" blocks (see [`is_borderless_box`]),
+/// which render as plain messages (reasoning dimmed). Inside a framed box
+/// the original non-conceal segment path renders the raw text — markup
+/// markers stay visible no matter the conceal toggle, exactly like the base
+/// renderer, *unless* the message's [`Message::conceal_box`] opts its
+/// content into the conceal path. Clicking a framed box toggles its collapse
+/// (see [`TurnPanel::handle_click`]).
+#[derive(Debug, Default)]
+pub struct BorderedRenderer;
+
+impl BorderedRenderer {
+    /// Rows for a whole transcript: bordered `boxed` messages are framed,
+    /// borderless ones (reasoning/response) and the rest render per the
+    /// `conceal` toggle (same rows as the pipeline the toggle would normally
+    /// pick). Boxed rows use the base path unless the message opts in via
+    /// `conceal_box`.
+    pub fn lines(messages: &[Message], content_w: usize, conceal: bool) -> Vec<Line<'static>> {
+        let text_w = content_w.saturating_sub(TAG_COLS + 1);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for msg in messages {
+            if msg.boxed.is_some() {
+                if is_borderless_box(msg) {
+                    let mut rows = message_lines(msg, text_w, conceal);
+                    if msg.boxed.as_deref() == Some("reasoning") {
+                        rows = dim_spans(rows);
+                    }
+                    lines.extend(rows);
+                } else {
+                    lines.extend(boxed_lines(msg, content_w, conceal));
+                }
+            } else {
+                lines.extend(message_lines(msg, text_w, conceal));
+            }
+        }
+        if lines.is_empty() {
+            lines.push(Line::raw("(no messages yet)"));
+        }
+        lines
+    }
+}
+
+/// The conversation component: the message list plus its viewport state.
+/// `scroll` is the row offset of the visible top within the rendered content;
+/// `follow` means "stick to the bottom" (new messages keep the view pinned).
+/// Follow starts on: a fresh panel has nothing to scroll and should show its
+/// first messages immediately.
+pub struct TurnPanel {
+    pub messages: Vec<Message>,
+    /// Implementation detail (row offset of the rendered content's top);
+    /// `pub(crate)` only so the shell's tests can assert on it.
+    pub(crate) scroll: usize,
+    pub(crate) follow: bool,
+    /// Markdown highlighter, when the grammars loaded. Without it (or on
+    /// highlighting errors) messages render as plain text.
+    highlighter: Option<MarkdownHighlighter>,
+    /// The dedicated chat renderer (owns the markup-conceal toggle).
+    renderer: ChatRenderer,
+    /// The (width, conceal) pair every [`Message::rows`] value was measured
+    /// for. A resize or conceal toggle makes the whole cache stale at once;
+    /// `ensure_measured` then re-measures every message once.
+    measure_w: usize,
+    measure_conceal: bool,
+    /// Lua panels (`agent.api.panel_*`): op id -> the panel's creation options
+    /// and, once materialized, its message's index in `messages`. Ops for
+    /// unknown ids are ignored.
+    panels: HashMap<u64, PanelRecord>,
+}
+
+/// Creation options + materialized state of one Lua panel ([`PanelOp`]).
+struct PanelRecord {
+    title: String,
+    boxed: bool,
+    conceal_box: bool,
+    /// Index into `messages` once the panel got its first content.
+    msg_index: Option<usize>,
+}
+
+/// One region of a split panel message: its caption plus the same per-message
+/// highlight state as [`Message`] — declared language, cached segments, and
+/// user regions — so each pane runs its own grammar (e.g. `rust` on both the
+/// "before" and "after" side of a patch).
+#[derive(Debug)]
+pub(crate) struct PaneContent {
+    pub(crate) caption: String,
+    pub(crate) text: String,
+    pub(crate) lang: Option<String>,
+    pub(crate) segs: Vec<Segment>,
+    pub(crate) user_segs: Vec<Segment>,
+}
+
+impl std::fmt::Debug for TurnPanel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnPanel")
+            .field("messages", &self.messages)
+            .field("scroll", &self.scroll)
+            .field("follow", &self.follow)
+            .field("highlighter", &self.highlighter.is_some())
+            .field("renderer", &self.renderer)
+            .field("panels", &self.panels.len())
+            .finish()
+    }
+}
+
+impl Default for TurnPanel {
+    fn default() -> Self {
+        Self {
+            messages: Vec::new(),
+            scroll: 0,
+            follow: true,
+            highlighter: None,
+            renderer: ChatRenderer::new(),
+            measure_w: 0,
+            measure_conceal: false,
+            panels: HashMap::new(),
+        }
+    }
+}
+
+/// The message's [`Message::segs`] after a (re)highlight: the markdown
+/// segments plus the Lua panel regions (`user_segs`), each clamped to the
+/// text length, then sorted by start for the clipping pipelines.
+fn merged_segs(markdown: Vec<Segment>, user: &[Segment], len: usize) -> Vec<Segment> {
+    let mut all = markdown;
+    for sg in user {
+        let (s, e) = (sg.start.min(len), sg.end.min(len));
+        if s < e {
+            all.push(Segment {
+                start: s,
+                end: e,
+                style: sg.style,
+            });
+        }
+    }
+    all.sort_by_key(|sg| (sg.start, sg.end));
+    all
+}
+
+/// Pane `pane` (1-based) of `messages[idx]`'s split panel — `None` when the
+/// message is not a split panel or the pane is out of range (`0` counts as
+/// out of range too). A free function so callers can pair it with a disjoint
+/// `&mut self.highlighter` borrow (like the single-body arms pair
+/// `&mut self.messages[idx]` with `rehighlight`).
+fn pane_of(messages: &mut [Message], idx: usize, pane: usize) -> Option<&mut PaneContent> {
+    let pi = pane.checked_sub(1)?;
+    messages[idx].panes.as_mut()?.get_mut(pi)
+}
+
+impl TurnPanel {
+    /// Install (or clear) the markdown highlighter; call before pushing
+    /// messages so their segments are computed with it.
+    pub fn set_highlighter(&mut self, highlighter: Option<MarkdownHighlighter>) {
+        self.highlighter = highlighter;
+    }
+
+    /// Apply one Lua panel op ([`PanelOp`]) to the transcript. Panels render
+    /// through exactly the same pipelines as every other message — `boxed`
+    /// panels are the click-collapsible bordered boxes, plain panels are
+    /// ordinary assistant messages — so the UI stays the familiar one. Ops
+    /// for unknown panels and highlights before any content are ignored
+    /// (the op stream is data; validation happens here, not in Lua).
+    pub fn apply_op(&mut self, op: PanelOp) {
+        match op {
+            PanelOp::Create {
+                id,
+                title,
+                boxed,
+                conceal_box,
+            } => {
+                self.panels.insert(
+                    id,
+                    PanelRecord {
+                        title,
+                        boxed,
+                        conceal_box,
+                        msg_index: None,
+                    },
+                );
+            }
+            PanelOp::Append { id, text } => {
+                let Some(idx) = self.ensure_panel(id) else {
+                    return;
+                };
+                let msg = &mut self.messages[idx];
+                msg.text.push_str(&text);
+                Self::rehighlight(&mut self.highlighter, msg);
+            }
+            PanelOp::Set { id, text } => {
+                let Some(idx) = self.ensure_panel(id) else {
+                    return;
+                };
+                let msg = &mut self.messages[idx];
+                msg.text = text;
+                Self::rehighlight(&mut self.highlighter, msg);
+            }
+            PanelOp::SetLang { id, lang } => {
+                let Some(idx) = self.ensure_panel(id) else {
+                    return;
+                };
+                let msg = &mut self.messages[idx];
+                msg.lang = lang;
+                Self::rehighlight(&mut self.highlighter, msg);
+            }
+            PanelOp::Highlight {
+                id,
+                start,
+                end,
+                style,
+            } => {
+                let Some(idx) = self.panels.get(&id).and_then(|p| p.msg_index) else {
+                    return; // highlight before any content: nothing to style
+                };
+                let len = self.messages[idx].text.len();
+                let (s, e) = (start.min(len), end.min(len));
+                let (start, end) = (s.min(e), s.max(e));
+                if start < end {
+                    let style = style_for_spec(&style);
+                    let msg = &mut self.messages[idx];
+                    msg.user_segs.push(Segment { start, end, style });
+                    msg.user_segs.sort_by_key(|sg| (sg.start, sg.end));
+                }
+                Self::rehighlight(&mut self.highlighter, &mut self.messages[idx]);
+            }
+            PanelOp::ClearRegions { id } => {
+                let Some(idx) = self.panels.get(&id).and_then(|p| p.msg_index) else {
+                    return;
+                };
+                let msg = &mut self.messages[idx];
+                msg.user_segs.clear();
+                Self::rehighlight(&mut self.highlighter, msg);
+            }
+            PanelOp::Split { id, title, panes } => {
+                // The split is its own materializer: the pane frame *is* the
+                // content, so the boxed message appears at creation (empty
+                // panes render as captioned blank regions). A repeated Split
+                // for a live id is ignored.
+                if self.panels.contains_key(&id) {
+                    return;
+                }
+                self.panels.insert(
+                    id,
+                    PanelRecord {
+                        title,
+                        boxed: true,
+                        conceal_box: false,
+                        msg_index: None,
+                    },
+                );
+                let Some(idx) = self.ensure_panel(id) else {
+                    return;
+                };
+                self.messages[idx].panes = Some(
+                    panes
+                        .into_iter()
+                        .map(|p| PaneContent {
+                            caption: p.caption,
+                            lang: p.lang,
+                            text: String::new(),
+                            segs: Vec::new(),
+                            user_segs: Vec::new(),
+                        })
+                        .collect(),
+                );
+                self.messages[idx].dirty = true; // pane captions were added
+            }
+            PanelOp::SetPane { id, pane, text } => {
+                let Some(idx) = self.ensure_panel(id) else {
+                    return;
+                };
+                let Some(p) = pane_of(&mut self.messages, idx, pane) else {
+                    return;
+                };
+                p.text = text;
+                Self::rehighlight_pane(&mut self.highlighter, p);
+                self.messages[idx].dirty = true;
+            }
+            PanelOp::SetPaneLang { id, pane, lang } => {
+                let Some(idx) = self.ensure_panel(id) else {
+                    return;
+                };
+                let Some(p) = pane_of(&mut self.messages, idx, pane) else {
+                    return;
+                };
+                if p.lang != lang {
+                    p.lang = lang;
+                    Self::rehighlight_pane(&mut self.highlighter, p);
+                }
+                self.messages[idx].dirty = true;
+            }
+            PanelOp::HighlightPane {
+                id,
+                pane,
+                start,
+                end,
+                style,
+            } => {
+                let Some(idx) = self.ensure_panel(id) else {
+                    return;
+                };
+                let Some(p) = pane_of(&mut self.messages, idx, pane) else {
+                    return;
+                };
+                let len = p.text.len();
+                let (s, e) = (start.min(len), end.min(len));
+                let (start, end) = (s.min(e), s.max(e));
+                if start < end {
+                    let style = style_for_spec(&style);
+                    p.user_segs.push(Segment { start, end, style });
+                    p.user_segs.sort_by_key(|sg| (sg.start, sg.end));
+                }
+                Self::rehighlight_pane(&mut self.highlighter, p);
+                self.messages[idx].dirty = true;
+            }
+            PanelOp::ClearPaneRegions { id, pane } => {
+                let Some(idx) = self.ensure_panel(id) else {
+                    return;
+                };
+                let Some(p) = pane_of(&mut self.messages, idx, pane) else {
+                    return;
+                };
+                p.user_segs.clear();
+                Self::rehighlight_pane(&mut self.highlighter, p);
+                self.messages[idx].dirty = true;
+            }
+            PanelOp::Overlay { id, text } => {
+                let Some(idx) = self.ensure_panel(id) else {
+                    return;
+                };
+                let msg = &mut self.messages[idx];
+                msg.overlay = text;
+                msg.dirty = true; // the overlay adds rows inside the box
+                if msg.overlay.is_some() {
+                    // A pending permission ask must be legible: expand a
+                    // collapsed box and pin the viewport to the bottom so the
+                    // overlay (drawn inside the box) is on screen.
+                    msg.collapsed = false;
+                    self.follow = true;
+                }
+            }
+        }
+    }
+
+    /// Materialize panel `id`'s message (its first `Append`/`Set`) if it
+    /// doesn't have one yet, and return its index into `messages`. Unknown
+    /// ids return `None` — their ops are ignored.
+    fn ensure_panel(&mut self, id: u64) -> Option<usize> {
+        let opts = {
+            let rec = self.panels.get(&id)?;
+            (rec.title.clone(), rec.boxed, rec.conceal_box)
+        };
+        if self.panels.get(&id).is_some_and(|p| p.msg_index.is_none()) {
+            self.push_inner(
+                Role::Assistant,
+                String::new(),
+                opts.1.then_some(opts.0),
+                opts.2,
+            );
+            self.panels.get_mut(&id).expect("checked above").msg_index =
+                Some(self.messages.len() - 1);
+        }
+        self.panels.get(&id).and_then(|p| p.msg_index)
+    }
+
+    pub fn push(&mut self, role: Role, text: String) {
+        self.push_inner(role, text, None, false);
+    }
+
+    /// Push a message rendered inside a bordered box titled `tool` (e.g. the
+    /// tool's name) — the "tool-call visual". Any role may be boxed. The box
+    /// uses the original (non-conceal) base rendering, so markers stay
+    /// visible inside it regardless of the conceal toggle.
+    pub fn push_boxed(&mut self, role: Role, text: String, tool: String) {
+        self.push_inner(role, text, Some(tool), false);
+    }
+
+    /// Append one streamed fragment to the conversation's current assistant
+    /// message, re-highlighting it so markdown stays current as a turn
+    /// streams in. If the last message isn't a plain assistant message — it's
+    /// boxed, or the conversation ended with a user message — a fresh
+    /// assistant message is started (so the first chunk creates the row the
+    /// answer renders into). This is the agent loop's live-reply seam.
+    pub fn stream_append(&mut self, text: &str) {
+        let msg = match self.messages.last_mut() {
+            Some(m) if m.role == Role::Assistant && m.boxed.is_none() => m,
+            _ => {
+                self.push(Role::Assistant, String::new());
+                self.messages.last_mut().expect("just pushed")
+            }
+        };
+        msg.text.push_str(text);
+        Self::rehighlight(&mut self.highlighter, msg);
+    }
+
+    /// Append one streamed fragment into a *borderless* assistant block
+    /// titled `title` (a fresh block is started for the first chunk, and
+    /// later chunks keep flowing into it as long as it's still the last
+    /// message). This is the seam the agent loop uses to stream both the
+    /// reasoning (title "reasoning") and the answer (title "response") live
+    /// into their own blocks: the reasoning one renders dimmed — darker than
+    /// the answer — and neither draws a frame (tool boxes,
+    /// [`TurnPanel::push_boxed`], keep theirs). The block's content follows
+    /// the markup-conceal toggle like a plain message.
+    pub fn stream_append_boxed(&mut self, text: &str, title: String) {
+        let msg = match self.messages.last_mut() {
+            Some(m) if m.role == Role::Assistant && m.boxed.as_deref() == Some(title.as_str()) => m,
+            _ => {
+                self.push_inner(Role::Assistant, String::new(), Some(title), true);
+                self.messages.last_mut().expect("just pushed")
+            }
+        };
+        msg.text.push_str(text);
+        Self::rehighlight(&mut self.highlighter, msg);
+    }
+
+    /// Re-run the highlighter over `msg.text` (the streaming seam: a raw
+    /// plain-text fragment may start/end mid-construct, so the whole message
+    /// is re-highlighted every time it grows), merging the Lua panel regions
+    /// (`user_segs`) back in. Takes the highlighter field rather than
+    /// `&mut self` so it can run while `msg` still borrows `self.messages`.
+    /// Marks the message's cached height stale, since its display text (and
+    /// therefore its wrapped row count) may have changed.
+    fn rehighlight(highlighter: &mut Option<MarkdownHighlighter>, msg: &mut Message) {
+        msg.dirty = true;
+        match highlighter {
+            Some(hl) => {
+                // A declared language (SetLang) bypasses the markdown
+                // pipeline and runs that grammar directly on the text.
+                let h = match msg.lang.as_deref() {
+                    Some(lang) => hl.highlight_lang(lang, &msg.text),
+                    None => hl.highlight_message_with_conceal(&msg.text),
+                };
+                msg.conceal = h.conceal;
+                msg.segs = merged_segs(h.segments, &msg.user_segs, msg.text.len());
+            }
+            None => {
+                msg.conceal.clear();
+                msg.segs = merged_segs(Vec::new(), &msg.user_segs, msg.text.len());
+            }
+        }
+    }
+
+    /// Re-highlight one pane after its text or language changed: the declared
+    /// grammar runs directly on the pane's own text (the markdown pipeline
+    /// never applies to panes — they hold raw code), and the pane's user
+    /// regions are merged back in like [`Self::rehighlight`] does for whole
+    /// messages. Unknown/unloaded languages degrade to plain text, matching
+    /// `highlight_lang`. A free-standing associated fn so callers can pass the
+    /// disjoint `&mut self.highlighter` while `pane` borrows `self.messages`.
+    fn rehighlight_pane(highlighter: &mut Option<MarkdownHighlighter>, pane: &mut PaneContent) {
+        let base = match highlighter {
+            Some(hl) => match pane.lang.as_deref() {
+                Some(lang) => hl.highlight_lang(lang, &pane.text).segments,
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        pane.segs = merged_segs(base, &pane.user_segs, pane.text.len());
+    }
+
+    fn push_inner(&mut self, role: Role, text: String, boxed: Option<String>, conceal_box: bool) {
+        let (segs, conceal) = match &mut self.highlighter {
+            Some(hl) => {
+                let h = hl.highlight_message_with_conceal(&text);
+                (h.segments, h.conceal)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        self.messages.push(Message {
+            role,
+            text,
+            segs,
+            conceal,
+            user_segs: Vec::new(),
+            boxed,
+            conceal_box,
+            collapsed: false,
+            lang: None,
+            overlay: None,
+            panes: None,
+            rows: 0,
+            dirty: true, // measured on the next render (or an ensure_measured)
+        });
+    }
+
+    /// Toggle markup concealment (see [`ChatRenderer`]); returns the new state.
+    pub fn toggle_conceal(&mut self) -> bool {
+        let on = !self.renderer.conceal_enabled();
+        self.renderer.set_conceal(on);
+        on
+    }
+
+    /// Whether markup concealment is currently enabled.
+    pub fn conceal_enabled(&self) -> bool {
+        self.renderer.conceal_enabled()
+    }
+
+    /// Scroll one row toward the top; disengages follow until the user is
+    /// back at the bottom.
+    pub fn scroll_up(&mut self) {
+        self.follow = false;
+        self.scroll = self.scroll.saturating_sub(1);
+    }
+
+    /// Scroll one row toward the bottom; follow re-engages automatically
+    /// once the view reaches the bottom (see [`Self::resolve_scroll`]).
+    pub fn scroll_down(&mut self) {
+        self.scroll += 1;
+    }
+
+    pub fn jump_top(&mut self) {
+        self.follow = false;
+        self.scroll = 0;
+    }
+
+    pub fn jump_bottom(&mut self) {
+        self.follow = true;
+    }
+
+    /// (Re)fill the per-message [`Message::rows`] cache for the current (width,
+    /// conceal) view. When either changed since the last fill the whole list
+    /// re-measures — one wrap per message, and that happens once per resize or
+    /// conceal toggle; otherwise only the messages marked dirty (their text,
+    /// box state, panes, or overlay changed) re-measure. After this, scroll
+    /// positioning and the scrollbar are plain sums over cached ints, and the
+    /// only wrapping per frame is the visible window (see [`Self::render`]).
+    fn ensure_measured(&mut self, content_w: usize) {
+        let conceal = self.renderer.conceal_enabled();
+        if self.measure_w != content_w || self.measure_conceal != conceal {
+            self.measure_w = content_w;
+            self.measure_conceal = conceal;
+            for m in &mut self.messages {
+                m.rows = message_rows(m, content_w, conceal);
+                m.dirty = false;
+            }
+        } else {
+            for m in &mut self.messages {
+                if m.dirty {
+                    m.rows = message_rows(m, content_w, conceal);
+                    m.dirty = false;
+                }
+            }
+        }
+    }
+
+    /// Rows the full panel occupies once wrapped to `content_w` cells
+    /// (re-measuring stale cached heights first). Heights come from the
+    /// *display* text (markers removed) when conceal is on, so the scrollbar
+    /// matches the rendered rows: concealed messages take fewer cells
+    /// (`# Plan` no longer spends two on the marker and space).
+    fn content_height(&mut self, content_w: usize) -> usize {
+        self.ensure_measured(content_w);
+        self.messages.iter().map(|m| m.rows).sum()
+    }
+
+    /// The first message overlapping global content row `offset`, plus how
+    /// many rows of it sit above `offset` (the intra-message scroll for the
+    /// viewport's [`Paragraph`]). `offset` is clamped by `resolve_scroll` to
+    /// lie within the content, so `within < rows` of the returned message. The
+    /// walk is over cached row counts — no wrapping.
+    fn window_start(&self, offset: usize) -> (usize, usize) {
+        let mut before = 0;
+        for (i, m) in self.messages.iter().enumerate() {
+            if before + m.rows > offset {
+                return (i, offset - before);
+            }
+            before += m.rows;
+        }
+        (self.messages.len().saturating_sub(1), 0)
+    }
+
+    /// The last message whose rows overlap the viewport when the window starts
+    /// at `start` with `within` rows already consumed by the scroll offset.
+    /// Over-approximates by cached counts only — no wrapping.
+    fn window_end(&self, start: usize, viewport: usize, within: usize) -> usize {
+        let mut acc = self.messages[start].rows.saturating_sub(within);
+        let mut end = start;
+        while acc < viewport && end + 1 < self.messages.len() {
+            end += 1;
+            acc += self.messages[end].rows;
+        }
+        end
+    }
+
+    /// Turn a *slice* of messages into styled, wrapped rows — the windowed
+    /// render path's base (conceal-off) pipeline. Byte-for-byte the same rows
+    /// [`Self::build_lines`] produces for the same messages; only the input is
+    /// limited to the visible window, so the frame's wrap cost is O(viewport),
+    /// not O(retained). Messages carry their highlight segments from push time;
+    /// here we only wrap them. Layout is identical to plain-text wrapping —
+    /// the tag row and continuation indent are unchanged, only span boundaries
+    /// differ. The original segment path renders markers as-is, no conceal.
+    fn build_lines_slice(&self, msgs: &[Message], content_w: usize) -> Vec<Line<'static>> {
+        let text_w = content_w.saturating_sub(TAG_COLS + 1);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for msg in msgs {
+            lines.extend(message_lines(msg, text_w, false));
+        }
+        lines
+    }
+
+    /// Turn every message into styled, wrapped rows — the full-transcript base
+    /// pipeline. The render path only wraps the visible slice
+    /// ([`Self::build_lines_slice`]); this full build survives for tests (and
+    /// the parity test proves the windowed output equals it row for row).
+    #[cfg(test)]
+    fn build_lines(&self, content_w: usize) -> Vec<Line<'static>> {
+        let mut lines = self.build_lines_slice(&self.messages, content_w);
+        if lines.is_empty() {
+            lines.push(Line::raw("(no messages yet)"));
+        }
+        lines
+    }
+
+    /// Resolve the scroll offset for a viewport of `viewport` rows, clamping
+    /// and re-engaging follow when the view reaches the bottom. Returns the
+    /// offset to pass to the transcript [`Paragraph`].
+    fn resolve_scroll(&mut self, content_height: usize, viewport: usize) -> usize {
+        let max = content_height.saturating_sub(viewport);
+        if self.follow {
+            self.scroll = max;
+        } else {
+            self.scroll = self.scroll.min(max);
+        }
+        if self.scroll >= max {
+            self.follow = true;
+        }
+        self.scroll
+    }
+
+    /// Draw the panel (its borderless body, wrapped rows, and scrollbar)
+    /// into `area`.
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        // The chat log is borderless: the body fills `area` except for the
+        // 1-cell scrollbar lane at the right edge.
+        let body = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width.saturating_sub(1),
+            height: area.height,
+        };
+        let content_w = body.width as usize;
+        let viewport = body.height as usize;
+        // Heights come from the per-message cache (`ensure_measured` only
+        // wraps messages whose text/state changed since they were measured)…
+        let content_h = self.content_height(content_w);
+        let offset = self.resolve_scroll(content_h, viewport);
+
+        // …so the only wrapping per frame happens here, on the visible slice:
+        // the messages overlapping [offset, offset + viewport). Older content
+        // stays in memory (the transcript caches up to the compaction point
+        // or the start of the session) but never gets wrapped again unless
+        // it becomes visible.
+        let (lines, scroll_rows) = if self.messages.is_empty() {
+            (vec![Line::raw("(no messages yet)")], 0)
+        } else {
+            let (start, within) = self.window_start(offset);
+            let end = self.window_end(start, viewport, within);
+            let slice = &self.messages[start..=end];
+            // Three pipelines: the original segment path when conceal is off,
+            // the dedicated chat renderer (display text) when it is on — and
+            // when any message is boxed, the bordered renderer frames the
+            // boxed ones (raw base path inside) while rendering the rest per
+            // the toggle. The pipeline is picked over the whole list so the
+            // slice renders exactly as it would in the full build.
+            let conceal = self.renderer.conceal_enabled();
+            let lines = if self.messages.iter().any(|m| m.boxed.is_some()) {
+                BorderedRenderer::lines(slice, content_w, conceal)
+            } else if conceal {
+                self.renderer.lines(slice, content_w)
+            } else {
+                self.build_lines_slice(slice, content_w)
+            };
+            // `within` rows of the slice sit above the viewport.
+            (lines, within)
+        };
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll_rows as u16, 0)),
+            body,
+        );
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            Rect {
+                x: area.x.saturating_add(area.width.saturating_sub(1)),
+                y: area.y,
+                width: 1,
+                height: area.height,
+            },
+            &mut ScrollbarState::new(content_h)
+                .position(offset)
+                .viewport_content_length(viewport),
+        );
+    }
+
+    /// A left click at terminal coordinates `(col, row)` inside the panel's
+    /// `area`: if it lands on any rendered row of a *framed* boxed (tool-call)
+    /// message, toggle that box's collapsed state (`reasoning`/`response`
+    /// blocks are borderless, so they are not clickable). Returns `true` when
+    /// the click was consumed; normal messages are not clickable.
+    pub fn handle_click(&mut self, col: usize, row: usize, area: Rect) -> bool {
+        // Only the transcript body is clickable (not the scrollbar lane at
+        // the right edge, or rows above/below the panel).
+        let left = area.x as usize;
+        let right = (area.x + area.width).saturating_sub(1) as usize;
+        if col < left || col >= right || row < area.y as usize {
+            return false;
+        }
+        // Screen row -> paragraph row, undoing the viewport's scroll offset.
+        let content_row = (row - area.y as usize) + self.scroll;
+        // Cached row counts (no wrapping on the common path — `ensure_measured`
+        // re-measures only stale messages). The panel's body width equals
+        // `content_w(area)`.
+        self.ensure_measured(content_w(area));
+        let mut acc = 0;
+        for msg in &mut self.messages {
+            let rows = msg.rows;
+            if content_row < acc + rows {
+                if msg.boxed.is_some() && !is_borderless_box(msg) {
+                    msg.collapsed = !msg.collapsed;
+                    msg.dirty = true; // collapse changes the row count
+                    return true;
+                }
+                return false;
+            }
+            acc += rows;
+        }
+        false
+    }
+}
+
+/// The paragraph's wrap width inside a panel of `area` (the rightmost
+/// column is the scrollbar lane, not body).
+fn content_w(area: Rect) -> usize {
+    (area.width as usize).saturating_sub(1)
+}
+
+/// Rows `msg` occupies; an empty message still takes one row (its tag line).
+/// With conceal enabled the height comes from the display text (markers
+/// removed) so it agrees with [`ChatRenderer::lines`]; otherwise the raw text
+/// matches the original path. A boxed message adds its two border rows and
+/// measures the base path unless its `conceal_box` opts the box content into
+/// the conceal path (then it mirrors [`boxed_lines`] with the toggle on); a
+/// collapsed box is just its title and bottom border. A boxed message with a
+/// pending [`Message::overlay`] adds the overlay's rows (see [`overlay_rows`]).
+fn message_rows(msg: &Message, content_w: usize, conceal: bool) -> usize {
+    if msg.boxed.is_some() && !is_borderless_box(msg) {
+        if msg.collapsed {
+            return 2;
+        }
+        if msg.panes.is_some() {
+            // Split body heights come from the pane layout, which reflows
+            // side-by-side→stacked with the width ([`split_body_rows`] is the
+            // single measure used here and in [`boxed_lines`]).
+            let inner = content_w.saturating_sub(4);
+            let rows = split_body_rows(msg, inner).len().max(1);
+            let overlay = if msg.overlay.is_some() {
+                overlay_rows(msg, content_w).len()
+            } else {
+                0
+            };
+            return rows + 2 + overlay;
+        }
+        let inner = content_w.saturating_sub(4);
+        let rows = if conceal && msg.conceal_box {
+            // Mirror `boxed_lines`: the conceal path hides markers, so the
+            // height comes from the display text.
+            let n = if msg.conceal.is_empty() {
+                wrap_lines(&msg.text, inner).len()
+            } else {
+                wrap_concealed(msg, inner).len()
+            };
+            n.max(1)
+        } else {
+            wrap_lines(&msg.text, inner).len().max(1)
+        };
+        let overlay = if msg.overlay.is_some() {
+            overlay_rows(msg, content_w).len()
+        } else {
+            0
+        };
+        return rows + 2 + overlay;
+    }
+    let text_w = content_w.saturating_sub(TAG_COLS + 1);
+    let text: std::borrow::Cow<'_, str> = if conceal {
+        display_text(msg)
+    } else {
+        std::borrow::Cow::Borrowed(&msg.text)
+    };
+    wrap_lines(text.as_ref(), text_w).len().max(1)
+}
+
+/// Styled body rows for `msg` wrapped to `text_w` cells — the shared
+/// per-message pipeline: the display text (markers hidden) when conceal is
+/// on and the message has ranges, otherwise the original segment path
+/// (raw text, `wrap_segments`/`wrap_lines`).
+fn body_rows(msg: &Message, text_w: usize, conceal: bool) -> Vec<Vec<Span<'static>>> {
+    if conceal && !msg.conceal.is_empty() {
+        return wrap_concealed(msg, text_w);
+    }
+    if msg.segs.is_empty() {
+        wrap_lines(&msg.text, text_w)
+            .into_iter()
+            .map(|row| vec![Span::raw(row)])
+            .collect()
+    } else {
+        wrap_segments(&msg.text, &msg.segs, text_w)
+    }
+}
+
+/// One message's full rows — the tag row (when the body isn't empty) plus
+/// the indented continuation rows — shared by the original path
+/// ([`TurnPanel::build_lines`]), the chat renderer, and the bordered
+/// renderer's non-boxed messages.
+fn message_lines(msg: &Message, text_w: usize, conceal: bool) -> Vec<Line<'static>> {
+    let mut first = vec![Span::styled(
+        format!("{:<TAG_COLS$}", msg.role.tag()),
+        msg.role.style(),
+    )];
+    let rows = body_rows(msg, text_w, conceal);
+    let mut out = Vec::with_capacity(rows.len());
+    if let Some(r0) = rows.first()
+        && r0.iter().any(|s| !s.content.is_empty())
+    {
+        first.extend(r0.iter().cloned());
+    }
+    out.push(Line::from(first));
+    for row in rows.iter().skip(1) {
+        let mut spans = vec![Span::raw(" ".repeat(TAG_COLS + 1))];
+        spans.extend(row.iter().cloned());
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// A boxed message's rows, replacing the role tag row: a title border
+/// (`┌─ <tool> [−] ─…─┐`), content rows `│ … │` wrapping the base path at
+/// `content_w - 4` (or the conceal path when the box opts in and the toggle
+/// is on), and a bottom border (`└─…─┘`). `[−]`/`[+]` marks the
+/// click-to-collapse/expand affordance; a collapsed box renders only the
+/// title and bottom rows, with `[+]`. Row counts match [`message_rows`].
+fn boxed_lines(msg: &Message, content_w: usize, conceal: bool) -> Vec<Line<'static>> {
+    let inner = content_w.saturating_sub(4); // '│ ' body ' │'
+    let title = msg.boxed.as_deref().unwrap_or("tool");
+    let indicator = if msg.collapsed { "[+]" } else { "[−]" };
+
+    // Title border, filled with ─ to exactly `content_w` cells.
+    let mut top = format!("┌─ {title} {indicator} ");
+    let fill = content_w.saturating_sub(top.chars().count() + 1);
+    top.push_str(&"─".repeat(fill));
+    top.push('┐');
+    let mut out = Vec::new();
+    out.push(Line::raw(top));
+
+    if !msg.collapsed {
+        if msg.panes.is_some() {
+            let inner = content_w.saturating_sub(4);
+            for row in split_body_rows(msg, inner) {
+                let used: usize = row.spans.iter().map(|s| s.content.chars().count()).sum();
+                let pad = " ".repeat(inner.saturating_sub(used));
+                let mut spans = Vec::with_capacity(row.spans.len() + 2);
+                spans.push(Span::raw("│ "));
+                spans.extend(row.spans.iter().cloned());
+                spans.push(Span::raw(format!("{pad} │")));
+                out.push(Line::from(spans));
+            }
+            if msg.overlay.is_some() {
+                out.extend(overlay_rows(msg, content_w));
+            }
+        } else {
+            for row in body_rows(msg, inner, conceal && msg.conceal_box) {
+                let used: usize = row.iter().map(|s| s.content.chars().count()).sum();
+                let pad = " ".repeat(inner.saturating_sub(used));
+                let mut spans = Vec::with_capacity(row.len() + 2);
+                spans.push(Span::raw("│ "));
+                spans.extend(row);
+                spans.push(Span::raw(format!("{pad} │")));
+                out.push(Line::from(spans));
+            }
+            if msg.overlay.is_some() {
+                out.extend(overlay_rows(msg, content_w));
+            }
+        }
+    }
+
+    let bottom = format!("└{}┘", "─".repeat(content_w.saturating_sub(2)));
+    out.push(Line::raw(bottom));
+    out
+}
+
+/// The key prompt drawn as the overlay panel's title: the user answers the
+/// pending permission ask with `y` (allow) or `n` (deny) while the sandbox
+/// keeps the asking syscall frozen.
+const OVERLAY_PROMPT: &str = "[y] allow \u{00B7} [n] deny";
+
+/// Style of the overlay's frame and title. Deliberately distinct from the
+/// body rows: bold yellow on a dark band reads as a modal inset, so the ask
+/// is unmistakable against the streamed output above it.
+fn overlay_title_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Style of the overlay's description rows.
+fn overlay_body_style() -> Style {
+    Style::default().fg(Color::Yellow).bg(Color::DarkGray)
+}
+
+/// The user-permission overlay rows for a boxed message, drawn at the bottom
+/// *inside* the box (between the last body row and the box's bottom border):
+/// a framed mini-panel
+///
+/// ```text
+/// │ ┌─ [y] allow · [n] deny ─────┐ │
+/// │ │ openat (pid 7) requests …  │ │
+/// │ └────────────────────────────┘ │
+/// ```
+///
+/// The description is wrapped to the inner width and capped at two rows, so
+/// the overlay stays ~3–4 rows tall. Each returned row already carries the
+/// outer box's `│ … │` framing and spans exactly `content_w` cells like the
+/// body rows, so the outer borders stay aligned. Rendered only for boxed
+/// messages with [`Message::overlay`] set; row counts agree with
+/// [`message_rows`].
+fn overlay_rows(msg: &Message, content_w: usize) -> Vec<Line<'static>> {
+    let inner = content_w.saturating_sub(4);
+    let desc = msg.overlay.as_deref().unwrap_or("");
+    let title = overlay_title_style();
+    let body = overlay_body_style();
+    let mut out = Vec::new();
+
+    // Mini-panel top border, filled with ─ to the full inner width.
+    let mut top = format!("┌─ {OVERLAY_PROMPT} ");
+    let fill = inner.saturating_sub(top.chars().count() + 1);
+    top.push_str(&"─".repeat(fill));
+    top.push('┐');
+    out.push(frame_row(top, title));
+
+    let text_w = inner.saturating_sub(2);
+    let mut lines = wrap_lines(desc, text_w);
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    if lines.len() > 2 {
+        lines.truncate(2);
+        let last = lines.last_mut().expect("non-empty after truncate");
+        if last.chars().count() < text_w {
+            last.push('…');
+        }
+    }
+    for line in lines {
+        let used = line.chars().count();
+        let pad = " ".repeat(text_w.saturating_sub(used));
+        out.push(frame_row(format!("│ {line}{pad} │"), body));
+    }
+
+    let bottom = format!("└{}┘", "─".repeat(inner.saturating_sub(2)));
+    out.push(frame_row(bottom, title));
+    out
+}
+
+/// Wrap one `inner`-wide overlay row in the outer box's `│ … │` framing so
+/// the row spans exactly `content_w` cells, matching the boxed body rows.
+fn frame_row(content: String, style: Style) -> Line<'static> {
+    let mut spans = vec![Span::styled("│ ", style)];
+    spans.push(Span::styled(content, style));
+    spans.push(Span::styled(" │", style));
+    Line::from(spans)
+}
+
+/// Minimum cells a side-by-side pane column gets before the panes stack
+/// instead. Picked so a two-pane patch box stays readable on an 80-col
+/// terminal (~37 cells per pane) and stacks on narrower ones.
+const MIN_PANE_COL: usize = 20;
+
+/// Vertical rule drawn between side-by-side panes.
+const PANE_DIVIDER: &str = "│";
+
+/// How a split panel's body lays out at `inner` cells of width.
+enum SplitLayout {
+    /// Every pane gets its own column (widths differ by at most one cell).
+    SideBySide(Vec<usize>),
+    /// Panes stack full-width, a dim rule row between each.
+    Stacked,
+}
+
+/// The pane layout for `inner` content cells: side-by-side whenever the inner
+/// width fits every pane's minimum plus the rule cells between them, stacked
+/// otherwise. Heights and drawing both go through this, so rows always agree.
+fn split_layout(inner: usize, n: usize) -> SplitLayout {
+    let n = n.max(1);
+    if inner >= n * MIN_PANE_COL + (n - 1) {
+        let avail = inner - (n - 1);
+        let base = avail / n;
+        let rem = avail % n;
+        let cols = (0..n)
+            .map(|i| if i < rem { base + 1 } else { base })
+            .collect();
+        SplitLayout::SideBySide(cols)
+    } else {
+        SplitLayout::Stacked
+    }
+}
+
+/// Pane captions render dim-bold so they read as column heads, not content.
+fn pane_caption_style() -> Style {
+    Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// A pane's caption row, clipped to `width` cells (long captions truncate
+/// rather than overflow into the pane divider or the box border).
+fn caption_row(caption: &str, width: usize) -> Line<'static> {
+    let text: String = caption.chars().take(width).collect();
+    Line::from(Span::styled(text, pane_caption_style()))
+}
+
+/// One pane's wrapped body rows at `width` cells: raw text when the pane has
+/// no segments, styled wrapped segments otherwise — the same split
+/// [`body_rows`] makes for whole messages, only per-pane.
+fn pane_body_rows(pane: &PaneContent, width: usize) -> Vec<Line<'static>> {
+    if pane.segs.is_empty() {
+        wrap_lines(&pane.text, width)
+            .into_iter()
+            .map(Line::raw)
+            .collect()
+    } else {
+        wrap_segments(&pane.text, &pane.segs, width)
+            .into_iter()
+            .map(Line::from)
+            .collect()
+    }
+}
+
+/// One pane column's rows: caption (when non-empty) then the wrapped body.
+fn pane_column_rows(pane: &PaneContent, width: usize) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    if !pane.caption.is_empty() {
+        rows.push(caption_row(&pane.caption, width));
+    }
+    rows.extend(pane_body_rows(pane, width));
+    rows
+}
+
+/// Pad a `Line`'s spans to exactly `width` cells. Rows never exceed their
+/// width (wrapping and caption clipping guarantee it), so padding alone keeps
+/// the pane grid aligned.
+fn pad_line_to(line: &Line<'static>, width: usize) -> Vec<Span<'static>> {
+    let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
+    spans.extend(line.spans.iter().cloned());
+    if used < width {
+        spans.push(Span::raw(" ".repeat(width - used)));
+    }
+    spans
+}
+
+/// A split panel's body rows for `inner` cells of content width: panes
+/// side-by-side (a `│` rule between the columns, shorter columns blank-padded)
+/// or stacked full-width below a dim rule. Row spans already fill `inner`
+/// cells, so the box's `│ … │` framing pads them to the full box width.
+fn split_body_rows(msg: &Message, inner: usize) -> Vec<Line<'static>> {
+    let panes = msg
+        .panes
+        .as_deref()
+        .expect("split body rows on a split message");
+    match split_layout(inner, panes.len()) {
+        SplitLayout::SideBySide(cols) => {
+            // The body height is the tallest column; rows beyond a column's
+            // own length render blank for that column.
+            let per: Vec<Vec<Line<'static>>> = panes
+                .iter()
+                .zip(&cols)
+                .map(|(p, &col)| pane_column_rows(p, col))
+                .collect();
+            let height = per.iter().map(Vec::len).max().unwrap_or(1);
+            let mut out = Vec::with_capacity(height);
+            for r in 0..height {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                for (i, rows) in per.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw(PANE_DIVIDER));
+                    }
+                    let col_w = cols[i];
+                    spans.extend(match rows.get(r) {
+                        Some(line) => pad_line_to(line, col_w),
+                        None => vec![Span::raw(" ".repeat(col_w))],
+                    });
+                }
+                out.push(Line::from(spans));
+            }
+            out
+        }
+        SplitLayout::Stacked => {
+            let mut out = Vec::new();
+            for (i, p) in panes.iter().enumerate() {
+                if i > 0 {
+                    out.push(Line::styled(
+                        "─".repeat(inner),
+                        Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+                    ));
+                }
+                if !p.caption.is_empty() {
+                    out.push(caption_row(&p.caption, inner));
+                }
+                out.extend(pane_body_rows(p, inner));
+            }
+            out
+        }
+    }
+}
+
+/// The visible text of `msg`: the message minus its concealed marker ranges.
+fn display_text(msg: &Message) -> std::borrow::Cow<'_, str> {
+    if msg.conceal.is_empty() {
+        return std::borrow::Cow::Borrowed(&msg.text);
+    }
+    let mut out = String::with_capacity(msg.text.len());
+    let mut prev = 0;
+    for &(r0, r1) in &msg.conceal {
+        out.push_str(&msg.text[prev..r0]);
+        prev = r1;
+    }
+    out.push_str(&msg.text[prev..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Wrap a message that conceals some markers: rows come from the *display*
+/// text (markers removed) with segment boundaries mapped through the conceal
+/// ranges. The row algorithm is identical to [`wrap_segments`], so heights
+/// match [`wrap_lines`] on the display text — what [`message_rows`] assumes.
+fn wrap_concealed(msg: &Message, width: usize) -> Vec<Vec<Span<'static>>> {
+    if width == 0 {
+        return vec![vec![]];
+    }
+    let display = display_text(msg);
+    let disp = display.as_ref();
+    // byte_at[i] = byte offset where char index i starts (chars + 1 entries).
+    let n = disp.chars().count();
+    let mut byte_at: Vec<usize> = Vec::with_capacity(n + 1);
+    byte_at.push(0);
+    byte_at.extend(disp.char_indices().skip(1).map(|(b, _)| b));
+    byte_at.push(disp.len());
+
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut para_start = 0; // char index of the paragraph's first char
+    for para in disp.split('\n') {
+        let para_chars = para.chars().count();
+        if para_chars == 0 {
+            rows.push(Vec::new());
+            para_start += 1;
+            continue;
+        }
+        let mut rest = 0;
+        while rest < para_chars {
+            let take = width.min(para_chars - rest);
+            let (cs, ce) = (para_start + rest, para_start + rest + take);
+            rows.push(clip_concealed(disp, msg, byte_at[cs], byte_at[ce]));
+            rest += take;
+        }
+        para_start += para_chars + 1;
+    }
+    rows
+}
+
+/// One display-space row's spans: each cached segment clipped to the row's
+/// display byte range, with its source boundaries translated through the
+/// conceal map.
+fn clip_concealed(display: &str, msg: &Message, bs: usize, be: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    for sg in &msg.segs {
+        let s = to_display(&msg.conceal, sg.start).max(bs);
+        let e = to_display(&msg.conceal, sg.end).min(be);
+        if s < e {
+            out.push(Span::styled(display[s..e].to_string(), sg.style));
+        }
+    }
+    out
+}
+
+/// Display-space byte offset of source byte offset `src`: `src` minus every
+/// conceal range that ends before it. Ranges are sorted and disjoint.
+fn to_display(conceal: &[(usize, usize)], src: usize) -> usize {
+    let mut hidden = 0;
+    for &(r0, r1) in conceal {
+        if r1 <= src {
+            hidden += r1 - r0;
+        } else {
+            break;
+        }
+    }
+    src - hidden
+}
+
+/// Wrap styled segments exactly like [`wrap_lines`] wraps plain text: split
+/// on `\n`, chunk by `width` chars, and clip each segment to the row's byte
+/// range. Row text is byte-identical to `wrap_lines` — only span boundaries
+/// differ — so heights computed from plain wrapping stay correct.
+fn wrap_segments(text: &str, segs: &[Segment], width: usize) -> Vec<Vec<Span<'static>>> {
+    if width == 0 {
+        return vec![vec![]];
+    }
+    // byte_at[i] = byte offset where char index i starts (chars + 1 entries).
+    let n = text.chars().count();
+    let mut byte_at: Vec<usize> = Vec::with_capacity(n + 1);
+    byte_at.push(0);
+    byte_at.extend(text.char_indices().skip(1).map(|(b, _)| b));
+    byte_at.push(text.len());
+
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut para_start = 0; // char index of the paragraph's first char
+    for para in text.split('\n') {
+        let para_chars = para.chars().count();
+        if para_chars == 0 {
+            rows.push(Vec::new());
+            para_start += 1;
+            continue;
+        }
+        let mut rest = 0;
+        while rest < para_chars {
+            let take = width.min(para_chars - rest);
+            let (cs, ce) = (para_start + rest, para_start + rest + take);
+            rows.push(clip_segments(text, segs, byte_at[cs], byte_at[ce]));
+            rest += take;
+        }
+        para_start += para_chars + 1;
+    }
+    rows
+}
+
+/// One row's spans: each segment clipped to the row's byte range.
+fn clip_segments(text: &str, segs: &[Segment], bs: usize, be: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    for sg in segs {
+        let s = sg.start.max(bs);
+        let e = sg.end.min(be);
+        if s < e {
+            out.push(Span::styled(text[s..e].to_string(), sg.style));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_height_counts_wrapped_rows() {
+        let mut panel = TurnPanel::default();
+        panel.push(Role::User, "ab\ncd".into()); // rows at text width 4 → 2
+        panel.push(Role::Assistant, "x".into()); // rows at text width 4 → 1
+        assert_eq!(panel.content_height(15), 3);
+    }
+
+    #[test]
+    fn resolve_scroll_follows_and_clamps() {
+        let mut panel = TurnPanel::default();
+        assert_eq!(panel.resolve_scroll(10, 5), 5); // follow: pinned to bottom
+        assert!(panel.follow);
+
+        panel.follow = false;
+        panel.scroll = 0;
+        assert_eq!(panel.resolve_scroll(10, 5), 0);
+        assert!(!panel.follow);
+
+        panel.scroll = 900; // clamp to the bottom of 10 rows in a 5-row view
+        assert_eq!(panel.resolve_scroll(10, 5), 5);
+        assert!(panel.follow, "reaching the bottom re-engages follow");
+
+        // Content shorter than the viewport: nothing to scroll, always bottom.
+        let mut panel = TurnPanel {
+            follow: false,
+            ..Default::default()
+        };
+        assert_eq!(panel.resolve_scroll(3, 8), 0);
+        assert!(panel.follow);
+    }
+
+    #[test]
+    fn build_lines_renders_tag_and_indents_continuation() {
+        let mut panel = TurnPanel::default();
+        panel.push(Role::User, "ab\ncd".into());
+        // content_w 15 -> text width 4 -> rows "ab", "cd"
+        let lines = panel.build_lines(15);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "user      ");
+        assert_eq!(lines[0].spans[1].content.as_ref(), "ab");
+        assert_eq!(lines[1].spans[0].content.as_ref(), "           "); // TAG_COLS+1
+        assert_eq!(lines[1].spans[1].content.as_ref(), "cd");
+    }
+
+    #[test]
+    fn empty_panel_renders_a_placeholder_row() {
+        let panel = TurnPanel::default();
+        let lines = panel.build_lines(40);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content, "(no messages yet)");
+    }
+
+    #[test]
+    fn wrap_segments_matches_wrap_lines_layout() {
+        for (text, width) in [
+            ("", 4),
+            ("ab\ncd", 4),
+            ("a\n\nb", 4),
+            ("abcdef", 3),
+            ("abcd\nefgh", 3),
+            ("x", 0),
+            ("café ☕", 3), // multi-byte chars: slicing stays on char bounds
+        ] {
+            let plain = wrap_lines(text, width);
+            let segs = vec![Segment {
+                start: 0,
+                end: text.len(),
+                style: Style::default(),
+            }];
+            let rows = wrap_segments(text, &segs, width);
+            assert_eq!(
+                rows.len(),
+                plain.len(),
+                "row count width={width} text={text:?}"
+            );
+            for (row, expected) in rows.iter().zip(&plain) {
+                let joined: String = row.iter().map(|s| s.content.as_ref()).collect();
+                assert_eq!(joined, *expected, "width={width} text={text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_segments_splits_styled_spans_across_row_boundaries() {
+        // "xxyy" at width 3 wraps to "xxy" + "y"; the second segment ("yy")
+        // is split across the boundary.
+        let text = "xxyy";
+        let segs = vec![
+            Segment {
+                start: 0,
+                end: 2,
+                style: Style::default().fg(Color::Red),
+            },
+            Segment {
+                start: 2,
+                end: 4,
+                style: Style::default().fg(Color::Blue),
+            },
+        ];
+        let rows = wrap_segments(text, &segs, 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), 2, "both styles present on row 0");
+        assert_eq!(rows[0][0].content.as_ref(), "xx");
+        assert_eq!(rows[0][0].style, segs[0].style);
+        assert_eq!(rows[0][1].content.as_ref(), "y");
+        assert_eq!(rows[0][1].style, segs[1].style);
+        assert_eq!(rows[1].len(), 1);
+        assert_eq!(rows[1][0].content.as_ref(), "y");
+        assert_eq!(rows[1][0].style, segs[1].style);
+    }
+
+    #[test]
+    fn build_lines_styles_message_body_from_segments() {
+        let mut panel = TurnPanel::default();
+        panel.push(Role::User, "say hi".into());
+        // Without a highlighter the message renders plain...
+        let lines = panel.build_lines(40);
+        assert_eq!(lines[0].spans.len(), 2); // tag + plain body
+        assert_eq!(lines[0].spans[1].content.as_ref(), "say hi");
+        assert_eq!(lines[0].spans[1].style, Style::default());
+
+        // ...and with segments the same body gets styled spans.
+        panel.messages[0].segs = vec![
+            Segment {
+                start: 0,
+                end: 4,
+                style: Style::default(),
+            },
+            Segment {
+                start: 4,
+                end: 6,
+                style: Style::default().fg(Color::Red),
+            },
+        ];
+        let lines = panel.build_lines(40);
+        assert_eq!(lines[0].spans.len(), 3); // tag + "say " + styled "hi"
+        assert_eq!(lines[0].spans[1].content.as_ref(), "say ");
+        assert_eq!(lines[0].spans[2].content.as_ref(), "hi");
+        assert_eq!(lines[0].spans[2].style, Style::default().fg(Color::Red));
+    }
+
+    fn msg(text: &str, segs: Vec<Segment>, conceal: Vec<(usize, usize)>) -> Message {
+        Message {
+            role: Role::User,
+            text: text.to_string(),
+            segs,
+            conceal,
+            user_segs: Vec::new(),
+            boxed: None,
+            conceal_box: false,
+            collapsed: false,
+            lang: None,
+            overlay: None,
+            panes: None,
+            rows: 0,
+            dirty: true,
+        }
+    }
+
+    /// A two-pane split message: captioned "before"/"after" regions holding
+    /// a couple of short lines each (no highlighter, so raw plain panes).
+    fn split_msg() -> Message {
+        Message {
+            role: Role::Assistant,
+            text: String::new(),
+            segs: Vec::new(),
+            conceal: Vec::new(),
+            user_segs: Vec::new(),
+            boxed: Some("apply_patch".into()),
+            conceal_box: false,
+            collapsed: false,
+            lang: None,
+            overlay: None,
+            panes: Some(vec![
+                PaneContent {
+                    caption: "before".into(),
+                    text: "aaa\nbb".into(),
+                    lang: None,
+                    segs: Vec::new(),
+                    user_segs: Vec::new(),
+                },
+                PaneContent {
+                    caption: "after".into(),
+                    text: "cc".into(),
+                    lang: None,
+                    segs: Vec::new(),
+                    user_segs: Vec::new(),
+                },
+            ]),
+            rows: 0,
+            dirty: true,
+        }
+    }
+
+    #[test]
+    fn display_text_removes_concealed_ranges() {
+        let m = msg("a**b**c", vec![], vec![(1, 3), (4, 6)]);
+        assert_eq!(display_text(&m).as_ref(), "abc");
+        let plain = msg("hello", vec![], vec![]);
+        assert_eq!(display_text(&plain).as_ref(), "hello");
+    }
+
+    #[test]
+    fn to_display_translates_boundaries() {
+        let conceal = vec![(0, 2), (10, 12), (20, 23)];
+        assert_eq!(to_display(&conceal, 0), 0);
+        assert_eq!(to_display(&conceal, 2), 0);
+        assert_eq!(to_display(&conceal, 5), 3);
+        assert_eq!(to_display(&conceal, 12), 8);
+        assert_eq!(to_display(&conceal, 23), 16);
+        assert_eq!(to_display(&conceal, 30), 23);
+        // Ordering is preserved across markers (monotone mapping).
+        assert!(to_display(&conceal, 6) <= to_display(&conceal, 13));
+    }
+
+    #[test]
+    fn chat_renderer_hides_heading_and_inline_markers() {
+        // "# Plan and **bold**" -> "Plan and bold"; the styled segment maps
+        // across both concealed marker runs.
+        let text = "# Plan and **bold**";
+        let conceal = vec![(0, 2), (11, 13), (17, 19)];
+        let segs = vec![Segment {
+            start: 0,
+            end: text.len(),
+            style: Style::default(),
+        }];
+        let lines = ChatRenderer::new().lines(&[msg(text, segs, conceal)], 40);
+        assert_eq!(lines.len(), 1, "display text fits one row");
+        assert_eq!(lines[0].spans[0].content.as_ref(), "user      ");
+        assert_eq!(lines[0].spans[1].content.as_ref(), "Plan and bold");
+    }
+
+    #[test]
+    fn wrap_concealed_matches_display_wrap_lines() {
+        // Wrapping happens on the *display* text, exactly like `wrap_lines`:
+        // row count and content stay in lockstep with the plain-text wrap.
+        let text = "**bold** and more words here to force wrapping";
+        let conceal = vec![(0, 2), (7, 9)];
+        let m = msg(
+            text,
+            vec![Segment {
+                start: 0,
+                end: text.len(),
+                style: Style::default(),
+            }],
+            conceal,
+        );
+        let display = display_text(&m);
+        let wrapped = wrap_concealed(&m, 9);
+        let plain = wrap_lines(&display, 9);
+        assert_eq!(wrapped.len(), plain.len());
+        for (row, expected) in wrapped.iter().zip(&plain) {
+            // Row text is byte-identical to the plain display wrap; only span
+            // boundaries differ. Here the single segment spans the whole row.
+            let joined: String = row.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(joined, *expected);
+        }
+    }
+
+    #[test]
+    fn fenced_code_content_is_never_concealed() {
+        // Only the fence delimiters are hidden; the content between them
+        // survives byte-for-byte (the renderer maps it verbatim through).
+        let text = "```bash\nfor x in 1 2; do\n  echo $x\ndone\n```";
+        let close = text.len() - 3;
+        let conceal = vec![(0, 3), (close, close + 3)];
+        let m = msg(text, vec![], conceal);
+        let expected = "bash\nfor x in 1 2; do\n  echo $x\ndone\n";
+        assert_eq!(display_text(&m).as_ref(), expected);
+    }
+
+    #[test]
+    fn content_height_uses_display_text_when_concealing() {
+        let mut panel = TurnPanel::default();
+        // "**bold**" wraps to 2 rows at text width 4; the display text
+        // "bold" fits one.
+        panel.messages.push(msg(
+            "**bold**",
+            vec![Segment {
+                start: 0,
+                end: 8,
+                style: Style::default(),
+            }],
+            vec![(0, 2), (6, 8)],
+        ));
+        let content_w = 15; // text width 4
+        assert!(panel.renderer.conceal_enabled());
+        assert_eq!(panel.content_height(content_w), 1);
+        panel.renderer.set_conceal(false);
+        assert_eq!(panel.content_height(content_w), 2);
+    }
+
+    #[test]
+    fn transcript_caches_every_message_up_to_the_start() {
+        // The transcript keeps all messages in memory (up to the compaction
+        // point or the start of the session) — the sliding window only limits
+        // what gets *rendered*, never what is retained. A flood never drops
+        // the oldest messages; they stay reachable for scrollback.
+        let mut panel = TurnPanel::default();
+        for i in 0..2500 {
+            panel.push(Role::User, format!("message {i}"));
+        }
+        assert_eq!(panel.messages.len(), 2500);
+        assert_eq!(panel.messages[0].text, "message 0");
+        assert_eq!(
+            panel.messages.last().map(|m| m.text.as_str()),
+            Some("message 2499")
+        );
+        // The whole list is still measured (cached heights — no trimming).
+        assert_eq!(panel.content_height(40), 2500);
+    }
+
+    #[test]
+    fn windowed_render_matches_the_full_transcript_rows() {
+        // The visible-window render must show exactly the rows the full
+        // build would at the same scroll offset: windowing only limits *which
+        // messages* get wrapped per frame, it never changes the rows.
+        let mut panel = TurnPanel::default();
+        for i in 0..60 {
+            let text = match i % 3 {
+                0 => format!("message {i} {}", "x".repeat(60)), // wraps to 3 rows
+                1 => format!("short {i}"),
+                _ => format!("medium {i} {}", "y".repeat(35)),
+            };
+            panel.push(Role::User, text);
+        }
+        panel.renderer.set_conceal(false); // exercise the base pipeline
+        let content_w = 40;
+        let viewport = 12;
+        let content_h = panel.content_height(content_w);
+        let full = panel.build_lines(content_w);
+        assert_eq!(full.len(), content_h, "cached heights equal the built rows");
+        for offset in [0, 7, content_h / 2, content_h.saturating_sub(viewport)] {
+            let (start, within) = panel.window_start(offset);
+            let end = panel.window_end(start, viewport, within);
+            let slice_lines = panel.build_lines_slice(&panel.messages[start..=end], content_w);
+            let got = &slice_lines[within..(within + viewport).min(slice_lines.len())];
+            let expected = &full[offset..(offset + viewport).min(full.len())];
+            assert_eq!(got, expected, "visible window at scroll offset {offset}");
+        }
+    }
+
+    #[test]
+    fn rows_cache_refreshes_on_text_change_and_collapse() {
+        let mut panel = TurnPanel::default();
+        panel.push(Role::User, "one".into());
+        panel.push(Role::User, "two".into());
+        let content_w = 15; // text width 4
+        assert_eq!(panel.content_height(content_w), 2);
+        assert!(!panel.messages.iter().any(|m| m.dirty));
+
+        // Streaming more text re-measures only the appended message. The last
+        // message is a user one, so a fresh assistant message is started.
+        panel.stream_append(" three four".into());
+        // " three four" wraps to 3 rows at text width 4; "one" and "two"
+        // keep their cached single rows.
+        assert_eq!(panel.content_height(content_w), 5);
+        assert_eq!(panel.messages[2].text, " three four");
+        assert_eq!(panel.messages[2].rows, 3);
+        assert_eq!(panel.messages[0].rows, 1, "other messages are not re-wrapped");
+        assert!(!panel.messages.iter().any(|m| m.dirty), "dirty cleared by measure");
+
+        // Collapsing a framed box shrinks it to title + bottom border rows.
+        panel.push_boxed(Role::Assistant, "boxed body here".into(), "tool".into());
+        assert_eq!(panel.content_height(content_w), 9, "5 + 4 boxed rows");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: (content_w + 1) as u16,
+            height: 30,
+        };
+        assert!(panel.handle_click(1, 6, area), "click lands on the box body");
+        assert!(panel.messages[3].collapsed);
+        assert_eq!(panel.content_height(content_w), 7, "collapsed box = 2 rows");
+        assert!(!panel.messages.iter().any(|m| m.dirty));
+    }
+
+    #[test]
+    fn toggle_conceal_switches_the_pipeline() {
+        let mut panel = TurnPanel::default();
+        assert!(panel.renderer.conceal_enabled(), "conceal defaults on");
+        assert!(!panel.toggle_conceal());
+        assert!(!panel.renderer.conceal_enabled());
+        assert!(panel.toggle_conceal());
+        assert!(panel.renderer.conceal_enabled());
+    }
+
+    #[test]
+    fn conceal_off_renders_raw_markers() {
+        // The off state must produce the original bytes, markers included.
+        let mut panel = TurnPanel::default();
+        panel
+            .messages
+            .push(msg("**bold**", vec![], vec![(0, 2), (6, 8)]));
+        panel.renderer.set_conceal(false);
+        let lines = panel.build_lines(40);
+        assert_eq!(lines[0].spans[1].content.as_ref(), "**bold**");
+    }
+
+    #[test]
+    fn boxed_message_renders_a_full_box() {
+        let m = Message {
+            boxed: Some("bash".into()),
+            ..msg("ls -la", vec![], vec![])
+        };
+        let lines = BorderedRenderer::lines(std::slice::from_ref(&m), 40, true);
+        assert_eq!(lines.len(), 3);
+        // Top: `┌─` title indicator, filled with ─ to exactly content_w.
+        assert_eq!(
+            lines[0].spans[0].content.as_ref(),
+            format!("┌─ bash [−] {}┐", "─".repeat(27))
+        );
+        assert_eq!(lines[0].spans[0].content.as_ref().chars().count(), 40);
+        // Content row: `│ ` + body + padding + ` │`, filling content_w cells.
+        assert_eq!(lines[1].spans[0].content.as_ref(), "│ ");
+        assert_eq!(lines[1].spans[1].content.as_ref(), "ls -la");
+        assert_eq!(
+            lines[1].spans[2].content.as_ref(),
+            format!("{} │", " ".repeat(30))
+        );
+        let total: usize = lines[1]
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(total, 40, "content row fills the box width");
+        // Bottom border.
+        assert_eq!(
+            lines[2].spans[0].content.as_ref(),
+            format!("└{}┘", "─".repeat(38))
+        );
+    }
+
+    #[test]
+    fn panel_overlay_renders_inside_the_box_and_counts_rows() {
+        // A pending permission ask rides the PanelOp::Overlay op: it renders
+        // as a framed mini-panel at the bottom *inside* the box (never
+        // outside), pins the viewport so it is visible, expands a collapsed
+        // box, and clearing it restores the plain boxed rows.
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Create {
+            id: 1,
+            title: "bash result".into(),
+            boxed: true,
+            conceal_box: false,
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "one\ntwo".into(),
+        });
+        let desc = "openat (pid 7) requests write: O_WRONLY|O_CREAT";
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: Some(desc.into()),
+        });
+        assert_eq!(panel.messages.len(), 1);
+        assert!(
+            panel.follow,
+            "setting an overlay pins the view to the bottom"
+        );
+        assert!(
+            panel.messages[0].overlay.is_some(),
+            "the message carries the ask"
+        );
+
+        let content_w = 40;
+        let lines = BorderedRenderer::lines(&panel.messages, content_w, true);
+        assert_eq!(
+            lines.len(),
+            message_rows(&panel.messages[0], content_w, true),
+            "overlay rows count must agree with the renderer"
+        );
+        let render_line =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let joined: Vec<String> = lines.iter().map(render_line).collect();
+        assert!(
+            joined
+                .iter()
+                .any(|l| l.contains("[y] allow") && l.contains("deny")),
+            "the key prompt is the overlay title: {joined:?}"
+        );
+        assert!(
+            joined.iter().any(|l| l.contains("requests write")),
+            "the ask description renders inside the box: {joined:?}"
+        );
+        // The overlay sits between the body and the outer bottom border.
+        let body = joined.iter().position(|l| l.contains("two"));
+        let ov = joined.iter().position(|l| l.contains("[y] allow"));
+        let bot = joined
+            .iter()
+            .position(|l| l.starts_with('└') && !l.contains('│'));
+        assert!(
+            body.is_some() && ov.is_some() && bot.is_some(),
+            "{joined:?}"
+        );
+        assert!(body.unwrap() < ov.unwrap() && ov.unwrap() < bot.unwrap());
+
+        // A collapsed box is expanded by the pending overlay.
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "\nmore".into(),
+        });
+        panel.messages[0].collapsed = true;
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: Some(desc.into()),
+        });
+        assert!(
+            !panel.messages[0].collapsed,
+            "an ask reopens a collapsed box"
+        );
+        assert_eq!(
+            BorderedRenderer::lines(&panel.messages, content_w, true).len(),
+            message_rows(&panel.messages[0], content_w, true)
+        );
+
+        // Clearing the overlay returns the box to its plain rows.
+        panel.apply_op(PanelOp::Overlay { id: 1, text: None });
+        let m = &panel.messages[0];
+        assert!(m.overlay.is_none());
+        let inner = content_w.saturating_sub(4);
+        let body_rows = wrap_lines(&m.text, inner).len().max(1);
+        assert_eq!(message_rows(m, content_w, true), body_rows + 2);
+        assert_eq!(
+            BorderedRenderer::lines(&panel.messages, content_w, true).len(),
+            body_rows + 2,
+            "after clearing, the overlay is gone from the render too"
+        );
+    }
+
+    #[test]
+    fn boxed_message_renders_raw_markers_not_concealed() {
+        // The box guarantees the non-conceal base: markers stay visible even
+        // when conceal is on and the message carries conceal ranges.
+        let m = Message {
+            boxed: Some("bash".into()),
+            ..msg("**bold**", vec![], vec![(0, 2), (6, 8)])
+        };
+        let lines = BorderedRenderer::lines(std::slice::from_ref(&m), 40, true);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].spans[1].content.as_ref(), "**bold**");
+    }
+
+    #[test]
+    fn collapsed_box_renders_just_title_and_keeps_height_parity() {
+        let m = Message {
+            boxed: Some("bash".into()),
+            ..msg("ls -la", vec![], vec![])
+        };
+        let expanded = BorderedRenderer::lines(std::slice::from_ref(&m), 40, true);
+        assert_eq!(
+            message_rows(&m, 40, true),
+            expanded.len(),
+            "expanded parity"
+        );
+
+        let m = Message {
+            boxed: Some("bash".into()),
+            collapsed: true,
+            ..msg("ls -la", vec![], vec![])
+        };
+        let collapsed = BorderedRenderer::lines(std::slice::from_ref(&m), 40, true);
+        assert_eq!(collapsed.len(), 2, "collapsed box is just two border rows");
+        assert_eq!(
+            collapsed[0].spans[0].content.as_ref(),
+            format!("┌─ bash [+] {}┐", "─".repeat(27))
+        );
+        assert_eq!(
+            collapsed[1].spans[0].content.as_ref(),
+            format!("└{}┘", "─".repeat(38))
+        );
+        assert_eq!(message_rows(&m, 40, true), 2);
+    }
+
+    #[test]
+    fn click_toggles_a_boxed_message() {
+        let mut panel = TurnPanel::default();
+        panel.push_boxed(Role::Assistant, "ls -la".into(), "bash".into());
+        panel.push(Role::User, "ok".into());
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 42,
+            height: 10,
+        };
+        // Paragraph rows: 0 top, 1 content, 2 bottom; user tag row 3. Screen
+        // rows shift by area.y (the chat log has no block border).
+        assert!(panel.handle_click(5, 1, area), "content row of the box");
+        assert!(panel.messages[0].collapsed);
+        assert!(panel.handle_click(5, 1, area), "click again to expand");
+        assert!(!panel.messages[0].collapsed);
+        assert!(
+            !panel.handle_click(5, 4, area),
+            "plain message is not a box"
+        );
+        assert!(
+            panel.handle_click(5, 2, area),
+            "bottom border still hits the box"
+        );
+        assert!(panel.messages[0].collapsed);
+    }
+
+    #[test]
+    fn click_outside_the_body_is_ignored() {
+        let mut panel = TurnPanel::default();
+        panel.push_boxed(Role::Assistant, "ls -la".into(), "bash".into());
+        let area = Rect {
+            x: 0,
+            y: 1,
+            width: 42,
+            height: 10,
+        };
+        assert!(!panel.handle_click(41, 1, area), "scrollbar lane (right edge)");
+        assert!(!panel.handle_click(42, 1, area), "past the right edge");
+        assert!(
+            !panel.handle_click(5, 0, area),
+            "above the body (row < area.y)"
+        );
+        assert!(panel.handle_click(5, 1, area), "body rows are clickable");
+        assert!(panel.messages[0].collapsed);
+    }
+
+    #[test]
+    fn boxed_content_wraps_inside_the_box() {
+        // Long text wraps at content_w - 4; every content row still fills the
+        // full box width with padding, so the right border stays aligned.
+        let text = "a very long line that must wrap inside the tool box";
+        let m = Message {
+            boxed: Some("read_file".into()),
+            ..msg(text, vec![], vec![])
+        };
+        let lines = BorderedRenderer::lines(std::slice::from_ref(&m), 20, true);
+        let wrapped = wrap_lines(text, 16); // content_w - 4
+        assert_eq!(lines.len(), wrapped.len() + 2, "interior rows + 2 borders");
+        for row in &lines[1..lines.len() - 1] {
+            let total: usize = row.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert_eq!(total, 20, "every content row fills the box width");
+        }
+        assert_eq!(message_rows(&m, 20, true), lines.len());
+    }
+
+    #[test]
+    fn mixed_boxed_and_concealed_transcript() {
+        // A normal concealed message next to a boxed one: outside the box the
+        // toggle applies, inside the box markers stay raw.
+        let concealed = Message {
+            role: Role::User,
+            boxed: None,
+            ..msg(
+                "# Plan",
+                vec![Segment {
+                    start: 0,
+                    end: 6,
+                    style: Style::default(),
+                }],
+                vec![(0, 2)],
+            )
+        };
+        let boxed = Message {
+            role: Role::Assistant,
+            boxed: Some("bash".into()),
+            ..msg("echo **hi**", vec![], vec![(5, 7), (10, 12)])
+        };
+        let mut panel = TurnPanel::default();
+        panel.messages.extend([Message { ..concealed }, boxed]);
+        let lines = BorderedRenderer::lines(&panel.messages, 40, true);
+        // Tag rows + body, then the box's 3 rows.
+        let joined: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            joined[0].contains("Plan"),
+            "concealed outside the box: {joined:?}"
+        );
+        assert!(
+            joined.iter().any(|l| l.contains("echo **hi**")),
+            "raw inside the box: {joined:?}"
+        );
+        // Height parity across the mixed transcript.
+        let mut hs = 0;
+        for m in &panel.messages {
+            hs += message_rows(m, 40, true);
+        }
+        assert_eq!(hs, lines.len());
+    }
+
+    #[test]
+    fn push_boxed_records_state() {
+        let mut panel = TurnPanel::default();
+        panel.push_boxed(Role::Assistant, "ls".into(), "bash".into());
+        assert_eq!(panel.messages.len(), 1);
+        assert_eq!(panel.messages[0].boxed.as_deref(), Some("bash"));
+        assert!(!panel.messages[0].collapsed);
+        assert_eq!(panel.messages[0].role, Role::Assistant);
+        assert_eq!(panel.messages[0].text, "ls");
+    }
+
+    #[test]
+    fn stream_append_creates_then_appends_one_message() {
+        let mut panel = TurnPanel::default();
+        panel.stream_append("Hel");
+        panel.stream_append("lo");
+        panel.stream_append(" world");
+        assert_eq!(panel.messages.len(), 1, "streaming fills one message");
+        assert_eq!(panel.messages[0].role, Role::Assistant);
+        assert_eq!(panel.messages[0].text, "Hello world");
+        assert!(panel.messages[0].boxed.is_none());
+    }
+
+    #[test]
+    fn stream_append_starts_fresh_after_user_and_boxed_messages() {
+        let mut panel = TurnPanel::default();
+        panel.push(Role::User, "hi".into());
+        panel.stream_append("answer");
+        assert_eq!(panel.messages.len(), 2, "a user message starts a new one");
+        assert_eq!(panel.messages[1].role, Role::Assistant);
+        assert_eq!(panel.messages[1].text, "answer");
+
+        // A tool-call box after the answer: the next fragment must not be
+        // appended into the box — it starts another plain assistant message.
+        panel.push_boxed(Role::Assistant, "args".into(), "echo".into());
+        panel.stream_append("more");
+        assert_eq!(panel.messages.len(), 4);
+        assert_eq!(panel.messages[2].text, "args", "boxed body untouched");
+        assert_eq!(panel.messages[2].boxed.as_deref(), Some("echo"));
+        assert_eq!(panel.messages[3].text, "more");
+        assert_eq!(panel.messages[3].role, Role::Assistant);
+    }
+
+    #[test]
+    fn stream_append_boxed_flows_into_one_block_and_breaks_on_plain() {
+        let mut panel = TurnPanel::default();
+        panel.stream_append_boxed("Hel", "response".into());
+        panel.stream_append_boxed("lo", "response".into());
+        assert_eq!(panel.messages.len(), 1, "same box keeps accumulating");
+        assert_eq!(panel.messages[0].text, "Hello");
+        assert_eq!(panel.messages[0].boxed.as_deref(), Some("response"));
+        assert!(
+            panel.messages[0].conceal_box,
+            "streamed blocks follow the toggle"
+        );
+
+        // A *different* block title starts a new box (e.g. reasoning flushed
+        // while a prior response box is still last).
+        panel.stream_append_boxed("think", "reasoning".into());
+        assert_eq!(panel.messages.len(), 2);
+        assert_eq!(panel.messages[1].text, "think");
+        assert_eq!(panel.messages[1].boxed.as_deref(), Some("reasoning"));
+        assert!(panel.messages[1].conceal_box);
+
+        // …and after a plain message the streaming seam restarts a fresh box
+        // rather than leaking into the plain row.
+        panel.push(Role::Assistant, "summary".into());
+        panel.stream_append_boxed("next", "response".into());
+        assert_eq!(panel.messages.len(), 4);
+        assert_eq!(panel.messages[2].text, "summary");
+        assert_eq!(panel.messages[2].boxed, None);
+        assert_eq!(panel.messages[3].text, "next");
+        assert_eq!(panel.messages[3].boxed.as_deref(), Some("response"));
+        assert!(panel.messages[3].conceal_box);
+    }
+
+    #[test]
+    fn conceal_boxes_hide_markers_with_the_toggle_like_plain_messages() {
+        // A reasoning/response block opts its *content* into the conceal path
+        // AND renders borderless — exactly like a plain message: markers
+        // visible with the toggle off, hidden with it on, and the row-height
+        // tracker agrees (no frame rows).
+        let cover = vec![Segment {
+            start: 0,
+            end: 128,
+            style: Style::default(),
+        }];
+        let mut fb = Message {
+            boxed: Some("response".into()),
+            conceal_box: true,
+            ..msg("**bold** text", cover, vec![(0, 2), (6, 8)])
+        };
+        let off = BorderedRenderer::lines(std::slice::from_ref(&fb), 40, false);
+        let on = BorderedRenderer::lines(std::slice::from_ref(&fb), 40, true);
+        assert_eq!(off.len(), 1, "borderless: no frame rows");
+        assert_eq!(off[0].spans[1].content.as_ref(), "**bold** text");
+        assert_eq!(on.len(), 1, "toggle on keeps one (concealed) row");
+        assert_eq!(on[0].spans[1].content.as_ref(), "bold text");
+        assert_eq!(message_rows(&fb, 40, true), on.len(), "conceal-on parity");
+        assert_eq!(
+            message_rows(&fb, 40, false),
+            off.len(),
+            "conceal-off parity"
+        );
+
+        // Concealing markers can shrink the wrapped height; the tracker must
+        // agree with the renderer again (the raw 14-char bold string wraps
+        // into more rows than the plain "abcdefghij" display text).
+        fb.text = "**abcdefghij**".into();
+        let off = BorderedRenderer::lines(std::slice::from_ref(&fb), 14, false);
+        let on = BorderedRenderer::lines(std::slice::from_ref(&fb), 14, true);
+        assert!(on.len() < off.len(), "the concealed display text wraps less");
+        assert_eq!(message_rows(&fb, 14, true), on.len());
+        assert_eq!(message_rows(&fb, 14, false), off.len());
+
+        // A plain tool box (no opt-in) stays framed and keeps raw markers
+        // even with conceal on.
+        let tb = Message {
+            boxed: Some("bash".into()),
+            ..msg("**bold**", vec![], vec![(0, 2), (6, 8)])
+        };
+        let raw = BorderedRenderer::lines(std::slice::from_ref(&tb), 40, true);
+        assert_eq!(raw[1].spans[1].content.as_ref(), "**bold**");
+        assert_eq!(message_rows(&tb, 40, true), raw.len(), "box parity");
+    }
+
+    #[test]
+    fn reasoning_and_response_blocks_are_borderless_and_only_reasoning_is_dimmed() {
+        // The agent loop's two streamed blocks shed their frames: reasoning
+        // and response both render as plain assistant messages, reasoning
+        // dimmed; only framed tool boxes keep `┌─…┐` and stay
+        // click-collapsible.
+        let mk = |title: &str, text: &str| Message {
+            boxed: Some(title.into()),
+            conceal_box: true,
+            ..msg(text, vec![], vec![])
+        };
+        let mut all = vec![
+            mk("reasoning", "**think** harder"),
+            mk("response", "the **answer**"),
+        ];
+        all.push(Message {
+            boxed: Some("bash".into()),
+            ..msg("ls -la", vec![], vec![])
+        });
+        let lines = BorderedRenderer::lines(&all, 50, true);
+        assert_eq!(
+            lines.len(),
+            5,
+            "1 reasoning + 1 response row, then the box's 3 framed rows"
+        );
+        let joined: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(!joined[0].contains('┌'), "reasoning has no frame: {joined:?}");
+        assert!(!joined[1].contains('┌'), "response has no frame: {joined:?}");
+        assert!(joined[2].contains('┌'), "the tool box keeps its frame: {joined:?}");
+
+        let all_dim = |line: &Line<'static>| line
+            .spans
+            .iter()
+            .all(|s| s.style.add_modifier.contains(Modifier::DIM));
+        assert!(all_dim(&lines[0]), "reasoning (tag + body) is all dimmed");
+        assert!(
+            !all_dim(&lines[1]),
+            "response keeps the normal assistant style"
+        );
+        assert!(!all_dim(&lines[2]), "the framed box stays undimmed");
+
+        // Only framed boxes toggle on click; borderless blocks do not.
+        let mut panel = TurnPanel::default();
+        panel.stream_append_boxed("think", "reasoning".into());
+        panel.push_boxed(Role::Assistant, "ls -la".into(), "bash".into());
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 42,
+            height: 10,
+        };
+        assert!(
+            !panel.handle_click(5, 0, area),
+            "a reasoning row is not a collapsible box"
+        );
+        assert!(
+            panel.handle_click(5, 1, area),
+            "the framed tool box still toggles"
+        );
+        assert!(panel.messages[1].collapsed);
+    }
+
+    #[test]
+    fn panel_ops_materialize_and_append_by_id() {
+        // Lua panels are keyed by op id, not by "still the last message", so
+        // interleaved panels keep flowing into their own messages.
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Create {
+            id: 1,
+            title: "first".into(),
+            boxed: true,
+            conceal_box: true,
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "a".into(),
+        });
+        panel.apply_op(PanelOp::Create {
+            id: 2,
+            title: "second".into(),
+            boxed: false,
+            conceal_box: false,
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 2,
+            text: "b".into(),
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "c".into(),
+        });
+        assert_eq!(panel.messages.len(), 2);
+        assert_eq!(panel.messages[0].boxed.as_deref(), Some("first"));
+        assert_eq!(panel.messages[0].text, "ac");
+        assert!(panel.messages[0].conceal_box);
+        assert!(panel.messages[1].boxed.is_none());
+        assert_eq!(panel.messages[1].text, "b");
+        assert!(!panel.messages[1].conceal_box);
+        assert_eq!(panel.messages[0].role, Role::Assistant);
+    }
+
+    #[test]
+    fn panel_highlight_adds_sorted_styled_regions() {
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Create {
+            id: 1,
+            title: "log".into(),
+            boxed: false,
+            conceal_box: false,
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "hello".into(),
+        });
+        panel.apply_op(PanelOp::Highlight {
+            id: 1,
+            start: 0,
+            end: 5,
+            style: "bold".into(),
+        });
+        panel.apply_op(PanelOp::Highlight {
+            id: 1,
+            start: 2,
+            end: 99,
+            style: "cyan".into(),
+        });
+        // No markdown highlighter in this panel: regions are the whole `segs`.
+        let segs = &panel.messages[0].segs;
+        assert_eq!(
+            segs,
+            &[
+                Segment {
+                    start: 0,
+                    end: 5,
+                    style: Style::default().add_modifier(Modifier::BOLD)
+                },
+                Segment {
+                    start: 2,
+                    end: 5,
+                    style: Style::default().fg(Color::Cyan)
+                },
+            ]
+        );
+        // Capture-name styles still work as a fallback for unknown specs.
+        panel.apply_op(PanelOp::Highlight {
+            id: 1,
+            start: 3,
+            end: 4,
+            style: "number".into(),
+        });
+        let segs = &panel.messages[0].segs;
+        assert_eq!(segs[0].start, 0);
+        assert!(
+            segs.iter().any(|s| s.style.fg == Some(Color::LightYellow)),
+            "{segs:?}"
+        );
+    }
+
+    #[test]
+    fn panel_highlight_clamps_and_normalizes_ranges() {
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Create {
+            id: 1,
+            title: "log".into(),
+            boxed: false,
+            conceal_box: false,
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "abcd".into(),
+        });
+        panel.apply_op(PanelOp::Highlight {
+            id: 1,
+            start: 5,
+            end: 2,
+            style: "bold".into(),
+        });
+        assert_eq!(
+            panel.messages[0].segs,
+            &[Segment {
+                start: 2,
+                end: 4,
+                style: Style::default().add_modifier(Modifier::BOLD)
+            }]
+        );
+    }
+
+    #[test]
+    fn panel_set_replaces_text_keeping_regions() {
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Create {
+            id: 1,
+            title: "status".into(),
+            boxed: false,
+            conceal_box: false,
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "hello".into(),
+        });
+        panel.apply_op(PanelOp::Highlight {
+            id: 1,
+            start: 0,
+            end: 5,
+            style: "bold".into(),
+        });
+        panel.apply_op(PanelOp::Set {
+            id: 1,
+            text: "world".into(),
+        });
+        let msg = &panel.messages[0];
+        assert_eq!(msg.text, "world");
+        assert_eq!(
+            msg.segs.len(),
+            1,
+            "regions survive a set (clamped to the new text)"
+        );
+        assert_eq!(msg.segs[0].start, 0);
+        assert_eq!(msg.segs[0].end, 5);
+    }
+
+    #[test]
+    fn panel_clear_regions_drops_user_segments() {
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Create {
+            id: 1,
+            title: "log".into(),
+            boxed: false,
+            conceal_box: false,
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "hello".into(),
+        });
+        panel.apply_op(PanelOp::Highlight {
+            id: 1,
+            start: 0,
+            end: 5,
+            style: "bold".into(),
+        });
+        assert_eq!(panel.messages[0].segs.len(), 1);
+        panel.apply_op(PanelOp::ClearRegions { id: 1 });
+        assert!(panel.messages[0].segs.is_empty());
+    }
+
+    #[test]
+    fn panel_unknown_and_contentless_ops_are_ignored() {
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Append {
+            id: 99,
+            text: "nope".into(),
+        });
+        panel.apply_op(PanelOp::Set {
+            id: 99,
+            text: "nope".into(),
+        });
+        panel.apply_op(PanelOp::Highlight {
+            id: 99,
+            start: 0,
+            end: 2,
+            style: "bold".into(),
+        });
+        assert!(
+            panel.messages.is_empty(),
+            "unknown panels never materialize"
+        );
+        // A created-but-contentless panel cannot be highlighted either.
+        panel.apply_op(PanelOp::Create {
+            id: 7,
+            title: "empty".into(),
+            boxed: false,
+            conceal_box: false,
+        });
+        panel.apply_op(PanelOp::Highlight {
+            id: 7,
+            start: 0,
+            end: 2,
+            style: "bold".into(),
+        });
+        assert!(
+            panel.messages.is_empty(),
+            "highlight before content stays a no-op"
+        );
+    }
+
+    #[test]
+    fn split_panel_is_side_by_side_wide_and_stacked_narrow() {
+        let m = split_msg();
+        // Wide (content_w 100 -> inner 96 >= 2 cols of 20 + rule): panes in
+        // equal columns joined by a `│`, body height = tallest column.
+        let wide = BorderedRenderer::lines(std::slice::from_ref(&m), 100, true);
+        assert_eq!(
+            wide.len(),
+            message_rows(&m, 100, true),
+            "heights agree with message_rows"
+        );
+        assert_eq!(
+            wide.len(),
+            3 + 2,
+            "caption rows + 2 body rows + box borders"
+        );
+        let caption: String = wide[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        let cols: Vec<&str> = caption.split('│').map(|p| p.trim()).collect();
+        assert_eq!(
+            cols,
+            ["", "before", "after", ""],
+            "captions split across the rule"
+        );
+        let body: String = wide[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        let cols: Vec<&str> = body.split('│').map(|p| p.trim()).collect();
+        assert_eq!(cols, ["", "aaa", "cc", ""], "pane bodies read side by side");
+
+        // Narrow (content_w 30 -> inner 26 < 41): panes stack full-width with
+        // a dim rule between them; the box borders frame the whole block.
+        let narrow = BorderedRenderer::lines(std::slice::from_ref(&m), 30, true);
+        assert_eq!(
+            narrow.len(),
+            message_rows(&m, 30, true),
+            "heights agree with message_rows"
+        );
+        let flat: String = narrow
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        for needle in ["before", "aaa", "bb", "after", "cc"] {
+            assert!(
+                flat.contains(needle),
+                "stacked panes keep every row: {needle:?}"
+            );
+        }
+        // Exactly one rule row between the two stacked panes: the framed
+        // `│ ──── │` trims to a pure ─ run; borders and text rows don't.
+        let rules = narrow
+            .iter()
+            .filter(|l| {
+                let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                let inner = s.trim_matches(|c: char| c == '│' || c == ' ');
+                !inner.is_empty() && inner.chars().all(|c| c == '─')
+            })
+            .count();
+        assert_eq!(rules, 1, "exactly one rule row between the stacked panes");
+    }
+
+    #[test]
+    fn split_panel_partitions_columns_by_bounds() {
+        // Three panes at a very wide content area: their captions and bodies
+        // each land in their own column slice, never bleeding across.
+        let mut m = split_msg();
+        let mut panes = m.panes.take().expect("split panes");
+        panes.push(PaneContent {
+            caption: "third".into(),
+            text: "dd".into(),
+            lang: None,
+            segs: Vec::new(),
+            user_segs: Vec::new(),
+        });
+        m.panes = Some(panes);
+        let wide = BorderedRenderer::lines(std::slice::from_ref(&m), 160, true);
+        let text: String = wide[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.find("before").unwrap() < text.find("third").unwrap(),
+            "third column after the second: {text:?}"
+        );
+        let cells: usize = wide[1]
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(cells, 160, "body rows fill the full box width");
+    }
+
+    #[test]
+    fn split_panel_collapses_like_any_boxed_message() {
+        let mut m = split_msg();
+        m.collapsed = true;
+        assert_eq!(
+            message_rows(&m, 80, true),
+            2,
+            "collapsed: title + bottom only"
+        );
+        let lines = BorderedRenderer::lines(std::slice::from_ref(&m), 80, true);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].spans[0].content.as_ref().contains("[+]"));
+    }
+
+    #[test]
+    fn split_panel_overlay_renders_inside_the_boxed_split() {
+        let mut m = split_msg();
+        m.overlay = Some("applying…".into());
+        let lines = BorderedRenderer::lines(std::slice::from_ref(&m), 80, true);
+        assert_eq!(
+            lines.len(),
+            message_rows(&m, 80, true),
+            "heights agree with message_rows"
+        );
+        let flat: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            flat.contains("applying"),
+            "the ask/status seam draws inside the split box"
+        );
+        assert!(flat.contains("allow"), "the overlay prompt row is present");
+    }
+}
