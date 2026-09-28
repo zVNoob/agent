@@ -198,10 +198,13 @@ return {
   },
 
   panel_overlay = {
-    summary = "Pin an overlay at the bottom of a panel (the ask seam).",
+    summary = "Set or clear a panel's dialog: the ask seam, drawn at the \
+      bottom of the panel's own box.",
     args = {
       { "id", "number", "a panel id" },
-      { "text", "string", "the overlay text" },
+      { "text", "string", "the question; nil clears the dialog" },
+      { "always", "boolean", "whether the answer is one to remember, which is \
+        what offers [a]lways in the key prompt" },
     },
     returns = "nothing",
   },

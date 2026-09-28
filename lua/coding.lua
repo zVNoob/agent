@@ -6,7 +6,7 @@
 --   agent.mode.set()           -- back to the state captured before the first switch
 --
 -- Registering it changes nothing until you switch to it. It is the mode the
--- shipped config starts in (`agent.lua`), and it is the mode you actually work
+-- shipped config starts in, and it is the mode you actually work
 -- in, as against `compact` — which is a *restriction*: an empty connection set,
 -- so a compaction turn has no tools at all and can only answer.
 --

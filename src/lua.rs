@@ -76,7 +76,7 @@
 //! - returns `true` (or `agent.allow()`) → `Verdict::Allow` — the syscall runs
 //!   normally;
 //! - returns `false` → `Verdict::Deny` — final: the whole tree is SIGKILLed
-//!   and the run ends (see `src/seccomp.rs` for the deny semantics);
+//!   and the run ends (see `src/seccomp/` for the deny semantics);
 //! - returns `agent.deny(reason)` → `Denied(reason)` — the same final deny,
 //!   but the run's result carries `denied_reason` so the panel status line
 //!   reads `Denied: <reason>` and the tool's JSON result names it;
@@ -245,7 +245,7 @@
 //! panels (`:append`/`:set` text, `:highlight` styled byte regions,
 //! `:clear_regions`) — the primitives underneath are the `agent.api.panel_*`
 //! entry points above. Emitted ops buffer in the round's
-//! [`PanelSink`](crate::panels::PanelSink) and the TUI applies them; with no
+//! [`PanelSink`] and the TUI applies them; with no
 //! sink (headless) they are no-ops. Panels render through the same pipelines
 //! as every other message, so the UI stays the familiar one.
 //!
@@ -256,16 +256,16 @@
 //! for a Lua `apply_patch`: before/after code renders side-by-side with
 //! tree-sitter running on each pane's own clean text (a unified diff could
 //! never do that — the grammar would choke on its `+`/`-` prefixes).
-//! Underneath this is [`PanelOp::Split`](crate::panels::PanelOp::Split) +
+//! Underneath this is [`PanelOp::Split`] +
 //! the `_panel_pane_*` primitives, mirroring the single-body `agent.panel`.
 //!
-//! Rust consumers get the same thing in one shot: [`bash`] runs a sandboxed
-//! `bash -c "cmdline"` on a fresh VM under a Lua policy that is itself plain
-//! Lua source (the CLI's `bash` tool — see `src/tools.rs` — is built on it).
+//! Rust consumers get the same thing in one shot, and it is all Lua: `agent.bash`
+//! (`lua/lib/bash.lua`) runs a sandboxed `bash -c "cmdline"` under a Lua policy
+//! that is itself plain Lua source, on the agent's own VM.
 //!
 //! ## MCP: `agent.mcp` and `agent.mcps`
 //!
-//! [`mcp`] adds the JSON text boundary above; the **MCP client protocol** is
+//! [`mcp`](crate::mcp) adds the JSON text boundary above; the **MCP client protocol** is
 //! `lua/lib/mcp.lua` — the pure-Lua `agent.mcp(name, func, opts)` module: it
 //! performs the MCP handshake (initialize → notifications/initialized →
 //! tools/list) and registers a callable **tool object** per advertised tool on
@@ -276,7 +276,7 @@
 //! ```lua
 //! local func = function(request_json, on_streaming_response_json) ... end
 //! agent.mcps.fs = agent.mcp("fs", func)
-//! local r = agent.mcps.fs.read_file({ path = "/etc/hostname" })
+//! local r = agent.mcps.fs.read({ path = "/etc/hostname" })
 //! -- r = { ok = true|false, result = <tools/call result>, error = <rpc error>, denied = true|false }
 //! ```
 //!
@@ -298,9 +298,9 @@
 //!
 //! ## HTTP(S) transport: `agent.http` (one interface, auto-routed)
 //!
-//! The MCP streamable HTTP transport is implemented in [`mcp`] **as a
-//! transport only** — Rust owns TLS, HTTP framing, and SSE parsing on a
-//! dedicated background thread; there is no protocol client over HTTP (no
+//! The MCP streamable HTTP transport is implemented in [`mcp`](crate::mcp) **as a
+//! transport only** — Rust owns TLS, HTTP framing, and SSE parsing, as tasks on
+//! the agent's own single reactor; there is no protocol client over HTTP (no
 //! handshake, no tool registry, no session machinery). The Lua half is
 //! `lua/lib/http.lua`: **one** `agent.http(method, url, opts)` returning a
 //! stream object that pushes the response through callbacks as it arrives,
@@ -366,7 +366,7 @@ use crate::seccomp::{self, CoroutineEvent, FdSlot, Step, Verdict};
 /// The sandbox handle handed to Lua. A single-owner wrapper around the live
 /// [`seccomp::Sandbox`]; dropping the userdata (GC, coroutine unwind,
 /// `agent.api.kill`) runs the engine's destructor, which SIGKILLs the whole tree
-/// (see `src/seccomp.rs`).
+/// (see `src/seccomp/`).
 struct SandboxHandle(Rc<RefCell<seccomp::Sandbox>>);
 
 impl UserData for SandboxHandle {}
@@ -382,7 +382,7 @@ pub fn setup(lua: &Lua) -> mlua::Result<()> {
 /// [`setup`] with an optional panel sink, so `agent.api.panel_*` emissions from
 /// policy/tool Lua are buffered for the TUI to apply (headless: `None`).
 fn setup_inner(lua: &Lua, sink: Option<&PanelSink>, on_ask: Option<AskHandler>) -> mlua::Result<()> {
-    setup_tree(lua, sink, on_ask, &lua_dir())
+    setup_tree(lua, sink, on_ask, &lua_dir(), &ConfigSource::default())
 }
 
 /// [`setup_inner`] against an explicit `lua/` tree instead of the resolved
@@ -392,6 +392,7 @@ fn setup_tree(
     sink: Option<&PanelSink>,
     on_ask: Option<AskHandler>,
     dir: &Path,
+    config: &ConfigSource,
 ) -> mlua::Result<()> {
     // The bridge first: every primitive in one locked table, so the entry
     // script and the lib modules can call them while they load.
@@ -401,14 +402,45 @@ fn setup_tree(
     lua.globals().set("agent", agent)?;
     install_require(lua, dir)?;
     load_lib_modules(lua, dir)?;
-    load_init(lua, dir)?;
+    // The settings table, created empty, before any configuration runs.
+    //
+    // A configuration assigns *fields* of it and never the table itself, and it
+    // has to be able to: the user's `~/.config/agent/init.lua` may be three
+    // lines long, and a file that cannot set `agent.llm.base_url` without
+    // first inventing the table is not a configuration. Every field defaults
+    // independently on the Rust side (`llm_config`, `memory_config`), so an
+    // absent key means "the default", and the starter config can still spell
+    // every value out where a user would go to change it.
+    {
+        let agent: Table = lua.globals().get("agent")?;
+        let existing: mlua::Value = agent.get("llm")?;
+        if !matches!(existing, mlua::Value::Table(_)) {
+            agent.set("llm", lua.create_table()?)?;
+        }
+    }
+    // The bridge's annotations, required by the *loader* rather than by the
+    // configuration script. The drift check below is a statement about the
+    // bridge, so it cannot depend on a file the user is invited to edit: making
+    // `agent.api_docs` the configuration's job meant that deleting one line from
+    // your own config stopped the agent with a message about a missing require.
+    load_api_docs(lua)?;
+    // The configuration script: the user's, seeded from the tree's on first run
+    // (see `ConfigSource`). Exactly one script runs — the user's file is not an
+    // overlay on top of the shipped one, it *is* the configuration.
+    match config {
+        ConfigSource::Tree => load_init(lua, dir)?,
+        ConfigSource::UserHome(home) => {
+            let (path, _) = ensure_config(dir, home.as_deref());
+            load_init_at(lua, &path)?;
+        }
+    }
     // The read-only token counters of the most recent request, seeded from the
     // process-wide snapshot so *every* VM agrees (see `record_usage`). They live
     // inside `agent.llm`, which is why this runs after the entry script created
     // it.
     install_usage(lua)?;
-    // The entry script required `lua/api.lua`; the annotations and the bridge
-    // must not drift apart.
+    // The annotations were loaded above; they and the bridge must not drift
+    // apart.
     verify_api_annotations(lua, &api)?;
     Ok(())
 }
@@ -434,7 +466,7 @@ fn setup_tree(
 //
 // Lua-side fields deliberately stay on `agent` (they are not the bridge):
 // `agent._events` (the hook registry), `agent.__on_reactor` (a flag Rust sets
-// while a handler coroutine runs), and whatever the user's own `agent.lua`
+// while a handler coroutine runs), and whatever the user's own config
 // defines.
 // ---------------------------------------------------------------------------
 
@@ -465,9 +497,50 @@ fn install_api(
     api.set("memory_latest", lua.create_function(lua_memory_latest)?)?;
     api.set("memory_flush", lua.create_function(lua_memory_flush)?)?;
     install_panel_primitives(lua, &api, &sink_slot)?;
+    install_print(lua)?;
     crate::mcp::install_bridge(lua, &api)?;
     Ok(api)
 }
+
+/// Replace the global `print` so it cannot land in the middle of the screen.
+///
+/// A TUI owns the terminal: a `print` from a tool callback or an event handler
+/// would scribble over the alternate screen and leave the garbage there when it
+/// exits. So `print` reports to [`crate::status`] instead — but only once a
+/// screen has attached. Detached (the probe, the tests, `chat`) it writes to
+/// real stdout exactly as before, which is what keeps a headless run debuggable.
+///
+/// The stringification is Lua's, not Rust's, and deliberately so: `print` is
+/// specified in terms of `tostring`, so a `__tostring` metamethod and a
+/// `__name` have to be honoured, and the C-level `lua_tolstring` mlua exposes
+/// does neither. So the shim below does what the reference `print` does —
+/// `tostring` every argument, join with tabs — and hands the finished line to a
+/// Rust primitive that only has to decide where it goes.
+fn install_print(lua: &Lua) -> mlua::Result<()> {
+    let sink = lua.create_function(|_: &Lua, line: String| {
+        if crate::status::is_attached() {
+            crate::status::print_line(&line);
+        } else {
+            println!("{line}");
+        }
+        Ok(())
+    })?;
+    lua.globals().set("__agent_print", sink)?;
+    lua.load(PRINT_SHIM).exec()?;
+    Ok(())
+}
+
+/// The `print` replacement: Lua's own argument handling, one Rust call.
+const PRINT_SHIM: &str = r#"
+local emit = __agent_print
+function print(...)
+  local n = select('#', ...)
+  if n == 0 then return emit("") end
+  local parts = {}
+  for i = 1, n do parts[i] = tostring((select(i, ...))) end
+  return emit(table.concat(parts, "\t"))
+end
+"#;
 
 /// Wrap `real` in a read-only proxy: reads pass through to the real table, any
 /// assignment raises, and `__metatable` hides the indirection from
@@ -506,13 +579,22 @@ fn lock_table(lua: &Lua, real: Table, name: &str) -> mlua::Result<Table> {
 /// name must be a real primitive with a `summary`. A bridge added without an
 /// annotation, or an annotation left behind after a removal, fails the VM
 /// instead of shipping as folklore.
+/// Require `lua/api.lua` and publish it as `agent.api_docs`, so the bridge's
+/// annotations are loaded and available whatever the configuration script does.
+fn load_api_docs(lua: &Lua) -> mlua::Result<()> {
+    let require: mlua::Function = lua.globals().get("require")?;
+    let docs: mlua::Value = require.call("api").map_err(|e| {
+        mlua::Error::RuntimeError(format!("agent.api: require(\"api\"): {e}"))
+    })?;
+    let agent: Table = lua.globals().get("agent")?;
+    agent.set("api_docs", docs)
+}
+
 fn verify_api_annotations(lua: &Lua, api: &Table) -> mlua::Result<()> {
     let agent: Table = lua.globals().get("agent")?;
     let docs: Table = agent.get("api_docs").map_err(|_| {
         mlua::Error::RuntimeError(
-            "agent.api: the entry script did not set agent.api_docs — is lua/api.lua \
-             present in the tree?"
-                .to_string(),
+            "agent.api: no api_docs — lua/api.lua did not load".to_string(),
         )
     })?;
     let mut undocumented: Vec<String> = Vec::new();
@@ -705,11 +787,20 @@ fn collect_modules(dir: &Path, prefix: &str, out: &mut Vec<String>) -> mlua::Res
     Ok(())
 }
 
-/// Run the entry script `lua/init.lua` — the last thing a VM's setup does.
+/// Run a configuration script — the last thing a VM's setup does, and either
+/// the tree's `init.lua` or the user's `~/.config/agent/init.lua` (see
+/// [`ConfigSource`]).
 fn load_init(lua: &Lua, dir: &Path) -> mlua::Result<()> {
-    let path = dir.join("init.lua");
-    let source = std::fs::read_to_string(&path).map_err(|e| {
-        mlua::Error::RuntimeError(format!("lua init: {}: {e}", path.display()))
+    load_init_at(lua, &dir.join("init.lua"))
+}
+
+/// The configuration script, run from wherever it lives — the tree's
+/// `init.lua` or the user's `~/.config/agent/init.lua`. Which one is decided by
+/// [`ConfigSource`], and both are the same script as far as the loader is
+/// concerned: a chunk that sets up `agent`.
+fn load_init_at(lua: &Lua, path: &Path) -> mlua::Result<()> {
+    let source = std::fs::read_to_string(path).map_err(|e| {
+        mlua::Error::RuntimeError(format!("lua config: {}: {e}", path.display()))
     })?;
     lua.load(&source)
         .set_name(path.display().to_string())
@@ -824,12 +915,18 @@ fn install_panel_primitives(
     })?;
     api.set("panel_overlay", {
         let sink = sink_slot.clone();
-        lua.create_function(move |_: &Lua, (id, text): (u64, Option<String>)| {
-            if let Some(s) = &*sink.borrow() {
-                s.push(PanelOp::Overlay { id, text });
-            }
-            Ok(())
-        })?
+        lua.create_function(
+            move |_: &Lua, (id, text, always): (u64, Option<String>, Option<bool>)| {
+                if let Some(s) = &*sink.borrow() {
+                    s.push(PanelOp::Overlay {
+                        id,
+                        text,
+                        always: always.unwrap_or(false),
+                    });
+                }
+                Ok(())
+            },
+        )?
     })?;
     // Split panels: one titled box holding several regions, each with its own
     // caption, text, and declared grammar (the sibling of the single-body
@@ -1002,14 +1099,63 @@ pub fn new_vm() -> mlua::Result<Lua> {
     new_vm_with_sink(None)
 }
 
-/// [`new_vm`] with an optional panel sink (see [`setup_inner`]).
+/// The VM the agent binaries run on: its configuration is the user's
+/// `~/.config/agent/init.lua`, seeded from the shipped one the first time.
+///
+/// Returns the VM and where its configuration came from, so startup can say so
+/// — a user who has never run the agent before should be told that the file now
+/// exists and is theirs, because that is the moment they can edit it.
+///
+/// Use [`new_vm_with_sink`] for an embedded or test VM instead: this one reads
+/// and writes the invoking user's home directory.
+pub fn new_agent_vm(sink: Option<&PanelSink>) -> Result<(Lua, ConfigOrigin), String> {
+    new_vm_with_ask_from(sink, None, &user_home_config())
+}
+
+/// The configuration the *agent* runs on: the user's `~/.config/agent/init.lua`,
+/// seeded from the shipped one when it is not there yet.
+///
+/// Public because "invoke a tool on a VM configured like the agent's" is a real
+/// thing a binary may want, and because it is better passed explicitly than
+/// inferred: a function that quietly reads the invoking user's home directory is
+/// a function whose behaviour depends on who is running it.
+pub fn user_config() -> ConfigSource {
+    user_home_config()
+}
+
+/// The configuration the *agent* runs on: the user's `~/.config/agent/init.lua`,
+/// seeded from the shipped one when it is not there yet.
+fn user_home_config() -> ConfigSource {
+    ConfigSource::UserHome(std::env::var_os("HOME").map(std::path::PathBuf::from))
+}
+
+/// A fresh VM whose configuration comes from `config` — the seam every
+/// constructor funnels through, so "which script configures this VM" is one
+/// decision in one place rather than one per caller.
+fn new_vm_with_ask_from(
+    sink: Option<&PanelSink>,
+    on_ask: Option<AskHandler>,
+    config: &ConfigSource,
+) -> Result<(Lua, ConfigOrigin), String> {
+    let tree = lua_dir();
+    let origin = match config {
+        ConfigSource::Tree => ConfigOrigin::Tree,
+        ConfigSource::UserHome(home) => ensure_config(&tree, home.as_deref()).1,
+    };
+    let lua = Lua::new_with(STDLIB, mlua::LuaOptions::default())
+        .map_err(|e| format!("lua: {e}"))?;
+    setup_tree(&lua, sink, on_ask, &tree, config).map_err(|e| e.to_string())?;
+    Ok((lua, origin))
+}
+
+/// [`new_vm`] with an optional panel sink (see `setup_inner`).
 pub fn new_vm_with_sink(sink: Option<&PanelSink>) -> mlua::Result<Lua> {
     new_vm_with_ask(sink, None)
 }
 
 /// [`new_vm_with_sink`] plus the user-permission ask handler that
 /// `agent.api.ask_user` calls: this is what makes a *tool* (a registered
-/// `agent.mcps` entry, run on its own thread by
+/// `agent.mcps` entry, run as a coroutine on this VM by
 /// [`invoke_mcp_tool_with_asks`]) able to put a question to the user. Without
 /// one the primitive auto-denies, so an asking policy always terminates.
 pub fn new_vm_with_ask(
@@ -1256,7 +1402,7 @@ fn usage_proxy(lua: &Lua, usage: Usage) -> mlua::Result<Table> {
 // ---------------------------------------------------------------------------
 //
 // The agent's configuration lives in Lua, not in environment variables. A
-// user `agent.lua` (./agent.lua, else ~/.config/agent/agent.lua) is loaded
+// user config (`~/.config/agent/init.lua`, see [`config_path`]) is loaded
 // after `lua/init.lua` and can set:
 //
 //   1. the LLM endpoint — `agent.llm = { base_url, model, api_key }`,
@@ -1306,16 +1452,17 @@ fn usage_proxy(lua: &Lua, usage: Usage) -> mlua::Result<Table> {
 // history, never what was logged.
 //
 // Rust **never caches** the registry. Every request reindexes `agent.mcps`
-// (the live table) and every tool invocation rebuilds a fresh VM — so an
-// agent.lua edit shows up on the very next request, with no stale Rust
-// state. The only Rust state is the config VM itself, which lives on the
-// TUI's main thread (where the reindexes read it). Fresh per-call VMs are
-// required because mlua here is built without the `send` feature (Cargo.toml
-// is frozen), so a VM cannot cross threads, and the TUI runs tools on
-// background threads.
+// (the live table) and every tool call runs on the config VM itself — so an
+// config edit shows up on the very next request, with no stale Rust state,
+// and whatever a tool decided (a trusted path, a trusted server) is still there
+// on the next one. The only Rust state is the config VM, and the process is
+// single-threaded, so it never has to cross a thread. mlua is built without the
+// `send` feature (Cargo.toml is frozen), which is what makes that a constraint
+// rather than a choice: a `Lua` is not `Send`, and a tool is therefore a
+// coroutine the event loop steps, not work handed to a thread of its own.
 
-// The runtime machinery for the Lua configuration — the defaults plus the
-// generic helpers `agent.lua` builds on — lives in the entry script
+// The runtime machinery for the Lua configuration — the built-in defaults,
+// which a user's copy then edits — lives in the entry script
 // `lua/init.lua`, which [`load_init`] runs on every VM (so it is always present
 // by the time anything reads `agent.llm`). It requires the driver itself
 // (`require("driver")`) for the `agent.bash` / `agent.memory` half of the
@@ -1328,36 +1475,123 @@ fn usage_proxy(lua: &Lua, usage: Usage) -> mlua::Result<Table> {
 // token counts of the last request, is written by the loop (see [`record_usage`])
 // and seeded into every VM.
 
-/// Where the user's `agent.lua` lives: `./agent.lua` first, else
-/// `~/.config/agent/agent.lua`. `None` when neither exists.
+/// Where the user's configuration lives: `~/.config/agent/init.lua`, and
+/// nowhere else. `None` when it does not exist, which is the normal case — the
+/// built-ins in the shipped `lua/init.lua` are a working agent on their own.
+///
+/// One location, deliberately. This used to be `./agent.lua` first and
+/// `~/.config/agent/agent.lua` second, which made *which* config was in force
+/// depend on the directory you happened to launch from — so a stray `agent.lua`
+/// in a checkout silently shadowed the real one, and `/reload` named a path that
+/// had nothing to do with the other. A single home-directory path answers "what
+/// is configured" without asking where you are standing.
+///
+/// The name matches the shipped entry script's on purpose: it is the same *kind*
+/// of file — a chunk of Lua layered over the defaults — and the two cannot be
+/// confused at runtime, because the user's lives outside the tree the loader
+/// searches. Error messages name the file they came from, which is the only
+/// place the two `init.lua` names appear side by side.
 pub fn config_path() -> Option<std::path::PathBuf> {
-    let cwd = std::path::Path::new("agent.lua");
-    if cwd.exists() {
-        return Some(cwd.to_path_buf());
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = std::path::Path::new(&home)
-            .join(".config")
-            .join("agent")
-            .join("agent.lua");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+    config_path_in(std::env::var_os("HOME").map(std::path::PathBuf::from))
 }
 
-/// Apply user configuration Lua (the contents of `agent.lua`) to `lua`:
-/// the entry script `lua/init.lua` is already loaded (by [`setup_inner`], via
-/// [`load_init`]), then the user chunk runs. A blank source is a no-op (the
-/// script's defaults stand).
+/// Where a VM's configuration comes from.
+///
+/// The split is not tidiness: one of these reads and writes the invoking user's
+/// home directory, and a test suite that did that by accident would be testing
+/// the machine rather than the code. So the home-directory path is opt-in, and
+/// [`ConfigSource::Tree`] is what every test gets.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConfigSource {
+    /// The shipped `lua/init.lua`, run where it lies. Touches no `$HOME`.
+    #[default]
+    Tree,
+    /// The user's `~/.config/agent/init.lua`, seeded from the shipped one the
+    /// first time. What the agent binaries run on.
+    UserHome(Option<std::path::PathBuf>),
+}
+
+/// How a VM's configuration came to be, so the caller can say so at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOrigin {
+    /// The shipped `init.lua` was run directly; no user config is involved.
+    Tree,
+    /// The user's `init.lua` already existed and was run.
+    Existing,
+    /// The user's `init.lua` did not exist, so the shipped one was copied there
+    /// and run. It is now *theirs* to edit.
+    Seeded,
+}
+
+/// The user's configuration file, seeded from the tree's `init.lua` when it does
+/// not exist yet.
+///
+/// This is the difference between a program that ships a configuration file and
+/// one that ships a *template*: after the first run the file at
+/// `~/.config/agent/init.lua` is the agent's configuration, and the copy beside
+/// the binary is only what it was seeded from. Editing it is the supported way
+/// to configure anything, and `/reload` re-reads it.
+///
+/// The consequence to be aware of: upgrading the agent does **not** update a
+/// config that has already been seeded, because the user's file is now the
+/// authority. Delete it to be re-seeded from whatever ships next.
+///
+/// A home that cannot be written (a read-only `$HOME`, a container running as
+/// nobody) is not fatal: the tree's own `init.lua` is run instead and the caller
+/// is told, because an agent with its defaults beats an agent that will not
+/// start.
+pub fn ensure_config(
+    tree: &Path,
+    home: Option<&std::path::Path>,
+) -> (std::path::PathBuf, ConfigOrigin) {
+    let shipped = tree.join("init.lua");
+    let Some(home) = home else {
+        return (shipped, ConfigOrigin::Tree);
+    };
+    let dir = home.join(".config").join("agent");
+    let path = dir.join("init.lua");
+    if path.is_file() {
+        return (path, ConfigOrigin::Existing);
+    }
+    if let Err(why) = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::copy(&shipped, &path))
+    {
+        eprintln!(
+            "[agent] could not write {} ({why}); using the built-in defaults",
+            path.display()
+        );
+        return (shipped, ConfigOrigin::Tree);
+    }
+    (path, ConfigOrigin::Seeded)
+}
+
+/// [`config_path`] with `$HOME` taken explicitly, so *where* the config lives
+/// is assertable without setting an environment variable — the same trick
+/// [`lua_dir_in`] plays for the Lua tree, and for the same reason: a test that
+/// shells out to the ambient environment tests the machine, not the code.
+fn config_path_in(home: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let p = home?
+        .join(".config")
+        .join("agent")
+        .join("init.lua");
+    // `is_file`, not `exists`: a *directory* called `init.lua` would otherwise
+    // be taken for the config and then fail at read time, with a message about
+    // the file rather than about the directory. The Lua tree's own resolution
+    // (`lua_dir_in`) makes the same check for the same reason.
+    p.is_file().then_some(p)
+}
+
+/// Apply the user's configuration (the contents of that `init.lua`) to `lua`:
+/// the shipped entry script is already loaded (by `setup_inner`, via
+/// `load_init`), then the user chunk runs on top. A blank source is a no-op
+/// (the built-in defaults stand).
 pub fn apply_config_source(lua: &Lua, source: &str) -> Result<(), String> {
     if source.trim().is_empty() {
         return Ok(());
     }
     lua.load(source)
         .exec()
-        .map_err(|e| format!("config: agent.lua: {e}"))?;
+        .map_err(|e| format!("config: ~/.config/agent/init.lua: {e}"))?;
     // A config that assigns the whole table (`agent.llm = { ... }`) drops the
     // read-only counters along with anything it did not mention. Put them back
     // now rather than leaving the surface incomplete until the next request
@@ -1366,12 +1600,14 @@ pub fn apply_config_source(lua: &Lua, source: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Load the user's `agent.lua` (see [`config_path`]) into `lua`. Missing
+/// Load the user's config (see [`config_path`]) into `lua`. Missing
 /// file -> `Ok(false)` with the driver defaults in place; loaded -> `Ok(true)`.
 pub fn load_config_file(lua: &Lua) -> Result<bool, String> {
-    let Some(path) = config_path() else {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let (path, origin) = ensure_config(&lua_dir(), home.as_deref());
+    if origin == ConfigOrigin::Tree {
         return Ok(false);
-    };
+    }
     let source = std::fs::read_to_string(&path)
         .map_err(|e| format!("config: read {}: {e}", path.display()))?;
     apply_config_source(lua, &source)?;
@@ -1413,7 +1649,7 @@ pub fn llm_config(lua: &Lua) -> Result<LlmConfig, String> {
 /// requests start with the conversation itself).
 ///
 /// Read per request off the live config VM, like the tool registry: editing it
-/// in `agent.lua` and reloading changes what the model is told next turn.
+/// in the user's config, and reloading changes what the model is told next turn.
 pub fn system_prompt(lua: &Lua) -> Result<String, String> {
     let agent: Table = lua
         .globals()
@@ -1431,6 +1667,28 @@ pub struct McpToolDef {
     pub description: String,
     /// The tool's advertised `inputSchema`, already a JSON object schema.
     pub parameters: serde_json::Value,
+}
+
+/// The name a tool is advertised and called by: `{connection}.{tool}`.
+///
+/// Connections are a namespace, and the name the model sees has to carry it.
+/// A bare `list_issues` from two MCP servers is not one tool, it is two tools
+/// with one name — and the registry resolves a bare name by scanning every
+/// connection and taking the first hit, so the loser is unreachable rather than
+/// merely ambiguous. Qualifying at the point of advertisement means the
+/// collision cannot be expressed.
+///
+/// Split on the **first** dot only, so a tool whose own name contains a dot
+/// (`github.create_issue.comment`, say) survives the round trip.
+pub(crate) fn qualified_name(conn: &str, tool: &str) -> String {
+    format!("{conn}.{tool}")
+}
+
+/// Split an advertised name back into `(connection, tool)`, or `None` when it is
+/// not qualified. The inverse of [`qualified_name`].
+fn split_qualified(name: &str) -> Option<(&str, &str)> {
+    name.split_once('.')
+        .filter(|(conn, tool)| !conn.is_empty() && !tool.is_empty())
 }
 
 /// Reindex `agent.mcps` in `lua`: read the live registry and return one
@@ -1451,15 +1709,16 @@ pub fn mcps_tool_defs(lua: &Lua) -> Result<Vec<McpToolDef>, String> {
         .map_err(|e| format!("mcps: agent.mcps: {e}"))?;
     let mut defs = Vec::new();
     for pair in mcps.pairs::<String, Table>() {
-        let (_conn_name, conn) = pair.map_err(|e| format!("mcps: conn: {e}"))?;
+        let (conn_name, conn) = pair.map_err(|e| format!("mcps: conn: {e}"))?;
         let tools: Table = conn
             .get("tools")
-            .map_err(|e| format!("mcps: conn.tools: {e}"))?;
+            .map_err(|e| format!("mcps: {conn_name}.tools: {e}"))?;
         for pair in tools.pairs::<String, Table>() {
-            let (name, tool) = pair.map_err(|e| format!("mcps: tool: {e}"))?;
+            let (tool_name, tool) = pair.map_err(|e| format!("mcps: tool: {e}"))?;
+            let name = qualified_name(&conn_name, &tool_name);
             let description: String = tool.get("description").unwrap_or_default();
             let signature: mlua::Value = tool.get("signature").unwrap_or(mlua::Value::Nil);
-            let parameters = crate::mcp::lua_to_json(lua, &signature)
+            let parameters = crate::mcp::lua_to_json( &signature)
                 .map_err(|e| format!("mcps: {name} signature: {e}"))?;
             defs.push(McpToolDef {
                 name,
@@ -1597,7 +1856,7 @@ pub fn verdict_to_lua(lua: &Lua, answer: &AskAnswer) -> mlua::Value {
 }
 
 /// [`invoke_tool`] on a fresh, thread-safe VM: loads the user configuration
-/// (`lua/init.lua` + `agent.lua`), then invokes. Used by the TUI's
+/// (the entry script + any user config), then invokes. Used by the TUI's
 /// background tool threads, so the VM lives and dies here — it never crosses
 /// threads afterwards (mlua is built without `send`).
 ///
@@ -1608,7 +1867,7 @@ pub fn invoke_mcp_tool(
     arguments: &str,
     sink: Option<&PanelSink>,
 ) -> Result<Option<(String, String)>, String> {
-    invoke_mcp_tool_with_asks(name, arguments, sink, None)
+    invoke_mcp_tool_with_asks(name, arguments, sink, None, &user_config())
 }
 
 /// [`invoke_mcp_tool`] whose VM carries a user-permission ask handler, so a
@@ -1625,10 +1884,14 @@ pub fn invoke_mcp_tool_with_asks(
     arguments: &str,
     sink: Option<&PanelSink>,
     on_ask: Option<AskHandler>,
+    config: &ConfigSource,
 ) -> Result<Option<(String, String)>, String> {
     let handler = on_ask.clone();
-    let lua = new_vm_with_ask(sink, on_ask).map_err(|e| format!("config: vm: {e}"))?;
-    load_config_file(&lua)?;
+    // `config` is a parameter rather than a guess: a tool invoked on its own
+    // should see the same configuration the agent does, but a test asserting on
+    // tool behaviour must not depend on whoever is running it.
+    let (lua, _) =
+        new_vm_with_ask_from(sink, on_ask, config).map_err(|e| format!("config: vm: {e}"))?;
     // The handler goes to the *driver*, not only to the VM: a question the tool
     // raises is a yield the driver answers. It is installed on the VM as well
     // (`agent.api.ask_user`), for the Lua code that asks by calling it directly
@@ -1669,7 +1932,7 @@ pub fn bind_trigger_channel(tx: mpsc::UnboundedSender<AgentCommand>) -> Option<(
 }
 
 /// Fire a registered event on `lua`, which must already have the user's
-/// configuration applied (`lua/init.lua` + `agent.lua`, whose top-level
+/// configuration applied (entry script + user config, whose top-level
 /// `agent.on_event(...)` calls registered the handlers). The handler runs in
 /// the calling thread as a plain call — no coroutine, no reactor; the TUI drives
 /// its own handler through [`EventRun`] instead, so it can yield.
@@ -1832,7 +2095,7 @@ pub enum ToolStep {
 /// Two things follow from running on that VM rather than a throwaway one. State
 /// a tool writes is still there next call: a path trusted with `[a]lways` is
 /// remembered, a mode a tool switches persists, a counter a tool increments
-/// accumulates. And there is no second VM to build, so `agent.lua` is parsed
+/// accumulates. And there is no second VM to build, so the config is parsed
 /// once per process instead of once per tool call.
 ///
 /// The coroutine is what makes a *question* possible at all: a tool callback is
@@ -1923,7 +2186,7 @@ impl<'lua> ToolRun<'lua> {
             // Dead: the values are the callback's returns, and a tool returns
             // the one result value the MCP shape defines.
             _ => {
-                let json = crate::mcp::lua_to_json(self.lua, &res)
+                let json = crate::mcp::lua_to_json( &res)
                     .map_err(|e| format!("config: {}: result encode: {e}", self.name))?;
                 let text =
                     serde_json::to_string(&json).map_err(|e| format!("config: {}: {e}", self.name))?;
@@ -1991,6 +2254,14 @@ fn decode_tool_ask(yielded: mlua::Value) -> Result<ToolStep, String> {
 /// registry holds no such tool. A tool object is a callable table: it carries a
 /// `callback` function (what `agent.utils.tool` builds; `agent.mcp` produced ones
 /// fall back to their `__call` metamethod, which routes through the connection).
+/// The callable behind an advertised name, or `None` when the registry holds no
+/// such tool.
+///
+/// The name is always `{connection}.{tool}` — see [`qualified_name`]. There is
+/// deliberately no bare-name fallback: the advertisement qualifies, so accepting
+/// an unqualified name here would be a way back to the collision the
+/// qualification exists to prevent, and a name the model was never shown should
+/// not resolve at all.
 fn lookup_tool(lua: &Lua, name: &str) -> Result<Option<mlua::Function>, String> {
     let agent: Table = lua
         .globals()
@@ -2000,26 +2271,25 @@ fn lookup_tool(lua: &Lua, name: &str) -> Result<Option<mlua::Function>, String> 
         Ok(t) => t,
         Err(_) => return Ok(None),
     };
-    let mut found: Option<Table> = None;
-    for pair in mcps.pairs::<String, Table>() {
-        let (_conn_name, conn) = pair.map_err(|e| format!("config: conn: {e}"))?;
-        // A connection advertises its tools in `conn.tools[name]`; the same
-        // tables `agent.mcp` also mirrors as `conn[name]`. Either is a hit, so
-        // a hand-built connection needs nothing but its `tools` table.
-        if let Ok(mlua::Value::Table(t)) = conn.get::<mlua::Value>(name) {
-            found = Some(t);
-            break;
-        }
-        if let Ok(mlua::Value::Table(t)) = conn
-            .get::<Table>("tools")
-            .and_then(|tools| tools.get::<mlua::Value>(name))
-        {
-            found = Some(t);
-            break;
-        }
-    }
-    let Some(tool) = found else {
+    let Some((conn_name, tool_name)) = split_qualified(name) else {
+        // Not a name this agent ever advertises. Refused rather than guessed at.
         return Ok(None);
+    };
+    let Ok(conn) = mcps.get::<Table>(conn_name) else {
+        return Ok(None);
+    };
+    // A connection holds its tools in `conn.tools[name]`; `agent.mcp` also
+    // mirrors the same tables as `conn[name]` for Lua callers. Either is a hit,
+    // so a hand-built connection needs nothing but its `tools` table.
+    let tool = match conn
+        .get::<Table>("tools")
+        .and_then(|tools| tools.get::<mlua::Value>(tool_name))
+    {
+        Ok(mlua::Value::Table(t)) => t,
+        _ => match conn.get::<mlua::Value>(tool_name) {
+            Ok(mlua::Value::Table(t)) => t,
+            _ => return Ok(None),
+        },
     };
     let call = match tool.get::<mlua::Function>("callback").ok() {
         Some(cb) => cb,
@@ -2078,7 +2348,7 @@ fn err_to_mlua(e: anyhow::Error) -> mlua::Error {
 /// [`AgentCommand`]) and the loop starts it at the next idle moment. Returns
 /// `true` when queued; `false` when no loop is bound to the channel (the
 /// headless probe, tests) so Lua can decide what that means.
-fn lua_trigger(lua: &Lua, args: mlua::MultiValue) -> mlua::Result<bool> {
+fn lua_trigger(_: &Lua, args: mlua::MultiValue) -> mlua::Result<bool> {
     let cmd = match args.into_iter().next() {
         None => AgentCommand::RunTurn {
             history: None,
@@ -2089,7 +2359,7 @@ fn lua_trigger(lua: &Lua, args: mlua::MultiValue) -> mlua::Result<bool> {
             user: Some(s.to_str()?.to_string()),
         },
         Some(mlua::Value::Table(t)) => {
-            let json = crate::mcp::lua_to_json(lua, &mlua::Value::Table(t)).map_err(|e| {
+            let json = crate::mcp::lua_to_json( &mlua::Value::Table(t)).map_err(|e| {
                 mlua::Error::RuntimeError(format!("agent.trigger: history decode: {e}"))
             })?;
             match json {
@@ -2122,12 +2392,13 @@ fn lua_trigger(lua: &Lua, args: mlua::MultiValue) -> mlua::Result<bool> {
     }
 }
 
-/// `agent.api.ask_user(text, always)`: put a question to the user and block for
-/// verdict. This is the *tool-side* half of the ask protocol — a registered
+/// `agent.api.ask_user(text, always)`: put a question to the user and wait for
+/// the verdict. This is the *tool-side* half of the ask protocol — a registered
 /// `agent.mcps` tool whose callback drives a sandbox (the shipped `bash`) needs
-/// its policy's asks answered by whoever is running the tool, which is a
-/// blocking call: the tool already owns a background thread, and the TUI's
-/// thread is free to keep rendering the question meanwhile.
+/// its policy's asks answered by whoever is running the tool. It is not a
+/// blocking call: the tool yields, which hands the question to the event loop
+/// and parks the tracee's syscall frozen, and the loop resumes the same
+/// coroutine with the answer once you have given one.
 ///
 /// Returns the value the ask protocol accepts ([`AskAnswer`] mapped to the
 /// wire shape `agent.ask` normalizes): `true` to allow the frozen syscall run,
@@ -2192,15 +2463,15 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 /// The shared conversation log: the loop writes it, Lua reads/writes it
 /// through `agent.memory`. Bound once at startup by the TUI
 /// ([`bind_memory`]) — the path and on/off switch come from
-/// `agent.llm.memory` — and shared behind a mutex because tool/event Lua
-/// runs on background threads. Unbound (tests, or `enabled = false`): the
-/// loop's archive is a no-op and `agent.memory.append` / `latest` / `flush`
-/// raise "no log open".
+/// `agent.llm.memory` — and shared behind a mutex, because the loop and the
+/// tool/event coroutines it drives reach it from both sides. Unbound (tests, or
+/// `enabled = false`): the loop's archive is a no-op and `agent.memory.append` /
+/// `latest` / `flush` raise "no log open".
 static MEMORY: OnceLock<Arc<Mutex<Memory>>> = OnceLock::new();
 
-/// Bind the process-wide conversation log (see [`MEMORY`]). Returns `None`
+/// Bind the process-wide conversation log (see `MEMORY`). Returns `None`
 /// when already bound. Like the trigger channel, this is a startup decision:
-/// `/reload` re-reads agent.lua but cannot rebind the store.
+/// `/reload` re-reads the user config but cannot rebind the store.
 pub fn bind_memory(mem: Arc<Mutex<Memory>>) -> Option<()> {
     MEMORY.set(mem).ok()
 }
@@ -2336,11 +2607,11 @@ fn lua_memory_path(_: &Lua, (): ()) -> mlua::Result<Option<String>> {
 
 /// `agent.api.memory_append(message) -> seq` — `message` is a JSON string or a
 /// table (encoded automatically, so history messages round-trip as written).
-fn lua_memory_append(lua: &Lua, msg: mlua::Value) -> mlua::Result<u64> {
+fn lua_memory_append(_: &Lua, msg: mlua::Value) -> mlua::Result<u64> {
     let text = match msg {
         mlua::Value::String(s) => s.to_str()?.to_string(),
         other => {
-            let json = crate::mcp::lua_to_json(lua, &other).map_err(|e| {
+            let json = crate::mcp::lua_to_json( &other).map_err(|e| {
                 mlua::Error::RuntimeError(format!("agent.memory.append: encode: {e}"))
             })?;
             serde_json::to_string(&json).map_err(|e| {
@@ -2664,8 +2935,12 @@ const CSTRING_ARGS: &[(&str, &[usize])] = &[
     ("mkdir", &[0]),
     ("mkdirat", &[1]),
     ("rename", &[0, 1]),
-    ("renameat", &[1, 2]),
-    ("renameat2", &[1, 2]),
+    // renameat(olddirfd, oldpath, newdirfd, newpath): the strings are 1 and 3.
+    // Slot 2 is *newdirfd* — a small integer, not a pointer — and reading it as
+    // a C string is how the second path came back nil for every rename, which
+    // is why nothing had ever asked about one.
+    ("renameat", &[1, 3]),
+    ("renameat2", &[1, 3]),
     ("chdir", &[0]),
     ("chroot", &[0]),
     ("chmod", &[0]),
@@ -2676,7 +2951,8 @@ const CSTRING_ARGS: &[(&str, &[usize])] = &[
     ("truncate", &[0]),
     ("statfs", &[0]),
     ("link", &[0, 1]),
-    ("linkat", &[1, 2]),
+    // linkat(olddirfd, oldpath, newdirfd, newpath, flags): the same shape.
+    ("linkat", &[1, 3]),
     ("symlink", &[0, 1]),
     // symlinkat(target, newdirfd, linkpath): the strings are 0 and 2.
     ("symlinkat", &[0, 2]),
@@ -2688,8 +2964,12 @@ const CSTRING_ARGS: &[(&str, &[usize])] = &[
     ("lgetxattr", &[0, 1]),
     ("setxattr", &[0, 1]),
     ("lsetxattr", &[0, 1]),
-    ("removexattr", &[0]),
-    ("lremovexattr", &[0]),
+    // removexattr(path, name): the name is a string argument too, and without
+    // it a policy gating the call cannot say *which* attribute was removed —
+    // which is the whole difference between `setcap -r` and an app tidying up
+    // its own `user.*` metadata.
+    ("removexattr", &[0, 1]),
+    ("lremovexattr", &[0, 1]),
     ("inotify_add_watch", &[1]),
     ("name_to_handle_at", &[1]),
 ];
@@ -2906,29 +3186,54 @@ fn tracee_cwd(pid: i32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
-/// The `args` slot holding a *directory fd*, for the dirfd family — the
-/// syscalls whose relative pathnames resolve against a caller-supplied fd
-/// instead of the cwd (`openat`, `newfstatat`, `renameat`, `execveat`, ...).
-/// `symlinkat` is the odd one out: its target (slot 0) is cwd-relative while
-/// its linkpath (slot 2) sits behind the fd in slot 1.
-const DIRFD_SLOTS: &[(&str, usize)] = &[
-    ("execveat", 0),
-    ("openat", 0),
-    ("openat2", 0),
-    ("newfstatat", 0),
-    ("faccessat", 0),
-    ("readlinkat", 0),
-    ("unlinkat", 0),
-    ("mkdirat", 0),
-    ("renameat", 0),
-    ("renameat2", 0),
-    ("linkat", 0),
-    ("utimensat", 0),
-    ("fchmodat", 0),
-    ("fchownat", 0),
-    ("inotify_add_watch", 0),
-    ("name_to_handle_at", 0),
+/// The `args` slot holding the *directory fd* each path argument of a syscall
+/// resolves against, as `(path slot, dirfd slot)` pairs, 0-based — the dirfd
+/// family: the syscalls whose relative pathnames resolve against a
+/// caller-supplied fd instead of the cwd (`openat`, `newfstatat`, `renameat`,
+/// `execveat`, ...).
+///
+/// **Per path, not per syscall.** The two-path `*at` calls have *two* dirfds,
+/// and one slot for the syscall resolves a rename's target against the
+/// *source's* directory — which is a wrong answer rather than a missing one, and
+/// the kind that only shows up once a command bothers to open a directory and
+/// rename into it.
+///
+/// A path with no pair here is cwd-relative and resolves as one. `symlinkat`
+/// relies on that: its target (slot 0) is cwd-relative, while its linkpath
+/// (slot 2) sits behind the fd in slot 1.
+const DIRFD_FOR_PATH: &[(&str, &[(usize, usize)])] = &[
+    ("execveat", &[(1, 0)]),
+    ("openat", &[(1, 0)]),
+    ("openat2", &[(1, 0)]),
+    ("newfstatat", &[(1, 0)]),
+    ("faccessat", &[(1, 0)]),
+    ("readlinkat", &[(1, 0)]),
+    ("unlinkat", &[(1, 0)]),
+    ("mkdirat", &[(1, 0)]),
+    ("renameat", &[(1, 0), (3, 2)]),
+    ("renameat2", &[(1, 0), (3, 2)]),
+    ("linkat", &[(1, 0), (3, 2)]),
+    ("symlinkat", &[(2, 1)]),
+    ("utimensat", &[(1, 0)]),
+    ("fchmodat", &[(1, 0)]),
+    ("fchownat", &[(1, 0)]),
+    ("inotify_add_watch", &[(1, 0)]),
+    ("name_to_handle_at", &[(1, 0)]),
 ];
+
+/// The dirfd slot one path argument of `sys_name` resolves against, or `None`
+/// when that path is relative to the cwd.
+fn dirfd_slot_for(sys_name: &str, path_slot: usize) -> Option<usize> {
+    DIRFD_FOR_PATH
+        .iter()
+        .find(|&&(n, _)| n == sys_name)
+        .and_then(|&(_, pairs)| {
+            pairs
+                .iter()
+                .find(|&&(p, _)| p == path_slot)
+                .map(|&(_, fd)| fd)
+        })
+}
 
 /// Whether a relative pathname at arg position `p` may be resolved against the
 /// tracee's cwd. Absolute names are context-independent and always resolve.
@@ -2936,15 +3241,7 @@ const DIRFD_SLOTS: &[(&str, usize)] = &[
 /// only `AT_FDCWD` means "the cwd", so anything else passes the name through
 /// rather than mis-resolving it against the wrong directory.
 fn cwd_resolution_ok(sys_name: &str, p: usize, args: [u64; 6]) -> bool {
-    let fd_slot = if sys_name == "symlinkat" {
-        (p == 2).then_some(1)
-    } else {
-        DIRFD_SLOTS
-            .iter()
-            .find(|&&(n, _)| n == sys_name)
-            .map(|&(_, f)| f)
-    };
-    match fd_slot {
+    match dirfd_slot_for(sys_name, p) {
         None => true,                                // plain pathname syscall
         Some(f) => args[f] == libc::AT_FDCWD as u64, // the fd slot says "cwd"?
     }
@@ -3116,19 +3413,9 @@ fn finished_table(lua: &Lua, r: seccomp::SandboxResult) -> mlua::Result<Table> {
     Ok(t)
 }
 
-// ---------------------------------------------------------------------------
-// The embedded Lua driver — `agent.bash`
-// ---------------------------------------------------------------------------
-
-/// Defines `agent.bash` on the already-installed `agent` table. It spawns a
-/// run and returns a **stdio stream object** (see the module docs above):
-/// output is *pushed* through optional `on_stdout`/`on_stderr`/`on_exit`
-/// callbacks, asks come from user-asking functions (re-yielded raw to whoever
-/// resumed the pump), and the object is drivable both imperatively
-/// (`s:run()`) and from any user coroutine (`s.pump`) — the driver only ever
-/// steps the engine through pure Lua frames, so yields never cross a C call
-/// and pull-reader wrappers are safe.
-///
+// `agent.bash` itself is Lua (`lua/lib/bash.lua`); what is left on this side is
+// the substrate it drives: `spawn`, `step`, `decide`, `kill`, `write` and
+// `close_stdin`, over `seccomp::Sandbox`.
 
 #[cfg(test)]
 mod tests {
@@ -3136,9 +3423,9 @@ mod tests {
     use crate::mcp::{FakeHttpServer, FakeRequest, FakeResponse, FakeServerReply};
     use serde_json::json;
 
-    /// Call one of the shipped tools the way the TUI does — a fresh VM built
-    /// from `agent.lua`, the round's sink, and an ask handler — and return the
-    /// tool's JSON body plus every question it asked.
+    /// Call one of the shipped tools the way the TUI does — on the shipped VM,
+    /// with the round's sink and an ask handler — and return the tool's JSON
+    /// body plus every question it asked.
     ///
     /// The `fs` tools ask before touching anything, so a test *has* to answer:
     /// `verdict` is what the user would press.
@@ -3158,6 +3445,7 @@ mod tests {
                 seen.borrow_mut().push(text.to_string());
                 verdict.clone()
             })),
+            &ConfigSource::Tree,
         )
         .expect("invoke")
         .unwrap_or_else(|| panic!("the shipped config registers {name}"));
@@ -3199,9 +3487,10 @@ mod tests {
         }
     }
 
-    /// Drive one sandboxed `bash -c` run through `agent.bash` in a fresh VM —
-    /// the same call a tool callback makes — with the policy given as Lua
-    /// source and, optionally, a user-permission ask handler.
+    /// Drive one sandboxed `bash -c` run through `agent.bash`, on a fresh VM of
+    /// its own, with the policy given as Lua source and, optionally, a
+    /// user-permission ask handler. A fresh VM here is the test's own isolation
+    /// — the shipped tool does the same call, on the config VM.
     ///
     /// The ask wiring is the shipped tool's, minus the panel: the run is driven
     /// with `s:run(handler)` and the handler hands each question to
@@ -3257,6 +3546,52 @@ mod tests {
     /// The tree every VM loads (the repo's own `lua/`, like the shipped one).
     fn tree() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua")
+    }
+
+    /// `print` goes to the status bar once a screen is attached, and to stdout
+    /// when there is not one — because a TUI owns the terminal, and because a
+    /// headless run still has to be debuggable.
+    ///
+    /// The two branches are mutually exclusive on a process-global, so the
+    /// whole test is serialized against the others that touch it.
+    #[test]
+    fn print_follows_the_screen() {
+        let _guard = crate::status::exclusive();
+        crate::status::reset();
+        let lua = vm();
+
+        // Detached: nothing lands on the status line.
+        lua.load(r#"print("to stdout")"#).exec().expect("print");
+        assert!(
+            crate::status::status_line().get().is_none(),
+            "with no screen, print must not become a status"
+        );
+
+        // Attached: it becomes the status line, tab-joined like Lua's own.
+        crate::status::attach();
+        lua.load(r#"print("hello", 42, "world")"#).exec().expect("print");
+        assert_eq!(
+            crate::status::status_line().get().unwrap().text,
+            "hello\t42\tworld",
+            "Lua's print semantics: any number of args, joined with tabs"
+        );
+
+        // A `__tostring` metamethod is honoured, as `print` requires.
+        lua.load(
+            r#"
+            local t = setmetatable({}, { __tostring = function() return "POINT" end })
+            print(t)
+        "#,
+        )
+        .exec()
+        .expect("print a table");
+        assert_eq!(crate::status::status_line().get().unwrap().text, "POINT");
+
+        // Multi-line print keeps one row: the rest would land on the input box.
+        lua.load(r#"print("one\ntwo")"#).exec().expect("print");
+        assert_eq!(crate::status::status_line().get().unwrap().text, "one");
+
+        crate::status::reset();
     }
 
     /// Every `lua/lib/**.lua` is required at VM setup, and a lib module
@@ -3465,7 +3800,7 @@ mod tests {
             local names = {}
             for name in pairs(conn.tools) do names[#names + 1] = name end
             table.sort(names)
-            if table.concat(names, ",") ~= "apply_patch,list_dir,read_file,write_file" then
+            if table.concat(names, ",") ~= "apply_patch,hand_to_user,read,write_file" then
               return "tools: " .. table.concat(names, ",")
             end
             -- Each is a callable agent.utils.tool with a description and a schema.
@@ -3606,7 +3941,7 @@ mod tests {
     /// copy, so a stray runtime write cannot push back into the mode's spec.
     #[test]
     fn a_mode_switch_overwrites_the_prompt_and_the_tool_registry() {
-        let lua = vm();
+        let lua = neutral_vm();
         let before = system_prompt(&lua).expect("baseline prompt");
         let problem: Option<String> = lua
             .load(
@@ -3681,7 +4016,7 @@ mod tests {
     /// very next request's tool list *and* system prompt are the mode's.
     #[test]
     fn a_mode_is_live_for_the_next_request() {
-        let lua = vm();
+        let lua = neutral_vm();
         lua.load(
             r#"
             agent.mode.new("scoped", {
@@ -3708,7 +4043,7 @@ mod tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            ["apply_patch", "list_dir", "read_file", "write_file"],
+            ["fs.apply_patch", "fs.hand_to_user", "fs.read", "fs.write_file"],
             "the mode's tools are what the next request advertises"
         );
     }
@@ -4087,7 +4422,12 @@ mod tests {
             end
             if agent.llm.model ~= "gpt-4o-mini" then return "llm.model", nil end
             if agent.llm.api_key ~= "" then return "llm.api_key", nil end
-            if agent.llm.system_prompt ~= "" then return "system_prompt", nil end
+            -- The script's own default is `""`, but it also activates the
+            -- `coding` mode, so what is in force is that mode's prompt. What
+            -- matters here is that it is a string the next request can send.
+            if type(agent.llm.system_prompt) ~= "string" then
+              absent[#absent+1] = "llm.system_prompt"
+            end
             if type(agent.llm.memory) ~= "table" then absent[#absent+1] = "llm.memory" end
             -- The read-only counters, and read-only in fact.
             if type(agent.llm.usage.total) ~= "number" then absent[#absent+1] = "llm.usage.total" end
@@ -4286,7 +4626,7 @@ mod tests {
             .expect("init");
 
         let lua = Lua::new();
-        setup_tree(&lua, None, None, &dir).expect("fixture tree setup");
+        setup_tree(&lua, None, None, &dir, &ConfigSource::Tree).expect("fixture tree setup");
         let problem: Option<String> = lua
             .load(
                 r#"
@@ -4319,9 +4659,9 @@ mod tests {
     /// ask-table's own business, pinned in ask's self-test.)
     #[test]
     fn the_always_flag_is_lua_s_and_reaches_the_handler() {
-        // The tool runs on a fresh VM that re-reads the config file, so the
-        // shipped `agent.lua` is the source of both the tool and its policy —
-        // this VM is here to fail loudly if that config ever stops loading.
+        // The tool runs on the shipped config VM, so the built-in configuration
+        // is the source of both the tool and its policy — this VM is here to
+        // fail loudly if that configuration ever stops loading.
         let _config = shipped_vm();
         // What the handler was told, per call.
         let seen: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(Vec::new()));
@@ -4329,7 +4669,7 @@ mod tests {
         let sink = PanelSink::default();
         let run = |args: &str, watch: Rc<RefCell<Vec<(String, bool)>>>| {
             invoke_mcp_tool_with_asks(
-                "bash",
+                "bash.bash",
                 args,
                 Some(&sink),
                 // Records what it was told and says yes: the default policy asks
@@ -4339,6 +4679,7 @@ mod tests {
                     watch.borrow_mut().push((text.to_string(), always));
                     AskAnswer::Allow
                 })),
+                &ConfigSource::Tree,
             )
             .expect("invoke")
         };
@@ -4346,7 +4687,11 @@ mod tests {
         // The shipped policy asks about every open with a path in the question,
         // so the third answer is on offer for each of them.
         let p = std::env::temp_dir().join(format!("ask-flag-{}.txt", std::process::id()));
-        let _ = std::fs::remove_file(&p);
+        // Seeded, so the write is an *overwrite* and therefore still a question.
+        // Creating a name nothing holds is deliberately silent (see
+        // `creating_a_new_name_is_not_a_question`), and `echo >` on a fresh path
+        // would leave this test with no write to inspect.
+        std::fs::write(&p, "before\n").expect("seed the target");
         let args = serde_json::json!({
             "cmdline": format!("echo x > {}", p.display()),
         })
@@ -4523,6 +4868,10 @@ mod tests {
             if type(agent.llm.api_key) ~= "string" then return "api_key" end
             if type(agent.llm.system_prompt) ~= "string" then return "system_prompt" end
             if type(agent.llm.memory) ~= "table" then return "memory" end
+            -- `false` is the "not configured" default, and is deliberately not
+            -- a number: compaction is off until the user says what the window
+            -- is, because a guessed one compacts at the wrong moment.
+            if agent.llm.context_size ~= false then return "context_size" end
             if agent.llm.llm ~= nil then return "llm.llm" end
             -- And Rust reads it from there.
             local names = {}
@@ -4535,17 +4884,20 @@ mod tests {
             .expect("settings shape");
         assert_eq!(
             problem.as_deref(),
-            Some("api_key,base_url,memory,model,system_prompt,usage"),
-            "the settings table is flat and complete, counters included"
+            Some("api_key,base_url,context_size,memory,model,system_prompt,usage"),
+            "the settings table is flat and complete: every key the starter \
+             config defines, plus the read-only counters"
         );
         assert_eq!(
             llm_config(&lua).expect("llm config").model,
-            "unsloth/gemma-4-E2B-it-GGUF:Q5_K_XL",
-            "and Rust reads the endpoint from agent.llm"
+            "gpt-4o-mini",
+            "and Rust reads the endpoint from agent.llm — the entry script's default, \
+             with no user config in the tree to override it"
         );
         assert!(
             system_prompt(&lua).expect("prompt").contains("coding agent"),
-            "as well as the system prompt"
+            "as well as the system prompt — the `coding` mode's, which the entry \
+             script activates by default"
         );
     }
 
@@ -4563,8 +4915,8 @@ mod tests {
     #[test]
     fn context_pressure_arms_a_compaction_turn_and_lands_its_summary() {
         let _usage = usage_guard();
+        // `new_vm` is the whole configuration now: one script, not two.
         let lua = new_vm().expect("VM");
-        load_config_file(&lua).expect("config");
         // A context window to measure against, and a mode with something to
         // switch away from.
         lua.load(
@@ -4572,7 +4924,7 @@ mod tests {
             agent.llm.context_size = 20000
             agent.mode.new("work", {
               system_prompt = "WORK PROMPT",
-              mcps = { fs = { name = "fs", tools = { read_file = true } } },
+              mcps = { fs = { name = "fs", tools = { read = true } } },
             })
             agent.mode.set("work")
             -- Stand in for the TUI's loop: record what the handler asks for.
@@ -4719,8 +5071,8 @@ mod tests {
     /// and everything it had — locals and the config it changed — is still there.
     #[test]
     fn a_handler_may_yield_on_the_shared_vm_and_keep_its_state() {
+        // `new_vm` is the whole configuration now: one script, not two.
         let lua = new_vm().expect("VM");
-        load_config_file(&lua).expect("config");
         lua.load(
             r#"
             agent.llm.system_prompt = "BEFORE THE WAIT"
@@ -4790,8 +5142,8 @@ mod tests {
 
     /// The shipped `compact` mode: a spec that swaps the prompt for a compaction
     /// brief and the registry for *nothing*. "Disable all tools" has to mean all
-    /// of them — including the shell, which only counts as a tool because
-    /// `agent.lua` registered it — and it has to be true at the tool-dispatch
+    /// of them — including the shell, which only counts as a tool because the
+    /// configuration registered it — and it has to be true at the tool-dispatch
     /// level, not merely in the advertised list.
     #[test]
     fn the_compact_mode_takes_every_tool_away() {
@@ -4818,7 +5170,7 @@ mod tests {
         );
         let defs = mcps_tool_defs(&lua).expect("baseline defs");
         assert!(
-            defs.iter().any(|d| d.name == "bash"),
+            defs.iter().any(|d| d.name == "bash.bash"),
             "the shell is there before the switch"
         );
 
@@ -4848,9 +5200,9 @@ mod tests {
             mcps_tool_defs(&lua).expect("compact defs").is_empty(),
             "a compaction turn is offered no tools"
         );
-        // Note the *other* half of "not offered": the tool VM loads a fresh
-        // registry (it re-runs `agent.lua`), so a dropped tool is not callable
-        // only because the loop refuses any name the request did not offer —
+        // Note the *other* half of "not offered": a tool is called by name
+        // against the live registry, so a dropped tool is not callable only
+        // because the loop refuses any name the request did not offer —
         // `main::may_run`, asserted there. What this layer guarantees is the
         // catalog: nothing to choose from, and nothing to call.
 
@@ -4865,7 +5217,7 @@ mod tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            ["apply_patch", "bash", "list_dir", "read_file", "write_file"],
+            ["bash.bash", "fs.apply_patch", "fs.hand_to_user", "fs.read", "fs.write_file"],
             "clearing the mode gives the tools back"
         );
     }
@@ -4927,11 +5279,11 @@ mod tests {
         Some(Rc::new(|_: &str, _: bool| AskAnswer::Allow))
     }
 
-    /// Call the shipped `bash` tool the way the TUI does: a fresh VM built from
-    /// `agent.lua`, the round's panel sink, and the call's ask handler. Returns
-    /// the tool's JSON body.
+    /// Call the shipped `bash` tool the way the TUI does: on the shipped
+    /// config VM, with the round's panel sink and the call's ask handler.
+    /// Returns the tool's JSON body.
     fn call_bash(args: &str, sink: &PanelSink, on_ask: Option<AskHandler>) -> serde_json::Value {
-        let (body, _) = invoke_mcp_tool_with_asks("bash", args, Some(sink), on_ask)
+        let (body, _) = invoke_mcp_tool_with_asks("bash.bash", args, Some(sink), on_ask, &ConfigSource::Tree)
             .expect("invoke bash")
             .expect("the shipped config registers agent.mcps.bash");
         serde_json::from_str(&body).expect("tool json")
@@ -4948,13 +5300,13 @@ mod tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            ["apply_patch", "bash", "list_dir", "read_file", "write_file"],
-            "the shell is advertised because agent.lua registered it, nothing else is"
+            ["bash.bash", "fs.apply_patch", "fs.hand_to_user", "fs.read", "fs.write_file"],
+            "the shell is advertised because the config registered it, nothing else is"
         );
         let def = defs
             .into_iter()
-            .find(|d| d.name == "bash")
-            .expect("bash def");
+            .find(|d| d.name == "bash.bash")
+            .expect("bash.bash def");
         assert!(
             def.description.contains("seccomp sandbox"),
             "the tool describes itself: {}",
@@ -4974,7 +5326,12 @@ mod tests {
         assert_eq!(v["result"]["stderr"], "");
         assert_eq!(v["result"]["exit_code"], 0);
         assert!(v["result"]["exit_signal"].is_null(), "no signal on a clean exit");
-        assert!(v["result"]["syscalls"].as_u64().unwrap() >= 1);
+        // No `syscalls` field: a raw total of every trapped call said nothing
+        // about the command, and `denied` is the number a reader can act on.
+        assert!(
+            v["result"].get("syscalls").is_none(),
+            "the syscall total is gone: {v}"
+        );
         assert_eq!(v["result"]["denied"], 0);
         assert!(v["result"]["denied_reason"].is_null());
 
@@ -5066,7 +5423,7 @@ mod tests {
             panic!("expected Create first, got {:?}", ops[0]);
         };
         assert_eq!(*id, 1);
-        assert_eq!(title, "bash result");
+        assert_eq!(title, "echo from sandbox", "the command is the title");
         assert!(*boxed && !*conceal_box, "a raw tool-style box, {ops:?}");
         let mut streamed = String::new();
         for op in &ops[1..] {
@@ -5089,9 +5446,36 @@ mod tests {
         );
     }
 
+    /// The title is one row, so a command with newlines or runs of whitespace
+    /// in it is flattened — otherwise a multi-line command would break the top
+    /// border of its own box. The renderer cuts a title that is still too wide.
+    #[test]
+    fn the_bash_tool_titles_its_panel_with_one_line_of_the_command() {
+        let cases = [
+            (r#"{"cmdline":"echo a && echo b"}"#, "echo a && echo b"),
+            (r#"{"cmdline":"echo a\n\necho b"}"#, "echo a echo b"),
+            (r#"{"cmdline":"  echo\ta  "}"#, "echo a"),
+            (r#"{"cmdline":"for i in 1 2 3; do echo $i; done"}"#, "for i in 1 2 3; do echo $i; done"),
+        ];
+        for (args, want) in cases {
+            let sink = PanelSink::default();
+            let v = call_bash(args, &sink, allow_all());
+            assert_eq!(v["ok"], true, "{args}: {v}");
+            let ops = sink.ops();
+            let Some(PanelOp::Create { title, .. }) = ops.first() else {
+                panic!("{args}: expected a Create first");
+            };
+            assert_eq!(title, want, "{args}");
+            assert!(
+                !title.contains('\n') && !title.contains('\r'),
+                "a title is one row: {title:?}"
+            );
+        }
+    }
+
     /// A denied run streams whatever arrived before the kill (often nothing) and
-    /// appends "Denied" instead of an exit line; an ask is shown as an overlay on
-    /// the same panel, set before the handler waits and cleared after.
+    /// appends "Denied" instead of an exit line. The ask it raises is drawn by
+    /// the event loop, not by the tool.
     #[test]
     fn the_bash_tool_panels_a_denial() {
         let _ = std::fs::remove_file("/tmp/agent-lua-bash-panel-deny");
@@ -5110,37 +5494,36 @@ mod tests {
 
         let ops = sink.ops();
         let mut streamed = String::new();
-        let mut overlays: Vec<&PanelOp> = Vec::new();
         for op in &ops {
-            match op {
-                PanelOp::Append { text, .. } => streamed.push_str(text),
-                PanelOp::Overlay { .. } => overlays.push(op),
-                _ => {}
+            if let PanelOp::Append { text, .. } = op {
+                streamed.push_str(text);
             }
         }
         assert_eq!(streamed, "Denied", "a denied run appends its status line");
-        assert_eq!(overlays.len(), 2, "the ask sets then clears: {ops:?}");
-        let PanelOp::Overlay { text, .. } = overlays[0] else {
+
+        // The dialog is the tool's own, on the panel the command is running in:
+        // `p:ask` sets it, waits, and clears it, so the question appears inside
+        // the run's box and leaves when the verdict lands. The driver draws
+        // nothing and adds no message of its own.
+        let dialogs: Vec<&PanelOp> = ops
+            .iter()
+            .filter(|op| matches!(op, PanelOp::Overlay { .. }))
+            .collect();
+        assert_eq!(dialogs.len(), 2, "asked, then cleared: {ops:?}");
+        let PanelOp::Overlay { id, text, always } = dialogs[0] else {
             unreachable!("filtered above");
         };
+        assert_eq!(*id, 1, "on the command's own panel, not another message");
         let desc = text.as_deref().unwrap_or_default();
-        // The overlay is the question the run actually raised. *Which* question
-        // that is belongs to the policy — the default policy asks about the
-        // program's own shared libraries before it reaches the command, so this
-        // pins the seam (the question is on the panel, with the choices the user
-        // actually has) and not one policy's wording, which the policy tests own.
         assert!(
-            desc.contains("The process want to") && desc.contains("/"),
-            "the overlay shows the question and the path it is about: {desc:?}"
+            desc.contains("The process want to") && desc.contains('/'),
+            "the dialog shows the question and the path it is about: {desc:?}"
         );
-        assert!(
-            desc.contains("[y]es  [n]o  [a]lways"),
-            "and the answers on offer, since a path can be remembered: {desc:?}"
-        );
-        let PanelOp::Overlay { text, .. } = overlays[1] else {
+        assert!(*always, "a path can be remembered, so `always` is offered");
+        let PanelOp::Overlay { text, .. } = dialogs[1] else {
             unreachable!("filtered above");
         };
-        assert!(text.is_none(), "the overlay clears once the verdict lands");
+        assert!(text.is_none(), "and it clears once the verdict lands");
     }
 
     /// The interactive path: the call's ask handler decides each frozen syscall.
@@ -5213,7 +5596,7 @@ mod tests {
         let path = target.to_string_lossy().to_string();
 
         // A model that writes an absolute path: asked about exactly that.
-        let (v, asked) = tool_allowed("read_file", &serde_json::json!({ "path": &path }).to_string());
+        let (v, asked) = tool_allowed("fs.read", &serde_json::json!({ "path": &path }).to_string());
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(asked, vec![format!("Allow read {path}")], "the whole question");
 
@@ -5230,7 +5613,7 @@ mod tests {
             std::process::id()
         );
         let (v, asked) =
-            tool_allowed("read_file", &serde_json::json!({ "path": &untidy }).to_string());
+            tool_allowed("fs.read", &serde_json::json!({ "path": &untidy }).to_string());
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(
             asked,
@@ -5240,12 +5623,507 @@ mod tests {
 
         // A write asks the write question about the same resolved path.
         let (v, asked) = tool_allowed(
-            "write_file",
+            "fs.write_file",
             &serde_json::json!({ "path": &path, "content": "y\n" }).to_string(),
         );
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(asked, vec![format!("Allow write {path}")], "a write asks about writing");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "y\n", "and it wrote");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `read` names the file it read, and shows nothing else.
+    ///
+    /// The withheld half is the point. A tool call puts nothing in the
+    /// transcript, so this panel is the *only* trace of the read — and it is
+    /// still not the file. The content is the model's to have; printing it here
+    /// too would put every read back on screen a second time, which is the
+    /// duplication the per-call result boxes were removed for.
+    #[test]
+    fn read_names_the_path_and_withholds_the_content() {
+        let dir = std::env::temp_dir().join(format!("agent-fs-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let target = dir.join("secret.txt");
+        // Distinctive enough that finding it in a panel op would be unambiguous.
+        std::fs::write(&target, "CANARY-LINE-ONE\nCANARY-LINE-TWO\n").expect("seed");
+        let path = target.to_string_lossy().to_string();
+
+        let sink = PanelSink::default();
+        let (body, _) = invoke_mcp_tool_with_asks(
+            "fs.read",
+            &serde_json::json!({ "path": &path }).to_string(),
+            Some(&sink),
+            Some(Rc::new(|_: &str, _: bool| AskAnswer::Allow)),
+            &ConfigSource::Tree,
+        )
+        .expect("invoke")
+        .expect("the shipped config registers fs.read");
+
+        // The model still gets the file, in full — this is a panel, not a
+        // truncation of the tool's result.
+        assert!(
+            body.contains("CANARY-LINE-ONE") && body.contains("CANARY-LINE-TWO"),
+            "the model reads the whole file: {body}"
+        );
+
+        let drawn: Vec<String> = sink
+            .ops()
+            .iter()
+            .map(|op| match op {
+                PanelOp::Create { title, .. } => format!("┌─ {title}"),
+                PanelOp::Append { text, .. } => text.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        let panel = drawn.join("\n");
+        assert!(
+            panel.contains("┌─ fs.read"),
+            "titled like every other tool panel: {panel:?}"
+        );
+        assert!(
+            panel.contains(&path),
+            "and it names the path: {panel:?}"
+        );
+        assert!(
+            !panel.contains("CANARY"),
+            "and shows none of the content: {panel:?}"
+        );
+        // One line, because the path the model wrote *is* the path. The second
+        // line is for when it is not — see the untidy case below.
+        // Only the title and the text ops: the overlay ops that put the
+        // question up and take it down are not part of what the panel says.
+        let body_lines: Vec<&String> = drawn
+            .iter()
+            .filter(|l| !l.starts_with('┌') && !l.is_empty())
+            .collect();
+        assert_eq!(
+            body_lines,
+            vec![&format!("{path}\n")],
+            "exactly the resolved path, and nothing else: {panel:?}"
+        );
+
+        // A path that is not the one it means: both are shown, because a panel
+        // naming only the resolved one would leave the model looking at a file
+        // it never wrote, and the *question* already names the other.
+        let untidy = format!(
+            "{}/./agent-fs-read-{}/../agent-fs-read-{}/secret.txt",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            std::process::id()
+        );
+        let usink = PanelSink::default();
+        invoke_mcp_tool_with_asks(
+            "fs.read",
+            &serde_json::json!({ "path": &untidy }).to_string(),
+            Some(&usink),
+            Some(Rc::new(|_: &str, _: bool| AskAnswer::Allow)),
+            &ConfigSource::Tree,
+        )
+        .expect("invoke")
+        .expect("registered");
+        let ubody: String = usink
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                PanelOp::Append { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ubody.contains(&path) && ubody.contains(&untidy),
+            "both paths when they differ: {ubody:?}"
+        );
+        assert!(
+            ubody.contains("which is the symlink of"),
+            "and it says which is which: {ubody:?}"
+        );
+
+        // The path is the whole of it: one panel, no line numbers, no envelope.
+        assert_eq!(
+            drawn
+                .iter()
+                .filter(|l| l.starts_with('┌'))
+                .count(),
+            1,
+            "exactly one panel for one read: {panel:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read the user refuses still says so, in the panel it already opened.
+    /// A tool call is silent everywhere else, so a panel that appeared and then
+    /// `write_file` shows the bytes it wrote, with the file's own grammar
+    /// declared — the reverse of `read`, and deliberately so: a read's
+    /// content is the model's to consume, but a write changes the user's files,
+    /// so what landed on disk is the thing being checked.
+    #[test]
+    fn write_file_shows_the_content_with_its_language_declared() {
+        let dir = std::env::temp_dir().join(format!("agent-fs-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let target = dir.join("shown.rs");
+        let path = target.to_string_lossy().to_string();
+        // Something the grammar will actually recognise, so "highlighted" is a
+        // claim about a real parse rather than about a fence.
+        let content = "fn main() {\n    let x: u32 = 7;\n    println!(\"{}\", x);\n}\n";
+
+        let sink = PanelSink::default();
+        let (body, _) = invoke_mcp_tool_with_asks(
+            "fs.write_file",
+            &serde_json::json!({ "path": &path, "content": content }).to_string(),
+            Some(&sink),
+            Some(Rc::new(|_: &str, _: bool| AskAnswer::Allow)),
+            &ConfigSource::Tree,
+        )
+        .expect("invoke")
+        .expect("the shipped config registers fs.write_file");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            content,
+            "and it wrote the bytes verbatim"
+        );
+        assert!(body.contains("written") || body.contains("bytes"), "the model is told: {body}");
+
+        // The panel, and the grammar on it.
+        let ops = sink.ops();
+        let split = ops
+            .iter()
+            .find_map(|op| match op {
+                PanelOp::Split { title, panes, .. } => Some((title.clone(), panes.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("write_file drew no split panel: {ops:?}"));
+        assert!(
+            split.0.starts_with("write_file: ") && split.0.contains(&path),
+            "titled with the tool and the file it changed: {:?}", split.0
+        );
+        assert_eq!(split.1.len(), 1, "one pane: there is only an \'after\'");
+        assert_eq!(
+            split.1[0].lang.as_deref(),
+            Some("rust"),
+            "and the file's own grammar, which is the whole of \'highlighted\': {:?}",
+            split.1[0]
+        );
+        assert_eq!(
+            split.1[0].caption,
+            format!("{} lines, {} bytes", content.lines().count(), content.len()),
+            "the caption sizes it, and agrees: {:?}",
+            split.1[0].caption
+        );
+
+        // The content is in the pane, and the pane is the only copy on screen.
+        let pane_text = ops
+            .iter()
+            .find_map(|op| match op {
+                PanelOp::SetPane { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(pane_text.contains("fn main()"), "the content is shown: {pane_text:?}");
+        assert_eq!(pane_text, content, "and shown as written, not reformatted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-line file gets "1 line", not "1 lines". Caught by looking at a
+    /// live panel rather than by any test: the first run of this said "1 lines"
+    /// and it was the sort of thing a reader stops trusting the rest of the box
+    /// The permission question is drawn, as a dialog, inside the panel of the
+    /// tool that raised it.
+    ///
+    /// This is the fix for a question asked into the void. `raise_ask` was a
+    /// bare `coroutine.yield`: it reached the loop, which remembered that
+    /// something was outstanding so a key press could be read as a verdict, and
+    /// the loop drew *nothing* — its own comment claimed the question was
+    /// already on screen, which is true only of an ask that came through
+    /// `panel:ask`. So `read` and `write_file` sat waiting on a question
+    /// nobody could see, with the input hint still reading "Enter sends".
+    #[test]
+    fn a_file_tools_question_is_a_dialog_on_its_own_panel() {
+        let dir = std::env::temp_dir().join(format!("agent-fs-askpanel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        // The panel ids each tool opened, and the overlays asked on them.
+        let overlays = |sink: &PanelSink| -> Vec<(u64, Option<String>, bool)> {
+            sink.ops()
+                .iter()
+                .filter_map(|op| match op {
+                    PanelOp::Overlay { id, text, always } => Some((*id, text.clone(), *always)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let panel_ids = |sink: &PanelSink| -> Vec<u64> {
+            sink.ops()
+                .iter()
+                .filter_map(|op| match op {
+                    PanelOp::Create { id, .. } | PanelOp::Split { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // A read, on a path nothing trusts.
+        let target = dir.join("asked.txt");
+        std::fs::write(&target, "x\n").expect("seed");
+        let path = target.to_string_lossy().to_string();
+        let sink = PanelSink::default();
+        invoke_mcp_tool_with_asks(
+            "fs.read",
+            &serde_json::json!({ "path": &path }).to_string(),
+            Some(&sink),
+            Some(Rc::new(|_: &str, _: bool| AskAnswer::Allow)),
+            &ConfigSource::Tree,
+        )
+        .expect("invoke")
+        .expect("registered");
+
+        let ids = panel_ids(&sink);
+        assert_eq!(ids.len(), 1, "read opened one panel: {ids:?}");
+        let asked = overlays(&sink);
+        assert_eq!(
+            asked.len(),
+            2,
+            "the question went up and came back down: {asked:?}"
+        );
+        assert_eq!(
+            asked[0].0, ids[0],
+            "and it is a dialog on the read panel, not somewhere else: {asked:?}"
+        );
+        assert_eq!(
+            asked[0].1.as_deref(),
+            Some(format!("Allow read {path}").as_str()),
+            "naming the path being read: {asked:?}"
+        );
+        assert!(
+            asked[0].2,
+            "and offering [a]lways, which is what makes the answer rememberable"
+        );
+        assert_eq!(
+            asked[1],
+            (ids[0], None, false),
+            "the dialog is cleared once answered, so it cannot outlive its question"
+        );
+
+        // A write asks on its own panel too — a different one.
+        let wtarget = dir.join("asked2.txt");
+        let wpath = wtarget.to_string_lossy().to_string();
+        let wsink = PanelSink::default();
+        invoke_mcp_tool_with_asks(
+            "fs.write_file",
+            &serde_json::json!({ "path": &wpath, "content": "y\n" }).to_string(),
+            Some(&wsink),
+            Some(Rc::new(|_: &str, _: bool| AskAnswer::Allow)),
+            &ConfigSource::Tree,
+        )
+        .expect("invoke")
+        .expect("registered");
+        let wids = panel_ids(&wsink);
+        let wasked = overlays(&wsink);
+        assert_eq!(wids.len(), 1, "write_file opened one panel: {wids:?}");
+        assert_eq!(wasked[0].0, wids[0], "its question is on its own panel");
+        assert_eq!(
+            wasked[0].1.as_deref(),
+            Some(format!("Allow write {wpath}").as_str()),
+            "and it is the write question: {wasked:?}"
+        );
+
+        // A trusted path asks nothing at all, so it has no dialog: the grant is
+        // the point, and a panel that appeared to ask would be a lie.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A split panel can host a dialog. `apply_patch` needs it: the ask gates the
+    /// write, the panel it lands in is the before/after view, and the captions
+    /// are fixed at creation — which is why they say "before"/"after" and not
+    /// the line counts, which need the very read the ask is gating.
+    #[test]
+    fn a_split_panel_can_host_the_question_too() {
+        let dir = std::env::temp_dir().join(format!("agent-fs-patchask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let target = dir.join("patched.txt");
+        std::fs::write(&target, "one\ntwo\n").expect("seed");
+        let path = target.to_string_lossy().to_string();
+
+        let sink = PanelSink::default();
+        let (body, _) = invoke_mcp_tool_with_asks(
+            "fs.apply_patch",
+            &serde_json::json!({
+                "path": &path,
+                "patch": "@@ -1,2 +1,2 @@
+ one
+-two
++two-changed
+",
+            })
+            .to_string(),
+            Some(&sink),
+            Some(Rc::new(|_: &str, _: bool| AskAnswer::Allow)),
+            &ConfigSource::Tree,
+        )
+        .expect("invoke")
+        .expect("registered");
+        assert!(body.contains("changed"), "the patch applied: {body}");
+
+        let split_id = sink
+            .ops()
+            .iter()
+            .find_map(|op| match op {
+                PanelOp::Split { id, panes, .. } => Some((*id, panes.clone())),
+                _ => None,
+            })
+            .expect("apply_patch drew a split panel");
+        let ops = sink.ops();
+        let asked: Vec<PanelOp> = ops
+            .iter()
+            .filter(|op| matches!(op, PanelOp::Overlay { text: Some(_), .. }))
+            .cloned()
+            .collect();
+        assert_eq!(asked.len(), 1, "the write was asked about: {asked:?}");
+        match &asked[0] {
+            PanelOp::Overlay { id, text, always } => {
+                assert_eq!(*id, split_id.0, "asked on the patch panel itself");
+                assert_eq!(
+                    text.as_deref(),
+                    Some(format!("Allow write {path}").as_str()),
+                    "naming the file being patched"
+                );
+                assert!(*always, "with [a]lways offered");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            split_id.1[0].caption, "before",
+            "captions are fixed at creation, so they cannot carry the line counts"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// over.
+    #[test]
+    fn a_one_line_file_is_captioned_in_the_singular() {
+        let dir = std::env::temp_dir().join(format!("agent-fs-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let target = dir.join("one.txt");
+        let path = target.to_string_lossy().to_string();
+
+        let caption = |content: &str| -> String {
+            let sink = PanelSink::default();
+            invoke_mcp_tool_with_asks(
+                "fs.write_file",
+                &serde_json::json!({ "path": &path, "content": content }).to_string(),
+                Some(&sink),
+                Some(Rc::new(|_: &str, _: bool| AskAnswer::Allow)),
+                &ConfigSource::Tree,
+            )
+            .expect("invoke")
+            .expect("registered");
+            sink.ops()
+                .iter()
+                .find_map(|op| match op {
+                    PanelOp::Split { panes, .. } => Some(panes[0].caption.clone()),
+                    _ => None,
+                })
+                .expect("a panel")
+        };
+
+        assert_eq!(caption("one line, no newline"), "1 line, 20 bytes");
+        assert_eq!(caption("one line\n"), "1 line, 9 bytes");
+        assert_eq!(caption("two\nlines\n"), "2 lines, 10 bytes");
+        assert_eq!(caption(""), "0 lines, 0 bytes");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refused write says so, in the panel that is already on screen showing
+    /// what the agent was trying to put there.
+    #[test]
+    fn a_refused_write_says_so_beside_the_content_it_would_have_written() {
+        let dir = std::env::temp_dir().join(format!("agent-fs-wdeny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let target = dir.join("refused.rs");
+        let path = target.to_string_lossy().to_string();
+        let content = "fn denied() -> bool { true }\n";
+
+        let sink = PanelSink::default();
+        invoke_mcp_tool_with_asks(
+            "fs.write_file",
+            &serde_json::json!({ "path": &path, "content": content }).to_string(),
+            Some(&sink),
+            Some(Rc::new(|_: &str, _: bool| AskAnswer::Deny(None))),
+            &ConfigSource::Tree,
+        )
+        .expect("invoke")
+        .expect("registered");
+
+        assert!(
+            !target.exists(),
+            "and it wrote nothing"
+        );
+        let pane_text: String = sink
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                PanelOp::SetPane { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            pane_text.contains("fn denied()"),
+            "the content is still shown — this is what the agent wanted to do: {pane_text:?}"
+        );
+        assert!(
+            pane_text.contains("not allowed"),
+            "and the refusal is right there: {pane_text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// said nothing would be the one shape worse than silence.
+    #[test]
+    fn a_refused_read_says_so_in_its_own_panel() {
+        let dir = std::env::temp_dir().join(format!("agent-fs-deny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let target = dir.join("denied.txt");
+        std::fs::write(&target, "x\n").expect("seed");
+        let path = target.to_string_lossy().to_string();
+
+        let sink = PanelSink::default();
+        let (_, _) = invoke_mcp_tool_with_asks(
+            "fs.read",
+            &serde_json::json!({ "path": &path }).to_string(),
+            Some(&sink),
+            Some(Rc::new(|_: &str, _: bool| AskAnswer::Deny(None))),
+            &ConfigSource::Tree,
+        )
+        .expect("invoke")
+        .expect("registered");
+
+        let panel: String = sink
+            .ops()
+            .iter()
+            .map(|op| match op {
+                PanelOp::Append { text, .. } => text.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert!(
+            panel.contains(&path),
+            "the file is still named — the panel was opened before the ask: {panel:?}"
+        );
+        assert!(
+            panel.contains("not allowed"),
+            "and the refusal is in the panel, not only in the model's result: {panel:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5277,7 +6155,7 @@ mod tests {
             let seen_offered = offered.clone();
             let sink = PanelSink::default();
             let (body, _) = invoke_mcp_tool_with_asks(
-                "write_file",
+                "fs.write_file",
                 &args(name),
                 Some(&sink),
                 Some(Rc::new(move |text: &str, always: bool| {
@@ -5285,6 +6163,7 @@ mod tests {
                     seen_asks.borrow_mut().push(text.to_string());
                     AskAnswer::Allow
                 })),
+                &ConfigSource::Tree,
             )
             .expect("invoke")
             .expect("registered write_file");
@@ -5378,8 +6257,8 @@ mod tests {
     }
 
     /// `lua/mcps.lua` is the shipped connection set as one registry — the same
-    /// tools `agent.lua` registers, obtainable in a single require, and usable as
-    /// a mode's tool set.
+    /// tools `lua/init.lua` registers, obtainable in a single require, and usable
+    /// as a mode's tool set.
     ///
     /// Its *name* is pinned here too, because getting it wrong is silent: `mcp`
     /// is `lua/lib/mcp.lua` (the client), `lib/` is ahead of the root on
@@ -5403,7 +6282,7 @@ mod tests {
           if type(conn.tools) ~= "table" then return name .. " is not a connection" end
           if next(conn.tools) == nil then return name .. " has no tools" end
           if agent.mcps[name] ~= conn then
-            return name .. " is not the same connection agent.lua registered"
+            return name .. " is not the same connection the config registered"
           end
         end
         return nil
@@ -5477,7 +6356,7 @@ mod tests {
         let mut before: Vec<&str> = tools_before.iter().map(|d| d.name.as_str()).collect();
         before.sort_unstable();
         assert!(
-            before.contains(&"read_file") && before.contains(&"write_file"),
+            before.contains(&"fs.read") && before.contains(&"fs.write_file"),
             "the baseline has the file tools: {before:?}"
         );
         let baseline_prompt = system_prompt(&lua).expect("baseline prompt");
@@ -5577,7 +6456,7 @@ mod tests {
                 "content": "payload\n",
             })
             .to_string();
-            invoke_tool(&lua, "write_file", &args)
+            invoke_tool(&lua, "fs.write_file", &args)
                 .expect("invoke")
                 .and_then(|(body, _)| serde_json::from_str::<serde_json::Value>(&body).ok())
                 .and_then(|v| v["ok"].as_bool())
@@ -5588,14 +6467,17 @@ mod tests {
                 "content": "payload\n",
             })
             .to_string();
-            let (v, _asked) = tool_allowed("write_file", &args);
+            let (v, _asked) = tool_allowed("fs.write_file", &args);
             v["ok"].as_bool()
         };
 
         // Baseline: the full connection, so the write is offered and works.
         let defs = mcps_tool_defs(&lua).expect("baseline defs");
         let baseline: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        assert!(baseline.contains(&"write_file"), "baseline: {baseline:?}");
+        assert!(
+            baseline.contains(&"fs.write_file"),
+            "baseline: {baseline:?}"
+        );
         assert_eq!(
             asked_write("baseline.txt"),
             Some(true),
@@ -5609,7 +6491,7 @@ mod tests {
             local read_only = {
               name = "fs_read_only",
               description = "reads only",
-              tools = { read_file = fs.tools.read_file, list_dir = fs.tools.list_dir },
+              tools = { read = fs.tools.read },
             }
             agent.mode.new("read_only", {
               description = "no edits",
@@ -5627,8 +6509,9 @@ mod tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            ["list_dir", "read_file"],
-            "the mode advertises exactly the tools its connection exposes"
+            ["fs_read_only.read"],
+            "the mode advertises exactly the tools *its* connection exposes — \
+             qualified by that connection's name, not the built-in one's"
         );
         assert_eq!(
             write("blocked.txt"),
@@ -5649,7 +6532,7 @@ mod tests {
         restored.sort_unstable();
         assert_eq!(
             restored,
-            ["apply_patch", "bash", "list_dir", "read_file", "write_file"],
+            ["bash.bash", "fs.apply_patch", "fs.hand_to_user", "fs.read", "fs.write_file"],
             "clearing the mode restores the configured tool set"
         );
         assert_eq!(
@@ -5716,7 +6599,7 @@ mod tests {
         std::fs::copy(tree().join("api.lua"), dir.join("api.lua")).expect("copy api.lua");
 
         let lua = Lua::new();
-        setup_tree(&lua, None, None, &dir).expect("fixture tree setup");
+        setup_tree(&lua, None, None, &dir, &ConfigSource::Tree).expect("fixture tree setup");
         let problem: Option<String> = lua
             .load(
                 r#"
@@ -5750,12 +6633,88 @@ mod tests {
     /// A tree without an entry script is a load-time error naming the file it
     /// wanted (the tree ships with the binary, so a missing one is a broken
     /// install, not something to paper over with an empty default).
+    /// The two tool shapes the live TUI run could not reach, because the local
+    /// model narrates a tool call as prose instead of emitting one: a tool that
+    /// draws nothing, and a tool that fails.
+    ///
+    /// Both are run through the real registry on a real VM, because the claim
+    /// being pinned is not "the loop suppresses a box" — it is the whole
+    /// arrangement: a tool has nothing to draw if it does not draw, and the
+    /// model learns the outcome either way. The transcript's half of that is in
+    /// `main.rs`, where the folding happens.
+    #[test]
+    fn a_silent_tool_and_a_failing_tool_both_reach_the_model_and_draw_nothing() {
+        let dir = fixture("quiet");
+        std::fs::create_dir_all(dir.join("lib")).expect("fixture dir");
+        std::fs::copy(tree().join("api.lua"), dir.join("api.lua")).expect("api.lua");
+        // The tool table written out rather than built with `agent.utils.tool`:
+        // a fixture tree has no `lib/` modules, so `agent.utils` is nil. This is
+        // the shape `utils.tool` produces (`lua/lib/utils.lua`), spelled here so
+        // the test does not need the whole tree to mean one thing.
+        std::fs::write(
+            dir.join("init.lua"),
+            r#"
+            agent.api_docs = require("api")
+            local function tool(description, callback)
+              return { description = description,
+                       signature = { type = "object", properties = {} },
+                       callback = callback }
+            end
+            agent.mcps = {}
+            agent.mcps.quiet = {
+              name = "quiet",
+              tools = {
+                silent = tool("Succeed without drawing anything.", function()
+                  return { ok = true, result = "done" }
+                end),
+                broken = tool("Raise without drawing anything.", function()
+                  error("the tool fell over")
+                end),
+              },
+            }
+            "#,
+        )
+        .expect("entry script");
+
+        let sink = crate::panels::PanelSink::default();
+        let lua = Lua::new();
+        setup_tree(&lua, Some(&sink), None, &dir, &ConfigSource::Tree).expect("fixture setup");
+
+        // A tool that draws nothing has nothing to draw.
+        let ran = invoke_tool_asking(&lua, "quiet.silent", "{}", None)
+            .expect("the silent tool runs");
+        let (_body, content) = ran.expect("the registry holds quiet.silent");
+        assert!(
+            sink.ops().is_empty(),
+            "a tool that drew nothing queued no panel op: {:?}",
+            sink.ops()
+        );
+        assert!(
+            content.contains("done"),
+            "and the model is told it worked: {content}"
+        );
+
+        // A tool that fails draws nothing either, and says nothing — the
+        // transcript honours that. The model still gets the error.
+        let err = invoke_tool_asking(&lua, "quiet.broken", "{}", None)
+            .expect_err("a raising tool is an error");
+        assert!(
+            sink.ops().is_empty(),
+            "a failure drew nothing either: {:?}",
+            sink.ops()
+        );
+        assert!(
+            err.contains("fell over"),
+            "but the model is told why: {err}"
+        );
+    }
+
     #[test]
     fn a_tree_without_an_entry_script_fails_by_name() {
         let dir = fixture("no-init");
         std::fs::create_dir_all(dir.join("lib")).expect("fixture dir");
         let lua = Lua::new();
-        let err = setup_tree(&lua, None, None, &dir).expect_err("a tree without init.lua must fail");
+        let err = setup_tree(&lua, None, None, &dir, &ConfigSource::Tree).expect_err("a tree without init.lua must fail");
         let text = err.to_string();
         assert!(
             text.contains("init.lua") && text.contains(&dir.display().to_string()),
@@ -7556,6 +8515,12 @@ mod tests {
         // Streaming is opt-in: without on_progress no `_meta.progressToken` is
         // injected and progress notifications fall through to the global
         // opts.on_message, exactly like any other inbound notification.
+        //
+        // This is now the `draw = false` case, and that scoping is the point:
+        // a connection that draws sets `on_progress` on the caller's behalf, so
+        // the opt-out is the only way to get the old wire behaviour — which is
+        // why it forwards the callopts *untouched* rather than merely skipping
+        // the panel. The default path is `mcp_a_wire_call_draws_its_own_panel`.
         let lua = vm();
         let ok: bool = lua
             .load(format!(
@@ -7573,7 +8538,8 @@ mod tests {
             end
             local notes = {}
             local conn = agent.mcp("s", fake_mcp_func(handlers),
-                                   { on_message = function(m) notes[#notes + 1] = m end })
+                                   { draw = false,
+                                     on_message = function(m) notes[#notes + 1] = m end })
             local r = conn.probe({ text = "x" })
             assert(r.ok == true and r.result.content[1].text == "x", "response still settles")
             assert(seen_request_meta == nil, "no progressToken without on_progress")
@@ -7586,6 +8552,214 @@ mod tests {
             .eval()
             .expect("eval");
         assert!(ok, "mcp opt-in progress fallback failed");
+    }
+
+    /// What the drawing path puts in the transcript, read back off the sink as
+    /// one string — `Create` contributes its title, everything else its text.
+    fn drawn(sink: &crate::panels::PanelSink) -> String {
+        sink.ops()
+            .iter()
+            .map(|op| match op {
+                PanelOp::Create { title, .. } => format!("┌─ {title}\n"),
+                PanelOp::Append { text, .. } => text.clone(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    /// An MCP tool cannot report itself — its code is across the wire — so the
+    /// connection draws the panel on its behalf. This is that, end to end
+    /// through the real protocol against the in-process fake.
+    ///
+    /// The assertions are the ones that make it the *same* behaviour a local
+    /// tool gets rather than a different one: a titled panel, opened before the
+    /// request, holding the result's **text** rather than its JSON envelope.
+    #[test]
+    fn mcp_a_wire_call_draws_its_own_panel() {
+        let sink = crate::panels::PanelSink::default();
+        let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
+        let ok: bool = lua
+            .load(format!(
+                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+                body = r#"
+            local conn = agent.mcp("wiki", fake_mcp_func(handlers))
+            local r = conn.probe({ text = "hi there" })
+            assert(r.ok == true, "the call still returns its result")
+            conn:close()
+            return true
+            "#
+            ))
+            .eval()
+            .expect("eval");
+        assert!(ok, "mcp drawing path failed");
+
+        // Opened *before* the result arrived, so a slow call is visibly in
+        // flight rather than appearing all at once when it finishes. The order
+        // of the ops is the evidence.
+        let ops = sink.ops();
+        assert!(
+            matches!(ops.first(), Some(PanelOp::Create { .. })),
+            "the panel is created first, then filled: {ops:?}"
+        );
+
+        let panel = drawn(&sink);
+        // Titled the way tools are named everywhere else.
+        assert!(
+            panel.contains("┌─ wiki.probe"),
+            "a panel titled {{connection}}.{{tool}}: {panel:?}"
+        );
+        // The result's text, not the envelope around it.
+        assert!(
+            panel.contains("hi there"),
+            "the text block is shown: {panel:?}"
+        );
+        assert!(
+            !panel.contains("\"content\"") && !panel.contains("\"type\":\"text\""),
+            "and not the JSON envelope it arrived in: {panel:?}"
+        );
+    }
+
+    /// `draw = false` is the escape hatch, and it has to be exact: no panel ops
+    /// at all, and the request on the wire byte for byte what it always was.
+    #[test]
+    fn mcp_draw_false_keeps_the_call_silent_and_the_wire_unchanged() {
+        let sink = crate::panels::PanelSink::default();
+        let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
+        let ok: bool = lua
+            .load(format!(
+                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+                body = r#"
+            local base_call = handlers["tools/call"]
+            handlers["tools/call"] = function(req)
+              __seen_meta = req.params._meta
+              return base_call(req)
+            end
+            local conn = agent.mcp("wiki", fake_mcp_func(handlers), { draw = false })
+            local r = conn.probe({ text = "hi there" })
+            assert(r.ok == true, "and the call still works")
+            assert(__seen_meta == nil, "no _meta at all: the callopts went through untouched")
+            conn:close()
+            return true
+            "#
+            ))
+            .eval()
+            .expect("eval");
+        assert!(ok, "the draw=false path failed");
+        assert!(
+            sink.ops().is_empty(),
+            "and an opted-out connection draws nothing: {:?}",
+            sink.ops()
+        );
+    }
+
+    /// The two shapes that are not a plain text result, and one failure. All
+    /// three used to be a wall of JSON or nothing at all.
+    #[test]
+    fn mcp_panels_show_text_json_and_failure() {
+        let sink = crate::panels::PanelSink::default();
+        let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
+        let ok: bool = lua
+            .load(format!(
+                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+                body = r#"
+            -- A result with no text block at all: shown as indented JSON, so a
+            -- structured result is never reduced to nothing.
+            handlers["tools/call"] = function(req)
+              if req.params.name == "structured" then
+                return { { jsonrpc = "2.0", id = req.id,
+                           result = { content = { { type = "image", data = "…" } },
+                                      meta = { rows = 2, ok = true } } } }
+              end
+              if req.params.name == "boom" then
+                return { { jsonrpc = "2.0", id = req.id,
+                           error = { code = -32000, message = "the server said no" } } }
+              end
+              -- The shape a real server actually uses for a failed tool: the
+              -- call succeeds, `isError` is set, and the content is a generic
+              -- sentence. Checked because a real `mcp` server does exactly
+              -- this, so a failure can arrive looking like a result.
+              if req.params.name == "iserr" then
+                return { { jsonrpc = "2.0", id = req.id,
+                           result = { isError = true,
+                                      content = { { type = "text",
+                                                    text = "Error executing tool iserr" } } } } }
+              end
+              error("fake func: unexpected tool " .. tostring(req.params.name))
+            end
+            -- Two more tools for these cases, advertised alongside the usual.
+            local base_list = handlers["tools/list"]
+            handlers["tools/list"] = function(req)
+              local msgs = base_list(req)
+              for _, t in ipairs({ "structured", "boom", "iserr" }) do
+                table.insert(msgs[1].result.tools, {
+                  name = t, description = t,
+                  inputSchema = { type = "object", properties = {} } })
+              end
+              return msgs
+            end
+            local conn = agent.mcp("wiki", fake_mcp_func(handlers))
+            conn.structured({})
+            conn.boom({})
+            conn.iserr({})
+            conn:close()
+            return true
+            "#
+            ))
+            .eval()
+            .expect("eval");
+        assert!(ok, "mcp result shapes failed");
+
+        let panel = drawn(&sink);
+        // Indented, and it kept the structure rather than printing it flat.
+        assert!(
+            panel.contains("\"rows\": 2") && panel.contains("\"ok\": true"),
+            "a textless result is shown as indented JSON: {panel:?}"
+        );
+        assert!(
+            panel.contains("the server said no"),
+            "and a JSON-RPC failure is reported in the call's own panel: {panel:?}"
+        );
+        // A tool that failed while the call succeeded: `isError` with a generic
+        // sentence, which is what a real MCP server sends. Unmarked it would be
+        // indistinguishable from a result.
+        assert!(
+            panel.contains("error: Error executing tool iserr"),
+            "an isError result is marked as the failure it is: {panel:?}"
+        );
+    }
+
+    /// A tool with a Lua `callback` is running on this VM, so it can ask for
+    /// its own panel. Drawing for it too would be the double output the whole
+    /// arrangement exists to prevent — so this path is left alone.
+    #[test]
+    fn mcp_a_callback_tool_is_left_to_draw_itself() {
+        let sink = crate::panels::PanelSink::default();
+        let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
+        let ok: bool = lua
+            .load(format!(
+                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+                body = r#"
+            local conn = agent.mcp("wiki", fake_mcp_func(handlers))
+            -- The override: same connection, but this tool answers in Lua.
+            -- The same override shape `mcp_tool_callback_overrides_the_rpc`
+            -- uses: a callback on a tool the server advertised.
+            conn.probe.callback = function()
+              return { content = { { type = "text", text = "answered here" } } }
+            end
+            local r = conn.probe({})
+            assert(r.ok == true, "the callback answers")
+            conn:close()
+            return true
+            "#
+            ))
+            .eval()
+            .expect("eval");
+        assert!(ok, "the callback-tool path failed");
+        assert!(
+            sink.ops().is_empty(),
+            "a tool that can draw for itself is not drawn for: {:?}",
+            sink.ops()
+        );
     }
 
     #[test]
@@ -8157,330 +9331,388 @@ return policy
     // request, never cached.
     // -----------------------------------------------------------------------
 
-    /// A user-style `agent.lua` (loaded via [`apply_config_source`], which is
-    /// what the real file loader runs): tools are whatever the user writes,
+    /// A user-style config (loaded via [`apply_config_source`], which is what
+    /// the real file loader runs): tools are whatever the user writes,
     /// registered into `agent.mcps` directly — there is no mode layer, only
     /// the primitives (agent.utils.tool, agent.shq, agent.bash).
     ///
     /// It is also the worked example of the policy convention: a policy is a
     /// local table in the file that applies it, because `agent.bash` takes one
-    /// per call and there is no `agent.policy` namespace to look one up in.
-    const TEST_CONFIG: &str = r#"
--- The sandbox policies, written here because a policy is just a table of
--- syscall name -> callback and its keys are the interception mask: an empty
--- policy traps nothing (everything else runs through the kernel undecided),
--- and `read_only` names `openat` to put a floor under the read tools.
-local sc = require("seccomp")
-
-local function open()
-  return {}
-end
-
-local function read_only()
-  return {
-    openat = function(sys)
-      local flags = sc.arg(sys, "openat")
-      if sc.is_tty_probe(flags) then return true end
-      if sc.check("openat", flags, "WRITE") then
-        return agent.deny("read-only policy: write open (" ..
-                          sc.describes("openat", flags) .. ") denied")
-      end
-      return true
-    end,
-  }
-end
-
-local function read_file(args)
-  local out = agent.bash("cat -n -- " .. agent.shq(args.path), read_only(), nil):run()
-  if out.exit and out.exit.code and out.exit.code ~= 0 then
-    return { ok = false, error = tostring(out.stderr or "") }
-  end
-  return { ok = true, result = { content = out.stdout } }
-end
-
-local function list_dir(args)
-  local out = agent.bash("ls -la -- " .. agent.shq(args.path), read_only(), nil):run()
-  return { ok = true, result = { content = out.stdout } }
-end
-
-local function grep(args)
-  local out = agent.bash(
-    "grep -rn -- " .. agent.shq(args.pattern) .. " " .. agent.shq(args.path),
-    read_only(), nil):run()
-  return { ok = true, result = { content = out.stdout } }
-end
-
-local function shell(args)
-  local out = agent.bash(args.cmdline, open(), nil):run()
-  return { ok = true, result = { stdout = out.stdout } }
-end
-
-local conn = { name = "user-tools", tools = {} }
-conn.tools.read_file = agent.utils.tool(
-  "Read a file (read-only; line numbers).",
-  { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
-  read_file)
-conn.tools.list_dir = agent.utils.tool(
-  "List a directory (read-only).",
-  { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
-  list_dir)
-conn.tools.grep = agent.utils.tool(
-  "Search file contents (read-only).",
-  { type = "object",
-    properties = { pattern = { type = "string" }, path = { type = "string" } },
-    required = { "pattern", "path" } },
-  grep)
-conn.tools.shell = agent.utils.tool(
-  "Run a sandboxed shell command (writes allowed).",
-  { type = "object", properties = { cmdline = { type = "string" } }, required = { "cmdline" } },
-  shell)
-agent.mcps["user-tools"] = conn
-"#;
-
+    /// A user's `~/.config/agent/init.lua` has to do what it is for: override
+    /// the endpoint and the prompt, and register connections, all through the
+    /// real loader, with the per-request reindex picking them up.
+    ///
+    /// This used to be a test that read "the example config the repo ships" —
+    /// and had been quietly passing for as long as no such file existed, because
+    /// it returned early when `config_path()` was `None`. The repo ships no
+    /// config; the user writes one. So it is written here instead, and asserted
+    /// through the same path the loader takes.
     #[test]
-    fn mcps_reindex_is_fresh_and_never_sticky() {
-        // The registry is the live `agent.mcps` table, reindexed on every
-        // request: nothing about the tool set survives in Rust, and Rust is
-        // not the source of truth for which tools exist.
+    fn tmp_probe_llm() {
         let lua = vm();
-        apply_config_source(&lua, TEST_CONFIG).expect("user config");
-        let defs = mcps_tool_defs(&lua).expect("reindex");
-        let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["grep", "list_dir", "read_file", "shell"],
-            "every tool the user registered is advertised"
-        );
-
-        // Mutating the table is visible to the very next reindex: drop one
-        // tool, add another, and the next index reflects only the new set.
-        let script = r#"
-            local conn = agent.mcps["user-tools"]
-            conn.tools.read_file = nil
-            conn.tools.touch = agent.utils.tool(
-              "Touch a file.",
-              { type = "object", properties = { path = { type = "string" } } },
-              function(args) return { ok = true, result = { path = args.path } } end)
-            return true
-        "#;
-        lua.load(script).eval::<bool>().expect("mutate registry");
-        let defs = mcps_tool_defs(&lua).expect("reindex after edit");
-        let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["grep", "list_dir", "shell", "touch"],
-            "the edit shows up on the next reindex, and the dropped tool is gone"
-        );
-
-        // An empty registry is legal (a mode with no tools), not an error.
-        lua.load(r#"agent.mcps = {}"#).exec().expect("clear");
-        assert!(mcps_tool_defs(&lua).expect("reindex empty").is_empty());
-
-        // Advertised schemas are real JSON object schemas (the `parameters`
-        // slot of the model-facing tool definition).
-        apply_config_source(&lua, TEST_CONFIG).expect("user config again");
-        let defs = mcps_tool_defs(&lua).expect("reindex");
-        let read_file = defs.iter().find(|t| t.name == "read_file").unwrap();
-        assert_eq!(read_file.parameters["type"], "object");
-        assert!(
-            read_file.parameters["required"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::Value::from("path")),
-            "inputSchema required lists the mandatory argument"
-        );
-        assert!(!read_file.description.is_empty());
+        let base: String = lua.load("return tostring(agent.llm.base_url)").eval().unwrap();
+        let shq: String = lua.load("return type(agent.shq)").eval().unwrap();
+        println!("PROBE base_url={base:?} shq={shq:?}");
     }
 
+    /// Two connections offering the *same* tool name are two tools, and the
+    /// names the model sees have to say so.
+    ///
+    /// This is why tools are advertised as `{connection}.{tool}`: a bare
+    /// `list_issues` from two servers is one name for two tools, and the
+    /// registry resolves an unqualified name by scanning connections — so one of
+    /// them is not merely ambiguous, it is unreachable. Qualifying at the point
+    /// of advertisement means the collision cannot be expressed at all.
     #[test]
-    fn mcp_invoke_runs_registered_tools_and_passes_unnamed_through() {
+    fn tool_names_are_qualified_by_their_connection() {
         let lua = vm();
-        apply_config_source(&lua, TEST_CONFIG).expect("user config");
-
-        // A real sandboxed read-only `cat` through a registered tool.
-        let (body, _) = invoke_tool(&lua, "read_file", r#"{"path":"/etc/hostname"}"#)
-            .expect("invoke")
-            .expect("registered tool");
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["ok"], true, "read succeeds: {body}");
-        assert!(
-            !v["result"]["content"].as_str().unwrap().is_empty(),
-            "content came back: {body}"
-        );
-
-        // grep runs read-only (exit 1 = no matches is still a result).
-        let (body, _) = invoke_tool(
-            &lua,
-            "grep",
-            r#"{"pattern":"mcp-tool-grep-probe","path":"./src"}"#,
-        )
-        .expect("invoke")
-        .expect("registered tool");
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["ok"], true, "grep runs read-only: {body}");
-
-        // The permissive policy lets the sandboxed shell write to stdout.
-        let (body, _) = invoke_tool(&lua, "shell", r#"{"cmdline":"echo tool-hi"}"#)
-            .expect("invoke")
-            .expect("registered tool");
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["ok"], true, "sandbox shell runs: {body}");
-        assert!(
-            v["result"]["stdout"].as_str().unwrap().contains("tool-hi"),
-            "stdout captured: {body}"
-        );
-
-        // An unregistered name falls through (Ok(None)): this config registers
-        // no shell, and the caller's cue is to refuse it.
-        let r = invoke_tool(&lua, "bash", "{}").expect("unregistered");
-        assert!(r.is_none(), "no bash tool registered here: {r:?}");
-
-        // A policy written in the tool's own closure really does deny a write,
-        // and says why: behavior here is a *user* choice, made in the config,
-        // with no namespace to reach for.
-        let lua = vm();
-        apply_config_source(
-            &lua,
+        lua.load(
             r#"
-            local sc = require("seccomp")
-            local function read_only()
+            local function conn(name, toolname)
               return {
-                openat = function(sys)
-                  local flags = sc.arg(sys, "openat")
-                  if sc.check("openat", flags, "WRITE") then
-                    return agent.deny("read-only policy: write open (" ..
-                                      sc.describes("openat", flags) .. ") denied")
-                  end
-                  return true
-                end,
+                name = name,
+                tools = { [toolname] = agent.utils.tool(
+                  "the same tool, from " .. name,
+                  { type = "object", properties = {} },
+                  function () return { ok = true, result = name } end) },
               }
             end
-            agent.mcps.w = { tools = { append = agent.utils.tool("Append.", {}, function(args)
-              local out = agent.bash("echo x >> " .. agent.shq(args.path),
-                                     read_only(), nil):run()
-              if out.denied then return { ok = false, denied = true, error = out.denied_reason } end
-              return { ok = true, result = { content = out.stdout } }
-            end) } }
-            "#,
+            agent.mcps.alpha = conn("alpha", "list_issues")
+            agent.mcps.beta  = conn("beta",  "list_issues")
+        "#,
         )
-        .expect("write-denied tool");
-        let (body, _) = invoke_tool(&lua, "append", r#"{"path":"/tmp/agent-mcp-deny"}"#)
-            .expect("invoke")
-            .expect("registered tool");
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["ok"], false, "the policy denies the write: {body}");
+        .exec()
+        .expect("two connections with a colliding tool name");
+
+        let names: Vec<String> = mcps_tool_defs(&lua)
+            .expect("reindex")
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "alpha.list_issues",
+                "bash.bash",
+                "beta.list_issues",
+                "fs.apply_patch",
+                "fs.hand_to_user",
+                "fs.read",
+                "fs.write_file",
+            ],
+            "the two colliding tools are two names, alongside the built-ins"
+        );
+
+        // And each resolves to *its own* implementation, not the first match.
+        for conn in ["alpha", "beta"] {
+            let (body, _) = invoke_tool(&lua, &format!("{conn}.list_issues"), "{}")
+                .expect("invoke")
+                .expect("registered");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("tool json");
+            assert_eq!(v["result"], conn, "{conn} runs its own tool");
+        }
+
+        // The bare name is not a way back in: it is a name the model was never
+        // shown, so it resolves to nothing rather than to whichever came first.
         assert!(
-            v["error"].as_str().unwrap_or("").contains("write open"),
-            "the denial names the reason: {body}"
+            invoke_tool(&lua, "list_issues", "{}").expect("invoke").is_none(),
+            "an unqualified name is refused, not guessed at"
         );
     }
 
     #[test]
-    fn llm_config_reads_lua_values_with_defaults() {
-        // No user file at all: the driver's defaults stand in for the old
-        // from_env defaults, so a config-less run still works.
-        let lua = vm();
-        let c = llm_config(&lua).expect("defaults");
-        assert_eq!(c.base_url, "https://api.openai.com/v1");
-        assert_eq!(c.model, "gpt-4o-mini");
-        assert_eq!(c.api_key, "");
-
-        // Full override.
-        apply_config_source(
-            &lua,
-            r#"agent.llm = { base_url = "http://localhost:8080/v1", model = "m", api_key = "k" }"#,
-        )
-        .expect("llm override");
-        let c = llm_config(&lua).expect("override");
-        assert_eq!(c.base_url, "http://localhost:8080/v1");
-        assert_eq!(c.model, "m");
-        assert_eq!(c.api_key, "k");
-
-        // Partial override keeps untouched fields.
-        apply_config_source(&lua, r#"agent.llm.base_url = "http://other/v1""#)
-            .expect("partial override");
-        let c = llm_config(&lua).expect("partial");
-        assert_eq!(c.base_url, "http://other/v1");
-        assert_eq!(c.model, "m", "untouched field keeps its Lua value");
-    }
-
-    #[test]
-    fn system_prompt_reads_lua_values_with_default() {
-        // No prompt configured: requests carry no leading `system` message.
-        let lua = vm();
-        assert_eq!(system_prompt(&lua).expect("default"), "");
-
-        apply_config_source(&lua, r#"agent.llm.system_prompt = [[Be terse.]]"#)
-            .expect("system prompt");
-        assert_eq!(system_prompt(&lua).expect("prompt"), "Be terse.");
-
-        // Re-applying the driver (idempotent) never clobbers user config.
-        apply_config_source(&lua, "").expect("no-op reapply");
-        assert_eq!(system_prompt(&lua).expect("prompt"), "Be terse.");
-
-        // A long-form multi-line prompt survives verbatim (users write these
-        // in Lua long-string form).
-        apply_config_source(&lua, "agent.llm.system_prompt = [[line one\nline two]]")
-            .expect("multiline prompt");
-        assert_eq!(system_prompt(&lua).expect("prompt"), "line one\nline two");
-    }
-
-    #[test]
-    fn shipped_agent_lua_loads_and_indexes_its_tools() {
-        // The example config the repo ships (and that users copy) must keep
-        // working: it loads through the real file loader, sets an endpoint
-        // and a system prompt, and registers tools the per-request reindex
-        // advertises. Skipped when run outside the repo (no agent.lua in cwd).
+    fn a_user_config_overrides_the_built_ins_and_registers_connections() {
         let lua = new_vm_with_sink(None).expect("vm");
-        let Some(path) = config_path() else {
-            return; // no agent.lua here: nothing to guard
-        };
-        let source = std::fs::read_to_string(&path).expect("read agent.lua");
-        apply_config_source(&lua, &source).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        // The built-ins first, so the override is an override and not an
+        // initialisation: `apply_config_source` runs on top of the entry script.
+        load_init(&lua, &tree()).expect("the entry script");
+        assert_eq!(
+            llm_config(&lua).expect("llm").model,
+            "gpt-4o-mini",
+            "the built-in default is what a config starts from"
+        );
 
+        let source = r#"
+            agent.llm.base_url = "http://127.0.0.1:9/v1"
+            agent.llm.model    = "my-local-model"
+            agent.llm.system_prompt = "You are a test fixture, and this is the prompt."
+            agent.mcps = { echo = { name = "echo", tools = {
+                echo = agent.utils.tool("echo one argument back", {
+                  type = "object",
+                  properties = { line = { type = "string", description = "the line" } },
+                  required = { "line" },
+                }, function (a) return { ok = true, result = a.line } end),
+            } } }
+        "#;
+        apply_config_source(&lua, source).expect("the user config applies");
+
+        let llm = llm_config(&lua).expect("llm");
+        assert_eq!(llm.base_url, "http://127.0.0.1:9/v1", "the endpoint is overridden");
+        assert_eq!(llm.model, "my-local-model", "and so is the model");
         assert!(
-            !llm_config(&lua).expect("llm").base_url.is_empty(),
-            "the shipped config names an endpoint"
+            system_prompt(&lua).expect("prompt").contains("test fixture"),
+            "and the prompt"
         );
-        let prompt = system_prompt(&lua).expect("system prompt");
-        assert!(
-            prompt.trim().len() > 20,
-            "the shipped config ships a real system prompt: {prompt:?}"
-        );
+
+        // The registry is what the request advertises, and this config replaced
+        // it wholesale — so only its own tool is offered.
         let defs = mcps_tool_defs(&lua).expect("reindex");
         let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            names.contains(&"read_file"),
-            "the shipped config registers its example tools: {names:?}"
+        assert_eq!(
+            names,
+            ["echo.echo"],
+            "the config's registry — qualified by the connection name it chose"
         );
+
         for tool in &defs {
-            assert_eq!(
-                tool.parameters["type"], "object",
-                "{} advertises an object schema",
-                tool.name
-            );
+            assert_eq!(tool.parameters["type"], "object", "{} advertises a schema", tool.name);
+            assert!(!tool.description.is_empty(), "{} has a description", tool.name);
             assert!(
-                !tool.description.is_empty(),
-                "{} has a description",
+                invoke_tool(&lua, &tool.name, r#"{"line":"hi"}"#)
+                    .expect("invoke")
+                    .is_some(),
+                "{} is registered and callable",
                 tool.name
             );
-        }
-        // Every registered tool really is invokable (registered, callable,
-        // and returning the MCP shape) — without running anything side-effecting.
-        for tool in &defs {
-            let probe = invoke_tool(&lua, &tool.name, "{}").expect("invoke");
-            assert!(probe.is_some(), "{} is registered in agent.mcps", tool.name);
         }
     }
 
-    /// A VM with the shipped ./agent.lua applied (the same file the TUI loads
-    /// from the repo root), so the tests exercise the real Lua tools.
-    fn shipped_vm() -> mlua::Lua {
+    /// Where the config is looked for: one path, under `$HOME`, and it has to
+    /// exist to count. Asserted through the `$HOME`-taking form so it does not
+    /// depend on whoever is running the suite.
+    /// The loader seeds the user's config from the shipped one, once, and runs
+    /// *that* — after which the file in `$HOME` is the configuration, not an
+    /// overlay on it.
+    ///
+    /// Both halves matter. Seeding means a user who has never run the agent ends
+    /// up with a file they can read and edit, instead of having to write one from
+    /// a manual. And "runs that, not both" means the file they edit is the whole
+    /// truth: there is no second script underneath quietly contributing
+    /// connections the user cannot see or remove.
+    /// A test that reads the invoking user's `~/.config/agent/init.lua` is a
+    /// test that passes on one machine and fails on the next, and one that
+    /// passes or fails depending on what the operator last edited. This pins
+    /// the two doors that opened onto `$HOME`.
+    ///
+    /// It runs a test VM with the *tree's* configuration and a config in a
+    /// temporary home that would be obviously wrong if it were read, and asserts
+    /// the VM came from the tree.
+    #[test]
+    fn the_test_suite_never_reads_the_real_home_directory() {
+        // 1. `ConfigSource::default()` — what every `new_vm` uses — is the tree.
+        assert_eq!(ConfigSource::default(), ConfigSource::Tree);
+        // The tree's entry script registers the shell and the file tools. A
+        // user's config need not — the hostile one this suite has been run
+        // against registers neither — so their presence is the evidence.
         let lua = vm();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent.lua");
-        let source = std::fs::read_to_string(&path).expect("read shipped agent.lua");
-        apply_config_source(&lua, &source).expect("load shipped agent.lua");
+        let names: Vec<String> = mcps_tool_defs(&lua)
+            .expect("reindex")
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "bash.bash",
+                "fs.apply_patch",
+                "fs.hand_to_user",
+                "fs.read",
+                "fs.write_file",
+            ],
+            "a plain VM has the shipped configuration, not the operator's"
+        );
+
+        // 2. The standalone tool-invocation path takes its configuration as an
+        //    argument, so a test passes the tree explicitly rather than
+        //    inheriting whatever is in `$HOME`. (Registration is the check; the
+        //    call itself would need a sandbox answer, and a headless run denies
+        //    every ask.)
+        assert!(
+            invoke_mcp_tool_with_asks("bash.bash", "{}", None, None, &ConfigSource::Tree)
+                .expect("invoke")
+                .is_some(),
+            "the tree's configuration, found by name"
+        );
+        assert!(
+            invoke_mcp_tool_with_asks("no.such.tool", "{}", None, None, &ConfigSource::Tree)
+                .expect("invoke")
+                .is_none(),
+            "and nothing else is"
+        );
+    }
+
+    #[test]
+    fn the_users_config_is_seeded_from_the_shipped_one_and_then_belongs_to_them() {
+        let home = std::env::temp_dir().join(format!("agent-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("fake home");
+        let cfg = home.join(".config").join("agent").join("init.lua");
+
+        // First run: no file, so the shipped one is copied there and that is the
+        // script the VM is configured by.
+        let (path, origin) = ensure_config(&tree(), Some(&home));
+        assert_eq!(path, cfg, "the config is the user's own copy");
+        assert_eq!(origin, ConfigOrigin::Seeded);
+        assert!(cfg.is_file(), "and it exists now: {}", cfg.display());
+        let seeded = std::fs::read_to_string(&cfg).expect("read the seeded config");
+        assert!(
+            seeded.contains("agent.llm"),
+            "seeded from the real entry script, not a stub: {} bytes",
+            seeded.len()
+        );
+
+        // A VM configured from the seeded file is a whole agent — the copy is
+        // the real entry script, not a stub.
+        let run = |home: &std::path::Path| -> Result<Lua, String> {
+            let lua = Lua::new_with(STDLIB, mlua::LuaOptions::default()).map_err(|e| e.to_string())?;
+            setup_tree(
+                &lua,
+                None,
+                None,
+                &tree(),
+                &ConfigSource::UserHome(Some(home.to_path_buf())),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(lua)
+        };
+        let seeded_vm = run(&home).expect("the seeded copy configures a VM");
+        assert_eq!(
+            llm_config(&seeded_vm).expect("llm").base_url,
+            "https://api.openai.com/v1",
+            "the seeded copy configures a working agent"
+        );
+        assert_eq!(
+            mcps_tool_defs(&seeded_vm).expect("reindex").len(),
+            5,
+            "shell and the four file tools"
+        );
+
+        // Second run: the user's file is the configuration, never re-seeded
+        // over. Note what an edit has to look like now: the file is the *whole*
+        // config, so it is also what creates the tables it sets.
+        std::fs::write(
+            &cfg,
+            "agent.llm = agent.llm or { base_url = 'x', model = 'x', api_key = '' }\n\
+             agent.llm.model = 'mine'\n",
+        )
+        .expect("edit the config");
+        let (path, origin) = ensure_config(&tree(), Some(&home));
+        assert_eq!((path, origin), (cfg.clone(), ConfigOrigin::Existing));
+        assert!(
+            std::fs::read_to_string(&cfg).expect("read").contains("'mine'"),
+            "an existing config is never re-seeded over"
+        );
+
+        let edited = run(&home).expect("the edited config loads");
+        assert_eq!(
+            llm_config(&edited).expect("llm").model,
+            "mine",
+            "the edit is what the VM runs"
+        );
+        assert!(
+            mcps_tool_defs(&edited).expect("reindex").is_empty(),
+            "and nothing else is layered underneath: replacing the file replaces \
+             the configuration, which is the point of it being the user's"
+        );
+
+        // And a config may be as short as the one thing it wants to change. The
+        // loader creates `agent.llm` before the config runs, precisely so that
+        // a three-line file is a working configuration — a user who writes their
+        // own from scratch should not have to reproduce a table constructor to
+        // set a field on it.
+        std::fs::write(&cfg, "agent.llm.model = 'short'\n").expect("a minimal config");
+        let short = run(&home).expect("a one-line config loads");
+        assert_eq!(llm_config(&short).expect("llm").model, "short");
+        assert_eq!(
+            llm_config(&short).expect("llm").base_url,
+            "https://api.openai.com/v1",
+            "and the fields it does not mention fall back to the default"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A home that cannot be written must not stop the agent: it runs the
+    /// shipped defaults and says so. An agent that will not start is worse than
+    /// one that is not configured.
+    #[test]
+    fn an_unwritable_home_falls_back_to_the_shipped_defaults() {
+        // A path whose parent is a *file*, so creating the directory under it
+        // cannot work — no permission fiddling, and it fails the same way on
+        // every platform and whether or not the suite runs as root.
+        let blocker = std::env::temp_dir().join(format!("agent-blocked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::create_dir_all(&blocker).expect("scratch");
+        std::fs::write(blocker.join("not-a-dir"), "x").expect("a file where a dir must go");
+
+        let (path, origin) = ensure_config(&tree(), Some(&blocker.join("not-a-dir")));
+        assert_eq!(origin, ConfigOrigin::Tree, "reported, not fatal");
+        assert_eq!(
+            path,
+            tree().join("init.lua"),
+            "and the shipped script is used instead"
+        );
+        let _ = std::fs::remove_dir_all(&blocker);
+    }
+
+    #[test]
+    fn the_user_config_is_one_path_under_home() {
+        let dir = std::env::temp_dir().join(format!("agent-confighome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = dir.join(".config").join("agent");
+        std::fs::create_dir_all(&cfg).expect("make a fake home");
+
+        // Nothing there yet: no config is the normal case, and the built-ins
+        // stand on their own.
+        assert_eq!(config_path_in(Some(dir.clone())), None);
+        assert_eq!(config_path_in(None), None, "and no HOME is not an error");
+
+        // A directory that exists but is not the file is still no config.
+        std::fs::create_dir_all(cfg.join("init.lua")).expect("a decoy directory");
+        assert_eq!(config_path_in(Some(dir.clone())), None, "a directory is not a config");
+
+        std::fs::remove_dir_all(cfg.join("init.lua")).expect("clear the decoy");
+        std::fs::write(cfg.join("init.lua"), "-- nothing\n").expect("write a config");
+        assert_eq!(
+            config_path_in(Some(dir.clone())),
+            Some(cfg.join("init.lua")),
+            "one path: ~/.config/agent/init.lua"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A VM with the built-in configuration taken back off: no connections, no
+    /// mode in force, no prompt — a neutral `agent` for the tests that need one.
+    ///
+    /// The built-ins are real (the entry script registers the file tools, the
+    /// shell and the `coding` mode, so a fresh checkout is usable), which means a
+    /// plain `vm()` is no longer neutral. This is the way to ask for the old
+    /// starting point rather than working around it in each test.
+    fn neutral_vm() -> mlua::Lua {
+        let lua = vm();
+        lua.load(
+            r#"
+        agent.mode.set()             -- off the built-in default, back to the baseline
+        agent.mcps = {}              -- …and the baseline registry itself
+        agent.llm.system_prompt = ""
+        agent.mode.forget_all()      -- no modes registered at all
+    "#,
+        )
+        .exec()
+        .expect("strip the built-in configuration");
         lua
+    }
+
+    /// A VM with the agent's built-in configuration — the connections and the
+    /// modes, which `lua/init.lua` registers as the defaults — so the tests
+    /// exercise the real Lua tools.
+    ///
+    /// No user config is in play in the test environment, so this is just
+    /// `vm()`. It stays a named function because "the agent as it is actually
+    /// configured" is a thing the tests mean, and because if a user config were
+    /// present it is this line that has to apply it.
+    fn shipped_vm() -> mlua::Lua {
+        vm()
     }
 
     /// Drive a tool call the way the event loop does — start it on the config
@@ -8518,6 +9750,203 @@ agent.mcps["user-tools"] = conn
         panic!("{name} never finished");
     }
 
+    /// Two tool calls in one round, each of which asks — can the TUI hold two
+    /// questions at once?
+    ///
+    /// No, and this pins *why*: a tool call is a coroutine that has to be
+    /// yielded back to before it can ask, and the loop keeps exactly one in
+    /// flight (`tool_flight: Option<ToolFlight>`), so the second call is not
+    /// even started until the first has returned. Driven here the way the loop
+    /// drives it, and asserted from the outside: while call one is unanswered,
+    /// call two does not exist, so there is nothing for its question to collide
+    /// with.
+    #[test]
+    fn two_asking_tool_calls_are_strictly_sequential() {
+        use ToolStep;
+        let lua = vm();
+        let sink = PanelSink::default();
+        install_sink(&lua, &sink).expect("round sink");
+        let args = |cmd: &str| format!(r#"{{"cmdline":{}}}"#, serde_json::json!(cmd));
+
+        // Call one: started, and it asks.
+        let Some((mut one, step1)) =
+            ToolRun::start(&lua, "bash.bash", &args("cat /etc/hostname")).expect("start")
+        else {
+            panic!("the registry holds bash");
+        };
+        let step1 = drive_to_ask(&mut one, step1);
+        let ToolStep::Ask { text: q1, .. } = &step1 else {
+            panic!("expected an ask, got {step1:?}");
+        };
+        assert!(q1.contains("read"), "the question names the read: {q1}");
+        // One panel exists for the first call. The dialog on it is the driver's to
+        // draw, and it is what makes the second call's question impossible to
+        // confuse with this one: the second call has not started.
+        assert_eq!(
+            sink.ops()
+                .iter()
+                .filter(|op| matches!(op, PanelOp::Create { .. }))
+                .count(),
+            1,
+            "one panel so far: {:?}",
+            sink.ops()
+        );
+
+        // Answer it; only once it has returned does call two begin.
+        let v: serde_json::Value = serde_json::from_str(&drive_to_end(&mut one, step1))
+            .expect("tool json");
+        assert_eq!(v["ok"], true, "{v}");
+
+        let Some((mut two, step2)) =
+            ToolRun::start(&lua, "bash.bash", &args("cat /etc/hosts")).expect("start")
+        else {
+            panic!("the registry holds bash");
+        };
+        let step2 = drive_to_ask(&mut two, step2);
+        let ToolStep::Ask { text: q2, .. } = &step2 else {
+            panic!("expected an ask, got {step2:?}");
+        };
+        assert!(q2.contains("read"), "{q2}");
+        let v: serde_json::Value = serde_json::from_str(&drive_to_end(&mut two, step2))
+            .expect("tool json");
+        assert_eq!(v["ok"], true, "{v}");
+
+        // Two panels, each titled with its own command, each with its own
+        // question, in order.
+        let creates: Vec<String> = sink
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                PanelOp::Create { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            creates,
+            ["cat /etc/hostname", "cat /etc/hosts"],
+            "one panel per call, each titled with its own command"
+        );
+    }
+
+    /// The other half, and the reason the test above matters: the machinery
+    /// *does* let two runs sit on an ask at the same time — nothing in `ToolRun`
+    /// or the runtime objects. What prevents it is the loop holding one flight.
+    ///
+    /// So the single `pending_verdict` slot in `main.rs` is safe by loop
+    /// discipline, not by construction. Anyone who later runs tools in parallel
+    /// has to widen it to a queue keyed by run, or a verdict will be handed to
+    /// whichever coroutine is stepped first. This is the canary for that change.
+    #[test]
+    fn two_asking_runs_are_possible_but_the_loop_never_gets_there() {
+        use ToolStep;
+        let lua = vm();
+        let sink = PanelSink::default();
+        install_sink(&lua, &sink).expect("round sink");
+        let args = |cmd: &str| format!(r#"{{"cmdline":{}}}"#, serde_json::json!(cmd));
+        let start = |cmd: &str| {
+            let Some(pair) = ToolRun::start(&lua, "bash.bash", &args(cmd)).unwrap() else {
+                panic!("the registry holds bash");
+            };
+            pair
+        };
+
+        let (mut one, s1) = start("cat /etc/hostname");
+        let (mut two, s2) = start("cat /etc/hosts");
+        let s1 = drive_to_ask(&mut one, s1);
+        let s2 = drive_to_ask(&mut two, s2);
+
+        // Both suspended mid-ask simultaneously, with an overlay each. This is
+        // the state the loop must never reach, and nothing below stops it.
+        assert!(
+            matches!(s1, ToolStep::Ask { .. }) && matches!(s2, ToolStep::Ask { .. }),
+            "two outstanding asks: {s1:?} / {s2:?}"
+        );
+        assert_eq!(
+            sink.ops()
+                .iter()
+                .filter(|op| matches!(op, PanelOp::Create { .. }))
+                .count(),
+            2,
+            "and two panels, each with a command of its own as its title"
+        );
+
+        // One verdict advances one run and leaves the other asking: a single
+        // slot is one wide, which is the whole constraint.
+        let after = one
+            .answer(verdict_to_lua(&lua, &AskAnswer::Allow))
+            .expect("answer the first");
+        assert!(
+            matches!(
+                after,
+                ToolStep::Waiting { .. } | ToolStep::Ask { .. } | ToolStep::Returned(_)
+            ),
+            "the first moved on: {after:?}"
+        );
+        assert!(
+            matches!(s2, ToolStep::Ask { .. }),
+            "the second is untouched: still asking, unanswered"
+        );
+    }
+
+    /// Step through the sandbox's cooperative waits until the tool asks, and
+    /// hand back that `Ask`.
+    ///
+    /// An ask is never the *first* step: the drive loop in `lua/lib/bash.lua`
+    /// yields once per cadence tick before the sandbox has anything to report,
+    /// so a driver that expects an ask immediately sees `Waiting { ms: 20 }`.
+    fn drive_to_ask(run: &mut ToolRun<'_>, mut step: ToolStep) -> ToolStep {
+        for waited in 0..20_000 {
+            match &step {
+                ToolStep::Ask { .. } => return step,
+                ToolStep::Waiting { ms } => {
+                    // The cadence wait is *real* time, and honouring it is what
+                    // makes this test deterministic. `ToolRun::wait` only
+                    // resumes the coroutine — the `ms` is advice for whoever is
+                    // driving it, and the shipped event loop is what acts on it.
+                    // A test that spun without sleeping burned its whole 1000
+                    // iterations in milliseconds and gave up before the
+                    // sandbox's notification was ever delivered, so this test
+                    // failed perhaps one run in three under load and passed the
+                    // rest. Spinning was never the thing under test.
+                    std::thread::sleep(std::time::Duration::from_millis(*ms));
+                    step = run.wait().expect("wait");
+                }
+                ToolStep::Returned(body) => panic!("returned before asking: {body}"),
+            }
+            let _ = waited;
+        }
+        panic!("never asked");
+    }
+
+    /// A tool already suspended on `first`, answering whatever it asks, driven
+    /// to its return. Every ask is allowed, so this is the "press yes to
+    /// everything" driver the loop's auto-yes would be.
+    fn drive_to_end(run: &mut ToolRun<'_>, first: ToolStep) -> String {
+        use ToolStep;
+        let mut step = first;
+        let mut asks = 0usize;
+        let mut waits = 0usize;
+        for _ in 0..100000 {
+            match step {
+                ToolStep::Returned(body) => return body,
+                ToolStep::Ask { .. } => {
+                    asks += 1;
+                    let v = verdict_to_lua(run.lua(), &AskAnswer::Allow);
+                    step = run.answer(v).expect("answer");
+                }
+                ToolStep::Waiting { ms } => {
+                    waits += 1;
+                    // As in `drive_to_ask`: the cadence is wall time, and a
+                    // driver that ignores it races the notification it is
+                    // waiting for.
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    step = run.wait().expect("wait");
+                }
+            }
+        }
+        panic!("the tool never finished after {asks} asks and {waits} waits");
+    }
+
     /// The permissive mode's gates ask, in the words the mode specifies.
     ///
     /// The command is `bash` itself doing the syscall, so each case is one real
@@ -8535,6 +9964,10 @@ agent.mcps["user-tools"] = conn
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let target = dir.join("out.txt");
+        // Seeded so the write is an overwrite. Creating a name nothing holds is
+        // deliberately not a question — `creating_a_new_name_is_not_a_question`
+        // is that test's whole subject — and this one is about the *question*.
+        std::fs::write(&target, "before\n").expect("seed the target");
         let path = target.to_string_lossy().to_string();
 
         // A write-open is asked, and the question names the file and the flags.
@@ -8559,8 +9992,15 @@ agent.mcps["user-tools"] = conn
             .unwrap_or_else(|| panic!("a read is asked: {asked:?}"));
         assert!(q.contains(&path), "with the read question and the path: {q:?}");
 
-        // A refused write creates nothing, and says it was denied.
-        let other = dir.join("refused.txt").to_string_lossy().to_string();
+        // A refused write leaves the file alone, and says it was denied. Seeded,
+        // because a refused *create* is no longer refusable — creating a name
+        // nothing holds is deliberately silent
+        // (`creating_a_new_name_is_not_a_question`). Overwriting something that
+        // is there is still a question, and refusing it must leave the old
+        // contents exactly as they were.
+        let other_path = dir.join("refused.txt");
+        std::fs::write(&other_path, "untouched\n").expect("seed the refused target");
+        let other = other_path.to_string_lossy().to_string();
         let (v, asked) = run_policy_bash(
             &lua,
             &format!("echo nope > {other}"),
@@ -8572,7 +10012,11 @@ agent.mcps["user-tools"] = conn
             v["error"].as_str().unwrap_or("").contains("denied by user"),
             "and carries the reason: {v}"
         );
-        assert!(!std::path::Path::new(&other).exists(), "a refused write wrote nothing");
+        assert_eq!(
+            std::fs::read_to_string(&other_path).unwrap_or_default(),
+            "untouched\n",
+            "a refused overwrite left the file exactly as it was: {v}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8644,11 +10088,1148 @@ agent.mcps["user-tools"] = conn
         assert!(asked[0].contains("want to access"), "{:?}", asked[0]);
     }
 
-    /// The mask is the whole policy: these four syscalls are the ones the shipped
-    /// policy decides, and nothing else. A policy that named fewer would silently
-    /// let a connect through, so the set is pinned exactly.
+    /// The shipped policy's mask, spelled out. A policy that named fewer would
+    /// silently let a connect — or an `rm`, or a `chmod` — through, so the set is
+    /// pinned exactly; and it is a list rather than a count, so that adding a
+    /// gate is a visible edit here and not a silent one.
+    const MASK: &str = "bind,chmod,connect,fchmodat,lremovexattr,lsetxattr,openat,removexattr,renameat,renameat2,sendto,setxattr,unlinkat";
+
+    /// The mask is the whole policy: these thirteen syscalls are the ones the
+    /// shipped policy decides, and nothing else. A policy that named fewer would silently
+    /// `unlinkat` is gated on **write** trust, so `rm` asks — and a path trusted
+    /// only for reading is not enough to delete it. The contents are never read
+    /// to answer, so the question is about the name and nothing leaks about what
+    /// Creating a name nothing holds is **not** a question. Nothing is there to
+    /// disturb, and a prompt per created file is how a user learns to stop
+    /// reading prompts and start pressing `a`.
+    ///
+    /// The path is then write-trusted, so the edits that follow a create are one
+    /// decision rather than one per write. That is the "trust it for writing"
+    /// half, and this asserts both: the create is silent, *and* the write that
+    /// follows it is. The answer is set to deny throughout, so a silent case is
+    /// The system tree is trusted at startup **for reading only**, which is what
+    /// makes it safe: a cold command stops asking about libc, the dynamic linker
+    /// and the locale files, and every write under there still asks.
+    ///
+    /// The second half is the one that matters and the one a careless grant would
+    /// lose, so it is asserted rather than assumed. `/usr` and `/lib` are read
+    /// silently; writing *into* them is a question, and so is creating a name
+    /// there — the "a create needs no ask" rule is about names nothing holds,
+    /// The `/dev` entries that carry nothing are granted: read for the lot, and
+    /// write for `/dev/null` alone, because `> /dev/null` is the commonest
+    /// redirect there is and asking about it every time is noise.
+    ///
+    /// The second half is the one that keeps "safe" honest. "Safe `/dev`" is not
+    /// a self-defining set, and the entries that are *not* granted are named
+    /// here so the boundary is a decision rather than an accident: your terminal,
+    /// The strings in a tool result field, whether it arrived as a JSON array or
+    /// as `{}`.
+    ///
+    /// An empty Lua table is ambiguous and the encoder emits `{}` for it, so a
+    /// list that came back empty is an object with no keys rather than an array
+    /// with no elements. Asserting on `as_array()` alone would read that as a
+    /// missing field, which is how the first run of this test failed on a tool
+    /// that had worked.
+    fn entries(v: &serde_json::Value) -> Vec<String> {
+        if let Some(a) = v.as_array() {
+            return a
+                .iter()
+                .map(|x| x.as_str().unwrap_or_default().to_string())
+                .collect();
+        }
+        match v.as_object() {
+            Some(o) => o.keys().cloned().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `hand_to_user` gives write-trust back, so the files a command created stop
+    /// being writable without a question.
+    ///
+    /// The round trip is the point: a create records write-trust on its own (see
+    /// `creating_a_new_name_is_not_a_question`), so without this the agent's own
+    /// output is the one thing it can keep rewriting in silence forever, and
+    /// nothing else in the system revokes a grant the agent made to itself.
     #[test]
-    fn the_default_policy_traps_exactly_four_syscalls() {
+    fn hand_to_user_takes_write_trust_back_so_later_writes_ask_again() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+        let dir = std::env::temp_dir().join(format!("agent-hand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("mine.txt");
+        let path_s = path.to_string_lossy().to_string();
+
+        // The create is silent and records write-trust.
+        let (v, asked) =
+            run_policy_bash(&lua, &format!("echo mine > {path_s}"), AskAnswer::Deny(None));
+        assert_eq!(v["ok"], true, "the create ran: {v}");
+        assert!(
+            !asked.iter().any(|q| q.contains("want to write")),
+            "and asked nothing: {asked:?}"
+        );
+        // ...which is why a second write is also silent.
+        let (_, asked) =
+            run_policy_bash(&lua, &format!("echo again > {path_s}"), AskAnswer::Deny(None));
+        assert!(
+            !asked.iter().any(|q| q.contains("want to write")),
+            "the create trusted the name: {asked:?}"
+        );
+
+        // Hand it over, through the tool so the advertised shape is what gets
+        // exercised — and on **this** VM, which is the whole mechanism. The trust
+        // lives in the config VM's ask tables, and the event loop runs every tool
+        // on that one VM; the `call_tool_asking` helper builds a fresh VM per
+        // call, so reaching for it here would have tested a tool looking at an
+        // empty table and quietly reporting "not trusted" for everything.
+        let handover = |args: &str| -> serde_json::Value {
+            let (body, _) = invoke_tool_asking(&lua, "fs.hand_to_user", args, None)
+                .expect("invoke")
+                .expect("the shipped config registers fs.hand_to_user");
+            serde_json::from_str(&body).expect("tool json")
+        };
+        let r = handover(&serde_json::json!({ "paths": [&path_s] }).to_string());
+        assert_eq!(r["ok"], true, "the handover ran: {r}");
+        assert_eq!(
+            entries(&r["result"]["handed_over"]),
+            vec![path_s.clone()],
+            "and it names what it gave up: {r}"
+        );
+        assert!(
+            entries(&r["result"]["not_write_trusted"]).is_empty(),
+            "with nothing left over: {r}"
+        );
+
+        // Now the third write asks, and a refusal stops it. This is the whole
+        // point of the tool: the file is the user's to look after now.
+        let (v, asked) =
+            run_policy_bash(&lua, &format!("echo nope > {path_s}"), AskAnswer::Deny(None));
+        assert_eq!(v["ok"], false, "a refused write is not ok: {v}");
+        assert!(
+            asked.iter().any(|q| q.contains("want to write") && q.contains(&path_s)),
+            "the write asks again: {asked:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_default(),
+            "again\n",
+            "and the refusal left the file alone"
+        );
+
+        // Handing over something the agent never held is not an error, and says
+        // so — a confused call has to be visible rather than quietly do nothing.
+        // The already-handed-over path is in here too, and being reported back as
+        // un-held is the honest answer: there is nothing left of it to give.
+        let r = handover(
+            &serde_json::json!({ "paths": ["/no/such/path", &path_s] }).to_string(),
+        );
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(
+            entries(&r["result"]["handed_over"]).is_empty(),
+            "nothing was given up a second time: {r}"
+        );
+        let mut missed = entries(&r["result"]["not_write_trusted"]);
+        missed.sort();
+        let mut want = vec!["/no/such/path".to_string(), path_s.clone()];
+        want.sort();
+        assert_eq!(missed, want, "both are named as un-held: {r}");
+
+        // Reading stays silent: only the write half was given up.
+        let (v, asked) = run_policy_bash(&lua, &format!("cat {path_s}"), AskAnswer::Deny(None));
+        assert_eq!(v["ok"], true, "the read ran: {v}");
+        assert!(
+            !asked.iter().any(|q| q.contains(&path_s)),
+            "and a read of a handed-over file is still silent: {asked:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The advertised shape: a `paths` array, and a single `path` accepted under
+    /// the same name every other fs tool takes, because a model reaching for
+    /// The pair that needed a blocklist: trust the working directory, then take
+    /// one file back out of it.
+    ///
+    /// A directory grant covers its whole subtree, so there is no entry for
+    /// `.env` to drop — `forget` removed nothing, reported success, and left the
+    /// file exactly as trusted as before. That is the shape a config reaches for
+    /// when it wants the repository to be quiet but not its secrets, so it is
+    /// pinned here against the real working directory rather than a fixture.
+    #[test]
+    fn a_trusted_working_directory_can_have_a_file_taken_back_out_of_it() {
+        let lua = new_vm_with_sink(None).expect("vm");
+        let cwd = std::env::var("PWD").expect("PWD");
+        let secret = format!("{cwd}/.env");
+        let other = format!("{cwd}/README.md");
+
+        // The shipped config trusts the cwd at startup.
+        for p in [&secret, &other] {
+            let trusted: bool = lua
+                .load(format!("return agent.ask.is_trusted({p:?})"))
+                .eval()
+                .unwrap_or_else(|e| panic!("is_trusted({p}): {e}"));
+            assert!(trusted, "{p} is trusted by the cwd grant");
+        }
+
+        // Take the one back out.
+        let forgot: bool = lua
+            .load(format!("return agent.ask.forget({secret:?})"))
+            .eval()
+            .expect("forget");
+        assert!(forgot, "and forgetting it reports it stopped being trusted");
+
+        let still: bool = lua
+            .load(format!("return agent.ask.is_trusted({secret:?})"))
+            .eval()
+            .expect("is_trusted");
+        assert!(!still, "so the file inside the trusted cwd is not trusted");
+        let sibling: bool = lua
+            .load(format!("return agent.ask.is_trusted({other:?})"))
+            .eval()
+            .expect("is_trusted");
+        assert!(sibling, "while the rest of the cwd is untouched");
+
+        // It is a preference, so trusting the same path again is how you change
+        // your mind: the block is lifted and the grant stands.
+        let retrusted: String = lua
+            .load(format!("return agent.ask.trust({secret:?})"))
+            .eval()
+            .expect("trust");
+        assert_eq!(retrusted, secret, "re-trusting it works");
+        let blocked: bool = lua
+            .load(format!("return agent.ask.is_blocked({secret:?})"))
+            .eval()
+            .expect("is_blocked");
+        assert!(!blocked, "and it lifted the block on the way");
+        let trusted_again: bool = lua
+            .load(format!("return agent.ask.is_trusted({secret:?})"))
+            .eval()
+            .expect("is_trusted");
+        assert!(trusted_again, "so the file is trusted again");
+        // ...but only exactly. A block on a *directory* is a statement about a
+        // tree, so naming something inside it is still refused.
+        lua.load("agent.ask.block('/usr')").exec().expect("block /usr");
+        let refused: bool = lua
+            .load("return not pcall(agent.ask.trust, '/usr/lib/inside-blocked.so')")
+            .eval()
+            .expect("pcall");
+        assert!(
+            refused,
+            "a path inside a blocked directory is still refused: only an exact \
+             block is a preference"
+        );
+        lua.load("agent.ask.unblock('/usr')").exec().expect("unblock /usr");
+
+        // Back to blocked, for the ask assertions below: the re-trust lifted it,
+        // and a trusted path answers itself rather than asking.
+        lua.load(format!("agent.ask.block({secret:?})"))
+            .exec()
+            .expect("re-block");
+
+        // The exclusion reaches the ask path, which is the part that matters: a
+        // read of the file is a question again. Asked of `ask_trust_read` on a
+        // coroutine — the helper the policy itself calls — because a real `cat`
+        // would mean creating a file inside the repository to read back, and
+        // because a file that does not exist never reaches the question at all.
+        let asked: bool = lua
+            .load(format!(
+                r#"
+            local co = coroutine.create(function()
+              return agent.ask.ask_trust_read({secret:?}, "may I read it?")
+            end)
+            local ok, value = coroutine.resume(co)
+            assert(ok, "the helper ran: " .. tostring(value))
+            return coroutine.status(co) == "suspended"
+        "#
+            ))
+            .eval()
+            .expect("ask");
+        assert!(asked, "reading the excluded file asks again rather than answering itself");
+
+        // And a sibling still answers itself, so the exclusion is narrow.
+        let silent: bool = lua
+            .load(format!(
+                r#"
+            local co = coroutine.create(function()
+              return agent.ask.ask_trust_read({other:?}, "may I read it?")
+            end)
+            local ok, value = coroutine.resume(co)
+            assert(ok, "the helper ran: " .. tostring(value))
+            return coroutine.status(co) == "dead"
+        "#
+            ))
+            .eval()
+            .expect("ask");
+        assert!(silent, "while a file next to it still answers itself");
+
+        // Unblocking puts the cwd grant back — it was never revoked, only stood
+        // in front of.
+        let lifted: bool = lua
+            .load(format!("return agent.ask.unblock({secret:?})"))
+            .eval()
+            .expect("unblock");
+        assert!(lifted, "unblocking reports it lifted the block");
+        let back: bool = lua
+            .load(format!("return agent.ask.is_trusted({secret:?})"))
+            .eval()
+            .expect("is_trusted");
+        assert!(back, "and the cwd grant applies to it again");
+    }
+
+
+    /// `path` should not be met with an error it has to reason about.
+    #[test]
+    fn hand_to_user_takes_both_a_paths_array_and_a_single_path() {
+        let dir = std::env::temp_dir().join(format!("agent-hand2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "a\n").expect("seed a");
+        std::fs::write(&b, "b\n").expect("seed b");
+
+        // Neither path was ever granted, so both come back as "not held" — which
+        // is what makes this a test of the argument handling and nothing else.
+        let lua = shipped_vm();
+        let handover = |args: &str| -> serde_json::Value {
+            let (body, _) = invoke_tool_asking(&lua, "fs.hand_to_user", args, None)
+                .expect("invoke")
+                .expect("the shipped config registers fs.hand_to_user");
+            serde_json::from_str(&body).expect("tool json")
+        };
+        let one = handover(&serde_json::json!({ "path": a.to_string_lossy() }).to_string());
+        assert_eq!(one["ok"], true, "a single path is accepted: {one}");
+
+        let many = handover(
+            &serde_json::json!({
+                "paths": [a.to_string_lossy(), b.to_string_lossy()],
+            })
+            .to_string(),
+        );
+        assert_eq!(many["ok"], true, "an array is accepted: {many}");
+        assert_eq!(
+            entries(&many["result"]["not_write_trusted"]).len(),
+            2,
+            "and both are accounted for: {many}"
+        );
+
+        // Nothing at all is refused, with a message that says what to give.
+        let none = handover(&serde_json::json!({}).to_string());
+        assert_eq!(none["ok"], false, "an empty call is refused: {none}");
+        assert!(
+            none["error"].as_str().unwrap_or("").contains("paths"),
+            "and the error names the argument: {none}"
+        );
+        let wrong = handover(&serde_json::json!({ "paths": "not an array" }).to_string());
+        assert_eq!(wrong["ok"], false, "a non-array is refused: {wrong}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// the console, a world-writable tmpfs, and the disks all stay questions.
+    #[test]
+    fn the_empty_devices_are_granted_and_the_rest_of_dev_is_not() {
+        let lua = new_vm_with_sink(None).expect("vm");
+        prime_the_sandbox(&lua);
+
+        // Readable without a question: no data, no device, nothing to keep.
+        for p in ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/full"] {
+            let trusted: bool = lua
+                .load(format!("return agent.ask.is_trusted({p:?})"))
+                .eval()
+                .unwrap_or_else(|e| panic!("is_trusted({p}): {e}"));
+            assert!(trusted, "{p} is readable without a question");
+        }
+        // ...and read-only, except the one that is meant to be written.
+        for p in ["/dev/zero", "/dev/random", "/dev/urandom", "/dev/full"] {
+            let writable: bool = lua
+                .load(format!("return agent.ask.is_write_trusted({p:?})"))
+                .eval()
+                .unwrap_or_else(|e| panic!("is_write_trusted({p}): {e}"));
+            assert!(!writable, "{p} is granted to be looked at, not written");
+        }
+        let null_writable: bool = lua
+            .load("return agent.ask.is_write_trusted('/dev/null')")
+            .eval()
+            .expect("is_write_trusted");
+        assert!(null_writable, "/dev/null is meant to be written to");
+
+        // The boundary. Each of these is a question, and naming them is the
+        // point: a grant for "the safe devices" that swept up /dev would be a
+        // grant for the disks.
+        for p in ["/dev/tty", "/dev/console", "/dev/shm", "/dev/pts/0", "/dev/ptmx", "/dev/sda"] {
+            let trusted: bool = lua
+                .load(format!("return agent.ask.is_trusted({p:?})"))
+                .eval()
+                .unwrap_or_else(|e| panic!("is_trusted({p}): {e}"));
+            assert!(!trusted, "{p} is not granted: it is not one of the empty ones");
+        }
+
+        // And the effect, on a real run: a redirect into /dev/null is silent,
+        // while a write to a device that was not granted still asks.
+        let (v, asked) = run_policy_bash(
+            &lua,
+            "echo hello > /dev/null",
+            AskAnswer::Deny(None),
+        );
+        assert_eq!(v["ok"], true, "the redirect ran: {v}");
+        assert_eq!(v["result"]["denied"], 0, "and nothing was refused: {v}");
+        assert!(
+            !asked.iter().any(|q| q.contains("/dev/null")),
+            "writing to /dev/null asks nothing: {asked:?}"
+        );
+
+        let (v, asked) = run_policy_bash(
+            &lua,
+            "echo hello > /dev/full",
+            AskAnswer::Deny(None),
+        );
+        assert!(
+            asked.iter().any(|q| q.contains("/dev/full")),
+            "a device that was only granted for reading still asks to write: {asked:?} {v}"
+        );
+    }
+
+
+    /// and it does not get to skip a write inside a granted tree.
+    #[test]
+    fn the_system_tree_is_trusted_to_read_and_still_asked_to_write() {
+        let lua = new_vm_with_sink(None).expect("vm");
+        // The *grants* are asserted before anything is run, on purpose.
+        // `prime_the_sandbox` below drives real programs with `AllowAndTrust`,
+        // and every path they touch is recorded as trusted — including
+        // `/proc/filesystems`, which they read. Asserting the table after that
+        // would have this test pass on its own warm-up rather than on the
+        // config, and it did: it reported a grant the shipped config never made.
+        // A cold run is the only thing that can answer this question.
+        let _ = &lua;
+
+        // Trusted to look, at both the tree and a file inside it.
+        for p in ["/usr", "/lib", "/usr/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6"] {
+            let trusted: bool = lua
+                .load(format!("return agent.ask.is_trusted({p:?})"))
+                .eval()
+                .unwrap_or_else(|e| panic!("is_trusted({p}): {e}"));
+            assert!(trusted, "{p} is readable without a question");
+        }
+        // …and trusted *only* to look. The write table is the whole difference
+        // between "you may read the system tree" and "you may install into it",
+        // and this is where a read-only grant that had leaked into the general
+        // table would show up.
+        for p in ["/usr", "/lib", "/etc/ld.so.cache"] {
+            let writable: bool = lua
+                .load(format!("return agent.ask.is_write_trusted({p:?})"))
+                .eval()
+                .unwrap_or_else(|e| panic!("is_write_trusted({p}): {e}"));
+            assert!(!writable, "{p} is not write-trusted: it was granted to be read");
+        }
+        // The two procfs reads the C library makes on every exec. Granted as
+        // files rather than as /proc, because a blanket grant there would be a
+        // grant for every other procfs file as well.
+        for p in ["/proc/self/maps", "/proc/filesystems"] {
+            let trusted: bool = lua
+                .load(format!("return agent.ask.is_trusted({p:?})"))
+                .eval()
+                .unwrap_or_else(|e| panic!("is_trusted({p}): {e}"));
+            assert!(trusted, "{p} is read on every exec, and is granted");
+        }
+        // ...but /proc itself is not.
+        let proc: bool = lua
+            .load("return agent.ask.is_trusted('/proc')")
+            .eval()
+            .expect("is_trusted");
+        assert!(!proc, "/proc is not granted as a tree — only those two files are");
+        // `/etc/ld.so.preload` decides what gets loaded into every process, so it
+        // is the one loader file deliberately left as a question.
+        let preload: bool = lua
+            .load("return agent.ask.is_trusted('/etc/ld.so.preload')")
+            .eval()
+            .expect("is_trusted");
+        assert!(
+            !preload,
+            "ld.so.preload is not granted: trusting it would mean trusting whatever \
+             it names, and those names are not the loader's to hold"
+        );
+        // The dynamic linker's cache is in /etc, not /usr, and is granted on its
+        // own: it is read on every exec, so without it a cold command still asks
+        // once per program it starts.
+        let cache: bool = lua
+            .load("return agent.ask.is_trusted('/etc/ld.so.cache')")
+            .eval()
+            .expect("is_trusted");
+        assert!(cache, "the loader cache is trusted");
+        // And the rest of /etc is not: this grant is one file, not a directory.
+        let shadow: bool = lua
+            .load("return agent.ask.is_trusted('/etc/shadow')")
+            .eval()
+            .expect("is_trusted");
+        assert!(!shadow, "but nothing else in /etc is — the grant is one file");
+
+        // From here on, real runs. Primed first: on this machine something on
+        // `PATH` is a rustup shim, so a cold `cat` also reads
+        // `~/.rustup/toolchains/...`, which is correctly still a question and is
+        // not what this test is about.
+        prime_the_sandbox(&lua);
+
+        // The read is genuinely silent, and it names something that is really
+        // there, so the quiet is the grant's doing rather than a missing file.
+        //
+        // A *directory* rather than `cat /etc/ld.so.cache`: the cache is granted
+        // and checked above, but it is binary, and the tool result has to encode
+        // as JSON text — so `cat`ing it fails on an invalid UTF-8 sequence. That
+        // is a pre-existing rough edge in the result encoding, not something the
+        // grant introduced, and it is not what this test is about.
+        let (v, asked) = run_policy_bash(&lua, "ls -d /usr/lib", AskAnswer::Deny(None));
+        assert_eq!(v["ok"], true, "the read ran: {v} asked={asked:?}");
+        assert_eq!(v["result"]["denied"], 0, "and nothing was refused: {v}");
+        assert!(
+            v["result"]["stdout"].as_str().unwrap_or("").contains("/usr/lib"),
+            "and it listed the directory: {v}"
+        );
+        assert!(
+            !asked.iter().any(|q| q.contains("/usr/lib")),
+            "reading inside the trusted tree asks nothing: {asked:?}"
+        );
+
+        // The write still asks — even with every answer set to deny, so a silent
+        // case would be silent because nothing was asked and not because the
+        // answer was ignored.
+        let (v, asked) = run_policy_bash(
+            &lua,
+            "echo x > /usr/share/agent-should-not-exist.txt",
+            AskAnswer::Deny(None),
+        );
+        assert_eq!(v["ok"], false, "a refused write into /usr is not ok: {v}");
+        assert!(
+            asked
+                .iter()
+                .any(|q| q.contains("want to write") && q.contains("/usr/share")),
+            "writing into the trusted tree still asks: {asked:?}"
+        );
+        assert!(
+            !std::path::Path::new("/usr/share/agent-should-not-exist.txt").exists(),
+            "and wrote nothing"
+        );
+    }
+
+
+    /// silent because nothing was asked and not because nothing was refused.
+    #[test]
+    fn creating_a_new_name_is_not_a_question() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+        let dir = std::env::temp_dir().join(format!("agent-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("brand-new.txt");
+        let path_s = path.to_string_lossy().to_string();
+
+        // Nothing under /tmp is granted, so without the rule this would ask.
+        let (v, asked) = run_policy_bash(&lua, &format!("echo hi > {path_s}"), AskAnswer::Deny(None));
+        assert_eq!(v["ok"], true, "the create ran: {v}");
+        assert_eq!(v["result"]["denied"], 0, "and nothing was refused: {v}");
+        assert!(
+            !asked.iter().any(|q| q.contains("want to write")),
+            "a create is not a question, even when every answer is deny: {asked:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_default(),
+            "hi\n",
+            "and the file is there"
+        );
+
+        // "Trust it for writing": the second write is silent too.
+        let (v, asked) =
+            run_policy_bash(&lua, &format!("echo there > {path_s}"), AskAnswer::Deny(None));
+        assert_eq!(v["ok"], true, "the rewrite ran: {v}");
+        assert!(
+            !asked.iter().any(|q| q.contains("want to write")),
+            "and it did not ask: the create trusted the name: {asked:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_default(),
+            "there\n",
+            "the second write landed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An **overwrite** is still a question, and a refused one leaves the file
+    /// exactly as it was.
+    ///
+    /// This is the half that could go wrong silently: the new rule turns on
+    /// whether the name is taken, so a permissive mistake in the existence test
+    /// would show up here and nowhere else.
+    #[test]
+    fn an_overwrite_is_still_a_question() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+        let dir = std::env::temp_dir().join(format!("agent-over-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("existing.txt");
+        std::fs::write(&path, "original\n").expect("seed");
+        let path_s = path.to_string_lossy().to_string();
+
+        let (v, asked) =
+            run_policy_bash(&lua, &format!("echo nope > {path_s}"), AskAnswer::Deny(None));
+        assert_eq!(v["ok"], false, "a refused overwrite is not ok: {v}");
+        assert!(
+            asked.iter().any(|q| q.contains("want to write") && q.contains(&path_s)),
+            "an overwrite asks, naming the file: {asked:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_default(),
+            "original\n",
+            "and the refusal left the old contents alone"
+        );
+
+        // Deliberately *not* asserted: a name below something that is not a
+        // directory reads as "not taken" (ENOTDIR), so the create is silent. That
+        // is safe rather than lax — the open cannot succeed either way, and the
+        // sandbox is a bare fork, so the command has the user's own permissions.
+        // An earlier version of this test asserted the opposite and was wrong.
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The existence test has to see a file the process **cannot read**, because
+    /// that is the case a naive one misses.
+    ///
+    /// `io.open` follows the name and fails on anything not readable, so a locked
+    /// file — `/etc/shadow` is the real one — reads as absent, and absent is the
+    /// answer that skips the ask. `os.rename(p, p)` is a documented no-op that
+    /// succeeds exactly when the name is taken, whatever its mode. This test is
+    /// what tells the two implementations apart.
+    #[test]
+    fn a_file_the_process_cannot_read_still_counts_as_taken() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+        let dir = std::env::temp_dir().join(format!("agent-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("locked.txt");
+        std::fs::write(&path, "secret\n").expect("seed");
+
+        // mode 000: unreadable *and* unwritable by us, and plainly present.
+        let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o000);
+        }
+        std::fs::set_permissions(&path, perms).expect("chmod 000");
+        assert!(
+            std::fs::File::open(&path).is_err(),
+            "precondition: the file really is unreadable, or this test is vacuous"
+        );
+
+        let path_s = path.to_string_lossy().to_string();
+        // The gate runs before the kernel, so it asks even though the write would
+        // then fail with EACCES: the ask is the contract, not the write's success.
+        let (_, asked) = run_policy_bash(&lua, &format!("echo x > {path_s}"), AskAnswer::Allow);
+        assert!(
+            asked.iter().any(|q| q.contains("want to write") && q.contains(&path_s)),
+            "an unreadable existing file is an overwrite, and asks: {asked:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// `chmod` asks on **write** trust, and a refused one leaves the mode alone.
+    ///
+    /// This was a genuine hole: the mask named files and endpoints, and a
+    /// sandboxed command could still make one of your files executable, or take
+    /// the bits off it. `chmod +x` is how a payload becomes runnable, and it was
+    /// the one permission change the gate did not ask about.
+    #[test]
+    fn changing_a_files_mode_asks_and_a_refusal_leaves_it_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+        let dir = std::env::temp_dir().join(format!("agent-chmod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("payload");
+        std::fs::write(&path, "#!/bin/sh\necho hi\n").expect("seed");
+        let path_s = path.to_string_lossy().to_string();
+        let mode_of = |p: &std::path::Path| {
+            std::fs::metadata(p).expect("stat").permissions().mode() & 0o777
+        };
+        let before = mode_of(&path);
+        // Not the exact bits — the temp dir's umask decides those — but the one
+        // thing that matters: no execute bit yet.
+        assert_eq!(before & 0o111, 0, "precondition: not executable yet");
+
+        // Refused: asked, and the mode is untouched.
+        let (v, asked) =
+            run_policy_bash(&lua, &format!("chmod 0700 {path_s}"), AskAnswer::Deny(None));
+        assert_eq!(v["ok"], false, "a refused chmod is not ok: {v}");
+        assert!(
+            asked
+                .iter()
+                .any(|q| q.contains("change the mode") && q.contains(&path_s)),
+            "it asks, naming the file and the change: {asked:?}"
+        );
+        assert_eq!(mode_of(&path), before, "and the mode did not change");
+
+        // Allowed: it goes through, and only then.
+        let (v, asked) =
+            run_policy_bash(&lua, &format!("chmod 0700 {path_s}"), AskAnswer::Allow);
+        assert_eq!(v["ok"], true, "an allowed chmod runs: {v}");
+        assert!(
+            asked.iter().any(|q| q.contains("change the mode")),
+            "and it still asked: {asked:?}"
+        );
+        assert_eq!(mode_of(&path), 0o700, "so the mode changed");
+
+        // A *different* mode this time, because `chmod` to the mode a file
+        // already has makes no syscall at all — so there would be nothing to
+        // gate, and the run would pass for the wrong reason.
+        let (v, asked) =
+            run_policy_bash(&lua, &format!("chmod 0644 {path_s}"), AskAnswer::Deny(None));
+        assert_eq!(v["ok"], false, "and refused again: {v}");
+        assert!(
+            asked.iter().any(|q| q.contains("change the mode")),
+            "so it asks each time the mode really changes: {asked:?}"
+        );
+        assert_eq!(mode_of(&path), 0o700, "and the mode is still untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shell run whose handler answers `deny` to questions mentioning
+    /// `marker` and `allow` to everything else.
+    ///
+    /// Needed because a cold `python3` reads a handful of unrelated files on the
+    /// way to running anything, and a handler that denies everything kills the run
+    /// before it reaches the call under test. Denying one question by its text is
+    /// the only way to say "this is the gate" without also enumerating
+    /// everything the interpreter happens to want.
+    fn run_policy_bash_except(
+        lua: &mlua::Lua,
+        cmdline: &str,
+        marker: &str,
+    ) -> (serde_json::Value, Vec<String>) {
+        let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let seen = asked.clone();
+        let mark = marker.to_string();
+        let handler: AskHandler = Rc::new(move |text: &str, _always: bool| {
+            seen.borrow_mut().push(text.to_string());
+            if text.contains(&mark) {
+                AskAnswer::Deny(Some("refused by the test".into()))
+            } else {
+                AskAnswer::Allow
+            }
+        });
+        let args = serde_json::json!({ "cmdline": cmdline }).to_string();
+        let Some((body, _)) =
+            invoke_tool_asking(lua, "bash.bash", &args, Some(handler)).expect("invoke")
+        else {
+            panic!("the permissive mode registers bash")
+        };
+        let v: serde_json::Value = serde_json::from_str(&body).expect("tool json");
+        (v, asked.borrow().clone())
+    }
+
+    /// Setting an extended attribute asks, and the question names the attribute —/ gated**, so a command holding an open descriptor can change that file's
+    /// mode without a question — and `cp --preserve=mode` is exactly that.
+    ///
+    /// It is not gated because it names no path, and a question needs one: there
+    /// is nothing to put in `ask_trust_write`, and a nameless question would be
+    /// unanswerable in the only way that matters. The descriptor is not free,
+    /// though — opening it cost read or write trust, so what this actually means
+    /// is that *read*-trust on a path implies being able to make it executable.
+    /// Closing that needs the engine to resolve an fd to a path through
+    /// `/proc/<pid>/fd`, which is real work and a decision rather than a policy
+    /// key. Pinned here so the gap is visible.
+    #[test]
+    fn fchmod_is_not_gated_because_it_names_no_path() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+        let dir = std::env::temp_dir().join(format!("agent-fchmod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::write(&src, "x\n").expect("seed");
+
+        let (v, asked) = run_policy_bash(
+            &lua,
+            &format!(
+                "cp --preserve=mode {0} {1}",
+                src.to_string_lossy(),
+                dst.to_string_lossy()
+            ),
+            // Allow, not deny: the question here is whether a *mode* question
+            // appears, and denying everything would just stop the copy early.
+            AskAnswer::Allow,
+        );
+        assert_eq!(v["ok"], true, "the copy ran: {v}");
+        assert!(
+            !asked.iter().any(|q| q.contains("change the mode")),
+            "and asked nothing about the mode: the descriptor path is ungated, \
+             which is the gap this test names"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Setting an extended attribute asks, and the question names the attribute —
+    /// because `security.capability` is `setcap`, and that is a different thing to
+    /// be told about than an app writing its own `user.*` metadata.
+    #[test]
+    fn setting_an_extended_attribute_asks_and_names_which_one() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+        // `python3` here resolves through the rustup toolchain, so its own
+        // libraries ask unless they are warmed first — and a Deny to those would
+        // kill the run before it ever reached the attribute, which is not what
+        // this test is about.
+        let (warm, _) = run_policy_bash(&lua, "python3 -c pass", AskAnswer::AllowAndTrust);
+        assert_eq!(warm["ok"], true, "warmed python3: {warm}");
+        let dir = std::env::temp_dir().join(format!("agent-xattr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("tagged");
+        std::fs::write(&path, "x\n").expect("seed");
+        let path_s = path.to_string_lossy().to_string();
+
+        // Driven through python's `os.setxattr`, which is the same
+        // `setxattr(2)` call `setcap` makes for `security.capability`. In a
+        // script file rather than `python3 -c`, because a path inside a
+        // double-quoted `-c` string needs its own layer of quoting and gets it
+        // wrong in a way that reads as a policy failure.
+        let script = dir.join("setx.py");
+        std::fs::write(
+            &script,
+            "import os, sys\nos.setxattr(sys.argv[1], 'user.agent-test', b'v')\n",
+        )
+        .expect("write the helper");
+        let script_s = script.to_string_lossy().to_string();
+        let read_script = dir.join("getx.py");
+        std::fs::write(
+            &read_script,
+            "import os, sys\nsys.stdout.write(os.getxattr(sys.argv[1], 'user.agent-test').decode())\n",
+        )
+        .expect("write the reader");
+        // Only the attribute question is denied, so the interpreter's own
+        // startup reads do not get in the way.
+        let (v, asked) = run_policy_bash_except(
+            &lua,
+            &format!("python3 {script_s} {path_s}"),
+            "user.agent-test",
+        );
+        assert_eq!(v["ok"], false, "a refused setxattr is not ok: {v}");
+        assert!(
+            asked
+                .iter()
+                .any(|q| q.contains("user.agent-test") && q.contains(&path_s)),
+            "the question names the attribute and the file: {asked:?}"
+        );
+
+        // Allowed, the attribute lands — so the gate was the only thing in the
+        // way, and it is a gate rather than a block.
+        let (v, asked) = run_policy_bash_except(
+            &lua,
+            &format!("python3 {script_s} {path_s}"),
+            "\u{0}never-matches",
+        );
+        assert_eq!(v["ok"], true, "an allowed setxattr runs: {v}");
+        assert!(
+            asked.iter().any(|q| q.contains("user.agent-test")),
+            "and it asked: {asked:?}"
+        );
+        // Read it back, rather than trusting that a silent run did the work. The
+        // read is ungated (only the *setting* of an attribute asks), so this is
+        // the same interpreter again and asks nothing.
+        let (read, _) = run_policy_bash_except(
+            &lua,
+            &format!("python3 {} {path_s}", read_script.to_string_lossy()),
+            "\u{0}never-matches",
+        );
+        assert_eq!(read["ok"], true, "the read-back ran: {read}");
+        assert_eq!(
+            read["result"]["stdout"], "v",
+            "and the attribute really is set: {read}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// was in the file.
+    #[test]
+    fn deleting_a_file_asks_on_write_trust_and_rm_goes_through_it() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+        let dir = std::env::temp_dir().join(format!("agent-rm-{0}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("doomed.txt");
+        std::fs::write(&path, "about to go\n").expect("seed the file to delete");
+        let path = path.to_string_lossy().to_string();
+
+        // Read-trust is not enough: the gate is the write table, and this is the
+        // whole reason unlinkat is not on `ask_trust_read`.
+        let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let seen = asked.clone();
+        let handler: AskHandler = Rc::new(move |text: &str, _always: bool| {
+            seen.borrow_mut().push(text.to_string());
+            AskAnswer::Deny(None)
+        });
+        let () = lua
+            .load(format!("return agent.ask.trust({:?})", path))
+            .eval()
+            .expect("trust the path for *reading* only");
+
+        let args = serde_json::json!({ "cmdline": format!("rm -f -- {path}") }).to_string();
+        let (body, _) = invoke_tool_asking(&lua, "bash.bash", &args, Some(handler.clone()))
+            .expect("invoke")
+            .expect("the shipped config registers bash.bash");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("tool json");
+        let questions = asked.borrow().clone();
+        // A refused syscall is `ok = false` with `denied`, not a crash: the gate
+        // did its job and the run reports it.
+        assert_eq!(v["ok"], false, "the delete was refused: {v}");
+        assert!(
+            v["result"]["denied"].as_u64().unwrap_or(0) >= 1,
+            "and counted as denied: {v}"
+        );
+        assert!(
+            questions.iter().any(|q| q.contains("want to delete") && q.contains(&path)),
+            "rm asked to delete the file: {questions:?}"
+        );
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "so read-trust did not delete it: the gate refused"
+        );
+
+        // Write-trust does delete it, and says nothing more about it.
+        let asked2: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let seen2 = asked2.clone();
+        let handler2: AskHandler = Rc::new(move |text: &str, _always: bool| {
+            seen2.borrow_mut().push(text.to_string());
+            AskAnswer::Allow
+        });
+        let args = serde_json::json!({ "cmdline": format!("rm -f -- {path}") }).to_string();
+        let (body, _) = invoke_tool_asking(&lua, "bash.bash", &args, Some(handler2))
+            .expect("invoke")
+            .expect("registered");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("tool json");
+        assert_eq!(v["ok"], true, "the run completed: {v}");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "write-trust let the delete through: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `renameat` asks twice when the target already exists — once for the source
+    /// and once for the name it would destroy — and once when it does not, since
+    /// creating a name is already covered by the source's permission.
+    ///
+    /// The two answers differ, which is the point: a runner that pressed one key
+    /// for every question could not tell "allowed the move, refused the
+    /// overwrite" from "allowed both".
+    #[test]
+    fn a_move_asks_twice_only_when_the_target_exists() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+        let dir = std::env::temp_dir().join(format!("agent-mv-{0}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let src = dir.join("from.txt");
+        let dst = dir.join("to.txt");
+        let src_s = src.to_string_lossy().to_string();
+        let dst_s = dst.to_string_lossy().to_string();
+        std::fs::write(&src, "source\n").expect("seed source");
+        // Warm `mv`'s own shared libraries, so the questions left are the move's
+        // and not the loader's. Granting write-trust on the scratch directory
+        // would be the obvious way to quiet those — and it would silence the
+        // questions under test too, which is how the first run of this asserted
+        // "one question" and got six library reads and no move at all.
+        let (warm, _) = run_policy_bash(&lua, "/bin/mv --version", AskAnswer::AllowAndTrust);
+        assert_eq!(warm["ok"], true, "warmed mv: {warm}");
+
+        // A fresh name: one question, about the source.
+        std::fs::write(&src, "source\n").expect("seed source");
+        let (v, asked) =
+            run_policy_bash(&lua, &format!("mv -f -- {src_s} {dst_s}"), AskAnswer::Allow);
+        assert_eq!(v["ok"], true, "the move ran: {v}");
+        assert!(
+            !std::path::Path::new(&src_s).exists() && std::path::Path::new(&dst_s).exists(),
+            "and it moved: {v}"
+        );
+        assert_eq!(
+            asked.len(),
+            1,
+            "creating a name is one question, the source's: {asked:?}"
+        );
+        assert!(
+            asked[0].contains("want to move") && asked[0].contains(&src_s),
+            "about the move: {asked:?}"
+        );
+
+        // An occupied name: two, and refusing the second must stop the move while
+        // leaving both files as they were.
+        std::fs::write(&src, "new source\n").expect("seed source again");
+        std::fs::write(&dst, "existing target\n").expect("seed target");
+        let asked3: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let seen3 = asked3.clone();
+        let handler3: AskHandler = Rc::new(move |text: &str, _always: bool| {
+            seen3.borrow_mut().push(text.to_string());
+            // Allow the move, refuse the overwrite.
+            if text.contains("want to overwrite") {
+                AskAnswer::Deny(Some("no".into()))
+            } else {
+                AskAnswer::Allow
+            }
+        });
+        let args =
+            serde_json::json!({ "cmdline": format!("mv -f -- {src_s} {dst_s}") }).to_string();
+        let (body, _) = invoke_tool_asking(&lua, "bash.bash", &args, Some(handler3))
+            .expect("invoke")
+            .expect("registered");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("tool json");
+        let questions = asked3.borrow().clone();
+        assert_eq!(questions.len(), 2, "an occupied name asks twice: {questions:?}");
+        assert!(
+            questions[0].contains("want to move") && questions[0].contains(&src_s),
+            "the source first: {questions:?}"
+        );
+        assert!(
+            questions[1].contains("want to overwrite") && questions[1].contains(&dst_s),
+            "then the name it would destroy: {questions:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&src).unwrap_or_default(),
+            "new source\n",
+            "the refused overwrite left the source alone: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dst).unwrap_or_default(),
+            "existing target\n",
+            "and left the target alone: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every pathname a syscall names, checked against the kernel's own
+    /// signatures — the tables that decide which `args` slots get dereferenced
+    /// as C strings, and which of them resolve against a dirfd.
+    ///
+    /// There was no test here, which is how `renameat` kept `&[1, 2]` for years:
+    /// slot 2 is *newdirfd*, so the second path was read out of a small integer
+    /// instead of a pointer and came back nil. Nothing had ever asked a question
+    /// about a rename's target, so nothing noticed. The signatures are spelled
+    /// out here rather than derived, because a typo in a table is invisible until
+    /// something reads the slot it mistyped.
+    #[test]
+    fn the_pathname_and_dirfd_tables_match_the_kernel_signatures() {
+        // (syscall, its 0-based string slots) straight from the man pages.
+        let signatures: &[(&str, &[usize])] = &[
+            ("open", &[0]),
+            ("openat", &[1]),
+            ("openat2", &[1]),
+            ("unlinkat", &[1]),
+            ("mkdirat", &[1]),
+            ("renameat", &[1, 3]),
+            ("renameat2", &[1, 3]),
+            ("linkat", &[1, 3]),
+            ("symlinkat", &[0, 2]),
+            ("execveat", &[1]),
+            ("newfstatat", &[1]),
+            ("readlinkat", &[1]),
+            ("fchmodat", &[1]),
+            ("fchownat", &[1]),
+            ("utimensat", &[1]),
+            ("name_to_handle_at", &[1]),
+            ("chmod", &[0]),
+            ("fchmodat", &[1]),
+            ("setxattr", &[0, 1]),
+            ("lsetxattr", &[0, 1]),
+            ("removexattr", &[0, 1]),
+            ("lremovexattr", &[0, 1]),
+        ];
+        for (name, want) in signatures {
+            assert_eq!(
+                cstring_positions(name),
+                Some(*want),
+                "{name}: which args hold a C string"
+            );
+        }
+
+        // And the dirfd each of those paths resolves against. A two-path call
+        // has two dirfds, and resolving the target against the source's
+        // directory is a wrong answer rather than a missing one.
+        let cases: &[(&str, usize, Option<usize>)] = &[
+            ("openat", 1, Some(0)),
+            ("chmod", 0, None),
+            ("fchmodat", 1, Some(0)),
+            ("unlinkat", 1, Some(0)),
+            ("renameat", 1, Some(0)),
+            ("renameat", 3, Some(2)),
+            ("renameat2", 1, Some(0)),
+            ("renameat2", 3, Some(2)),
+            ("linkat", 1, Some(0)),
+            ("linkat", 3, Some(2)),
+            // symlinkat's target is cwd-relative; only its linkpath is behind
+            // the fd.
+            ("symlinkat", 0, None),
+            ("symlinkat", 2, Some(1)),
+            ("open", 0, None),
+            ("unlink", 0, None),
+        ];
+        for (name, path, want) in cases {
+            assert_eq!(
+                dirfd_slot_for(name, *path),
+                *want,
+                "{name} path slot {path}: which dirfd it resolves against"
+            );
+        }
+    }
+
+    /// The dirfd decision is per *path*, so a rename's target resolves against
+    /// the cwd only when the caller said `AT_FDCWD` in the slot that governs
+    /// it — the target's own slot, not the source's.
+    #[test]
+    fn a_rename_target_resolves_against_its_own_dirfd() {
+        let cwd = libc::AT_FDCWD as u64;
+        let other_fd = 7u64;
+        // renameat(olddirfd, oldpath, newdirfd, newpath): the target is slot 3
+        // and its dirfd is slot 2.
+        // olddirfd, oldpath, newdirfd, newpath — slots 0 and 2 govern slots 1
+        // and 3 respectively.
+        let both_cwd = [cwd, 0, cwd, 0, 0, 0];
+        let new_only = [cwd, 0, other_fd, 0, 0, 0];
+        let both_fds = [other_fd, 0, other_fd, 0, 0, 0];
+
+        // Both slots say the cwd: both paths resolve.
+        assert!(cwd_resolution_ok("renameat", 1, both_cwd), "source, both AT_FDCWD");
+        assert!(cwd_resolution_ok("renameat", 3, both_cwd), "target, both AT_FDCWD");
+
+        // Only the target names a real dirfd: the source still resolves and the
+        // target must not. The old table had one slot for the whole syscall —
+        // slot 0 — so it read "AT_FDCWD" here and resolved the target against
+        // the cwd, which is a wrong answer rather than a missing one.
+        assert!(cwd_resolution_ok("renameat", 1, new_only), "source, its own slot");
+        assert!(
+            !cwd_resolution_ok("renameat", 3, new_only),
+            "target, behind a caller-held dirfd"
+        );
+
+        // Neither does: neither resolves.
+        assert!(!cwd_resolution_ok("renameat", 1, both_fds), "source, behind an fd");
+        assert!(!cwd_resolution_ok("renameat", 3, both_fds), "target, behind an fd");
+    }
+
+    /// let a connect — or a `rm` — through, so the set is pinned exactly.
+    #[test]
+    fn the_default_policy_traps_exactly_thirteen_syscalls() {
         assert_default_shell(&shipped_vm());
     }
 
@@ -8727,38 +11308,33 @@ agent.mcps["user-tools"] = conn
     /// to the default fails loudly at the point the tests start rather than as a
     /// baffling "asked nothing".
     fn assert_default_shell(lua: &mlua::Lua) {
+        // The real table, not the source: this used to grep
+        // `policy.<name> = function` out of `lua/policy.lua`, which cannot see a
+        // gate assigned from a named local — and `renameat` is exactly that,
+        // because it and `renameat2` are one callback. The grep would have
+        // reported five gates while the sandbox trapped seven.
         let gates: String = lua
             .load(
                 r#"
-        -- The policy is a local in a module that *returns* one, so it is read
-        -- off the source rather than exported: a policy that were reachable would
-        -- be ambient state, which is the convention this whole shape exists to
-        -- avoid.
-        local src = io.open("lua/policy.lua"):read("*a")
+        local policy = require("policy")
         local names = {}
-        for name in src:gmatch("policy%.(%w+)%s*=%s*function") do
-          names[#names + 1] = name
-        end
+        for name in pairs(policy) do names[#names + 1] = name end
         table.sort(names)
         return table.concat(names, ",")
     "#,
             )
             .eval()
             .expect("mask");
-        assert_eq!(
-            gates, "bind,connect,openat,sendto",
-            "the default policy's mask is the four gates"
-        );
+        assert_eq!(gates, MASK, "the default policy's mask is exactly this set");
     }
 
     /// `lua/init.lua` trusts the working directory at startup, so the mode's
     /// every-read gate is silent inside the project and asks about everything
-    /// else. That is a *full config load* (the entry script plus `agent.lua`),
-    /// which is why this is not just another `shipped_vm()` assertion.
+    /// else. That is a *full config load* (the entry script plus any user
+    /// config), which is why this is not just another `shipped_vm()` assertion.
     #[test]
     fn the_working_directory_is_trusted_at_startup() {
         let lua = new_vm_with_sink(None).expect("vm");
-        load_config_file(&lua).expect("load the shipped config");
         let cwd = std::env::var("PWD").expect("PWD");
 
         // The grant is a *directory* entry, so it covers the whole subtree — a
@@ -8781,10 +11357,13 @@ agent.mcps["user-tools"] = conn
 
         // And the effect the grant exists for: inside the cwd nothing asks, and
         // the same read outside it does.
-        let (v, asked) = run_policy_bash(&lua, &format!("cat {cwd}/agent.lua"), AskAnswer::Allow);
+        // Read a file that is really there, so the grant is what made it quiet
+        // rather than the file being absent.
+        let (v, asked) =
+            run_policy_bash(&lua, &format!("cat {cwd}/lua/init.lua"), AskAnswer::Allow);
         assert_eq!(v["ok"], true, "the read ran: {v}");
         assert!(
-            !asked_about(&asked, "agent.lua"),
+            !asked_about(&asked, "init.lua"),
             "a read inside the trusted cwd asks nothing: {asked:?}"
         );
         let outside_path = std::env::temp_dir().join("agent-cwd-trust-probe.txt");
@@ -8848,7 +11427,7 @@ agent.mcps["user-tools"] = conn
         });
         let args = serde_json::json!({ "cmdline": cmdline }).to_string();
         let Some((body, _)) =
-            invoke_tool_asking(lua, "bash", &args, Some(handler)).expect("invoke")
+            invoke_tool_asking(lua, "bash.bash", &args, Some(handler)).expect("invoke")
         else {
             panic!("the permissive mode registers bash")
         };
@@ -8877,27 +11456,27 @@ agent.mcps["user-tools"] = conn
         };
 
         // A plain yes is for that one operation: the next call asks again.
-        let (v, asked) = drive_on_vm(&lua, "write_file", &args("a.txt"), |_, _| AskAnswer::Allow);
+        let (v, asked) = drive_on_vm(&lua, "fs.write_file", &args("a.txt"), |_, _| AskAnswer::Allow);
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(asked.len(), 1, "asked: {asked:?}");
-        let (v, asked) = drive_on_vm(&lua, "write_file", &args("a.txt"), |_, _| AskAnswer::Allow);
+        let (v, asked) = drive_on_vm(&lua, "fs.write_file", &args("a.txt"), |_, _| AskAnswer::Allow);
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(asked.len(), 1, "a plain yes is not remembered: {asked:?}");
 
         // "always" *is* remembered, because the tables live on this VM now.
-        let (v, asked) = drive_on_vm(&lua, "write_file", &args("a.txt"), |_, _| {
+        let (v, asked) = drive_on_vm(&lua, "fs.write_file", &args("a.txt"), |_, _| {
             AskAnswer::AllowAndTrust
         });
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(asked.len(), 1, "asked once: {asked:?}");
         let (v, asked) =
-            drive_on_vm(&lua, "write_file", &args("a.txt"), |_, _| AskAnswer::Deny(None));
+            drive_on_vm(&lua, "fs.write_file", &args("a.txt"), |_, _| AskAnswer::Deny(None));
         assert_eq!(v["ok"], true, "the remembered path needs no answer: {v}");
         assert!(asked.is_empty(), "and asks nothing at all: {asked:?}");
 
         // A different path is a different question: trust is a path, not a
         // blanket permission.
-        let (v, asked) = drive_on_vm(&lua, "write_file", &args("b.txt"), |_, _| AskAnswer::Allow);
+        let (v, asked) = drive_on_vm(&lua, "fs.write_file", &args("b.txt"), |_, _| AskAnswer::Allow);
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(asked.len(), 1, "another path still asks: {asked:?}");
 
@@ -8916,7 +11495,7 @@ agent.mcps["user-tools"] = conn
             .eval()
             .expect("is_trusted");
         assert!(read_still, "and read-trust is untouched by a write revocation");
-        let (v, asked) = drive_on_vm(&lua, "write_file", &args("a.txt"), |_, _| AskAnswer::Allow);
+        let (v, asked) = drive_on_vm(&lua, "fs.write_file", &args("a.txt"), |_, _| AskAnswer::Allow);
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(asked.len(), 1, "a forgotten path asks again: {asked:?}");
 
@@ -8937,9 +11516,9 @@ agent.mcps["user-tools"] = conn
 
         // A read that is refused: the tool reports the denial, and the loop's
         // answer is what decided it.
-        let (mut run, step) = ToolRun::start(&lua, "read_file", &args)
+        let (mut run, step) = ToolRun::start(&lua, "fs.read", &args)
             .expect("start")
-            .expect("registered read_file");
+            .expect("registered read");
         let (text, always) = match step {
             ToolStep::Ask { text, always } => (text, always),
             other => panic!("expected a question, got {other:?}"),
@@ -8980,7 +11559,7 @@ agent.mcps["user-tools"] = conn
         )
         .exec()
         .expect("register a bare-ask tool");
-        let (mut run, step) = ToolRun::start(&lua, "askonce", "{}").expect("start").unwrap();
+        let (mut run, step) = ToolRun::start(&lua, "askonce.askonce", "{}").expect("start").unwrap();
         match step {
             ToolStep::Ask { text, always } => {
                 assert_eq!(text, "a question with no path");
@@ -9160,7 +11739,7 @@ agent.mcps["user-tools"] = conn
         };
 
         // Refused: not one byte, not one directory.
-        let (v, asked) = call_tool_asking("write_file", &args("nope\n"), AskAnswer::Deny(None));
+        let (v, asked) = call_tool_asking("fs.write_file", &args("nope\n"), AskAnswer::Deny(None));
         assert_eq!(v["ok"], false, "a refused write is not ok: {v}");
         assert_eq!(v["denied"], true, "and it says it was denied: {v}");
         assert_eq!(asked.len(), 1, "one question: {asked:?}");
@@ -9172,7 +11751,7 @@ agent.mcps["user-tools"] = conn
         assert!(!dir.exists(), "a refused write created nothing");
 
         // Allowed: the file lands verbatim, parent directories and all.
-        let (v, asked) = tool_allowed("write_file", &args("hello\nsandbox\n"));
+        let (v, asked) = tool_allowed("fs.write_file", &args("hello\nsandbox\n"));
         assert_eq!(v["ok"], true, "write failed: {v}");
         assert_eq!(v["result"]["bytes"], 14);
         assert_eq!(v["result"]["lines"], 2);
@@ -9185,7 +11764,7 @@ agent.mcps["user-tools"] = conn
 
         // Overwriting is a write too: it asks again, because a plain yes is for
         // that one operation.
-        let (v, asked) = tool_allowed("write_file", &args("x"));
+        let (v, asked) = tool_allowed("fs.write_file", &args("x"));
         assert_eq!(v["ok"], true, "overwrite failed: {v}");
         assert_eq!(v["result"]["bytes"], 1);
         assert_eq!(asked.len(), 1, "asked again: {asked:?}");
@@ -9193,7 +11772,7 @@ agent.mcps["user-tools"] = conn
 
         // Missing required argument: validation catches it before the ask, so
         // nothing is even questioned.
-        let (v, asked) = tool_allowed("write_file", r#"{"content":"hi"}"#);
+        let (v, asked) = tool_allowed("fs.write_file", r#"{"content":"hi"}"#);
         assert_eq!(v["ok"], false, "validation error: {v}");
         assert!(
             v["error"].as_str().unwrap_or("").contains("path"),
@@ -9204,11 +11783,12 @@ agent.mcps["user-tools"] = conn
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `write_file` and `list_dir` go through the sandbox like the other fs
-    /// tools, and the module is where they now live — so exercise them the way
-    /// `read_file` and `list_dir` ask before they read, and the read is a plain
-    /// `io.open` — so what comes back is the file's own bytes, with the line
-    /// numbers this module adds.
+    /// `read` covers a file and a directory, and asks before either.
+    ///
+    /// The stdlib opens a directory happily and only fails on the *read*, so
+    /// which one this is gets decided by `read(0)` returning nil — asserted
+    /// here by both branches working, because a probe that guessed wrong would
+    /// make one of them a clean error instead.
     #[test]
     fn the_read_tools_ask_and_return_the_file_directly() {
         let dir = std::env::temp_dir().join(format!("agent-fs-tools-test-{}", std::process::id()));
@@ -9220,7 +11800,7 @@ agent.mcps["user-tools"] = conn
         let args = serde_json::json!({ "path": &path }).to_string();
 
         // A refused read returns the denial, not a complaint about the file.
-        let (v, asked) = call_tool_asking("read_file", &args, AskAnswer::Deny(None));
+        let (v, asked) = call_tool_asking("fs.read", &args, AskAnswer::Deny(None));
         assert_eq!(v["ok"], false, "a refused read is not ok: {v}");
         assert_eq!(v["denied"], true, "and it says it was denied: {v}");
         assert_eq!(asked.len(), 1, "one question: {asked:?}");
@@ -9231,26 +11811,33 @@ agent.mcps["user-tools"] = conn
         );
 
         // Allowed: the bytes, numbered by this module now (no `cat -n`).
-        let (v, _asked) = tool_allowed("read_file", &args);
+        let (v, _asked) = tool_allowed("fs.read", &args);
         assert_eq!(v["ok"], true, "read failed: {v}");
         let content = v["result"]["content"].as_str().unwrap_or_default();
         assert_eq!(content, "1\talpha\n2\tbeta\n", "numbered, and nothing else: {content:?}");
 
-        // `list_dir` asks too, and shows the directory.
+        // The same tool, on a directory: the listing, and the same question.
         let dir_args =
             serde_json::json!({ "path": dir.to_string_lossy().to_string() }).to_string();
-        let (v, asked) = tool_allowed("list_dir", &dir_args);
-        assert_eq!(v["ok"], true, "list failed: {v}");
+        let (v, asked) = tool_allowed("fs.read", &dir_args);
+        assert_eq!(v["ok"], true, "listing a directory failed: {v}");
         assert!(
             v["result"]["content"].as_str().unwrap_or_default().contains("notes.txt"),
-            "the directory listing names the file: {v}"
+            "the listing names the file: {v}"
         );
         assert_eq!(asked.len(), 1, "asked once: {asked:?}");
-        assert!(asked[0].contains("Allow read"), "a listing is a read: {:?}", asked[0]);
+        assert!(
+            asked[0].contains("Allow read"),
+            "a listing is still a read: {:?}",
+            asked[0]
+        );
 
-        // A path that is not a directory is a clean error, not a crash.
-        let (v, _) = tool_allowed("list_dir", &args);
-        assert_eq!(v["ok"], false, "listing a file fails: {v}");
+        // A directory that is not there is a clean error, not a crash.
+        let missing =
+            serde_json::json!({ "path": dir.join("nope").to_string_lossy().to_string() })
+                .to_string();
+        let (v, _) = tool_allowed("fs.read", &missing);
+        assert_eq!(v["ok"], false, "reading a missing path fails cleanly: {v}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9415,7 +12002,7 @@ agent.mcps["user-tools"] = conn
         .to_string();
         // A patch is one write decision: one question, then the read the diff
         // needs and the write itself, both direct.
-        let (v, asked) = tool_allowed("apply_patch", &args);
+        let (v, asked) = tool_allowed("fs.apply_patch", &args);
         let body = v.to_string();
         assert_eq!(asked.len(), 1, "one question for the whole patch: {asked:?}");
         assert!(
@@ -9435,7 +12022,7 @@ agent.mcps["user-tools"] = conn
 
         // Applying the identical patch again is a no-op: matched by content,
         // the recomputed text equals the file, so nothing is rewritten.
-        let (v, _) = tool_allowed("apply_patch", &args);
+        let (v, _) = tool_allowed("fs.apply_patch", &args);
         let body = v.to_string();
         assert_eq!(v["ok"], true, "idempotent apply failed: {body}");
         assert_eq!(v["result"]["changed"], false, "{body}");
@@ -9452,7 +12039,7 @@ agent.mcps["user-tools"] = conn
             "patch": "@@ -1,1 +1,1 @@\n-nope\n+yes\n",
         })
         .to_string();
-        let (v, _) = tool_allowed("apply_patch", &bad);
+        let (v, _) = tool_allowed("fs.apply_patch", &bad);
         let body = v.to_string();
         assert_eq!(v["ok"], false, "bad patch errors: {body}");
         assert!(
@@ -10000,3 +12587,4 @@ agent.mcps["user-tools"] = conn
         );
     }
 }
+

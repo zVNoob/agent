@@ -91,12 +91,22 @@ pub enum PanelOp {
     },
     /// Drop all previously set regions of pane `pane`.
     ClearPaneRegions { id: u64, pane: usize },
-    /// Set (`Some`) or clear (`None`) the panel's user-permission overlay: a
-    /// compact overlay panel drawn at the bottom *inside* the boxed message
-    /// (only boxed panels render it) — the ask seam for policy questions. A
-    /// pending ask pins the viewport so the overlay is visible; clearing it
-    /// returns the panel to its plain boxed rendering when the run resumes.
-    Overlay { id: u64, text: Option<String> },
+    /// Set (`Some`) or clear (`None`) the panel's user-permission dialog: drawn
+    /// at the bottom *inside* the boxed message (only boxed panels render it),
+    /// so a question belongs to the panel that raised it rather than becoming a
+    /// panel of its own. A pending ask pins the viewport so the dialog is
+    /// visible and expands a collapsed box; clearing it returns the panel to its
+    /// plain boxed rendering when the run resumes.
+    ///
+    /// `always` is whether the question had something to remember, and it is
+    /// what decides the key prompt in the dialog's title — `[a]lways` is only
+    /// offered when the answer is one the agent can act on. Ignored when
+    /// clearing.
+    Overlay {
+        id: u64,
+        text: Option<String>,
+        always: bool,
+    },
 }
 
 /// Initialization for one pane of a [`PanelOp::Split`] panel: its caption and
@@ -600,6 +610,70 @@ mod tests {
             segs.iter()
                 .any(|s| s.start == key && s.style.fg == Some(Color::LightCyan)),
             "json key styled property/cyan inside the pane: {segs:?}"
+        );
+    }
+
+    /// A split panel with **one** pane, which is what `fs.write_file` opens: a
+    /// declared grammar needs a pane, and a single pane must still render as a
+    /// plain full-width box rather than a one-column split with a divider
+    /// beside it.
+    #[test]
+    fn a_one_pane_split_is_a_full_width_box_that_still_highlights() {
+        let Some(CachedHl { _catalog, hl }) = cached_highlighter() else {
+            eprintln!("skipping: markdown/json grammars not cached on this machine");
+            return;
+        };
+        let mut panel = TurnPanel::default();
+        panel.set_highlighter(Some(hl));
+        panel.apply_op(PanelOp::Split {
+            id: 1,
+            title: "write_file: /tmp/shown.json".into(),
+            panes: vec![PaneInit {
+                caption: "1 line, 14 bytes".into(),
+                lang: Some("json".into()),
+            }],
+        });
+        panel.apply_op(PanelOp::SetPane {
+            id: 1,
+            pane: 1,
+            text: "{\"ok\": true}".into(),
+        });
+
+        // Styled: the declared grammar ran, which is the whole claim about
+        // "highlighted" — the op carrying a language would not prove this.
+        let panes = panel.messages[0].panes.as_ref().unwrap();
+        let segs = &panes[0].segs;
+        assert!(!segs.is_empty(), "the json grammar styled the single pane");
+        let key = panes[0].text.find("\"ok\"").expect("key present");
+        assert!(
+            segs.iter()
+                .any(|s| s.start == key && s.style.fg == Some(Color::LightCyan)),
+            "and styled it as a json key: {segs:?}"
+        );
+
+        // Full width: at 60 cells the content fits on one row with no divider
+        // and no second column, which is what a one-pane split must look like.
+        let rows: Vec<String> =
+            crate::tui::BorderedRenderer::lines(&panel.messages, 60, true)
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+        let text = rows.join("\n");
+        assert!(text.contains("write_file: /tmp/shown.json"), "titled: {text}");
+        assert!(text.contains("1 line, 14 bytes"), "captioned: {text}");
+        assert!(text.contains("{\"ok\": true}"), "the content is on one row: {text}");
+        // No pane divider: every row carries exactly the box's own two bars, so
+        // a one-pane split has nothing between the columns to draw.
+        for row in rows.iter().filter(|r| r.starts_with('\u{2502}')) {
+            assert_eq!(
+                row.matches('\u{2502}').count(),
+                2,
+                "a body row with a third bar would be a pane divider: {row}"
+            );
+        }
+        assert!(
+            rows.iter().filter(|r| r.starts_with('\u{2502}')).count() >= 2,
+            "the caption and the content are both body rows: {text}"
         );
     }
 

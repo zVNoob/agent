@@ -1,7 +1,7 @@
 -- bash.lua — the sandboxed `agent.bash`: drive a `bash -c` run under a
 -- seccomp syscall policy.
 --
--- The Rust side (src/seccomp.rs) owns the engine and exposes *non-blocking*
+-- The Rust side (src/seccomp/) owns the engine and exposes *non-blocking*
 -- primitives on the bridge; everything that makes a run a coroutine protocol
 -- lives here, in Lua, where `coroutine.yield` works:
 --

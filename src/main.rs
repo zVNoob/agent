@@ -17,9 +17,18 @@
 //!
 //! Key semantics: Enter mid-turn is ignored (the typed text stays in the
 //! input and submits once the current turn ends); Ctrl+C / q / Esc quit.
-//! `/reload` re-reads ./agent.lua — endpoint, system prompt, `agent.mcps`
-//! tools — without restarting; `/save` flushes the conversation log to disk
-//! and reports where it went. Nothing else is a local command.
+//! `/reload` re-reads the user config (`~/.config/agent/init.lua`) — endpoint,
+//! system prompt, `agent.mcps` tools — without restarting; `/save` flushes the
+//! conversation log to disk and reports where it went. Nothing else is a local
+//! command.
+//!
+//! The bottom of the screen is a one-line status bar (`agent::status`), which is
+//! where anything *in progress* goes: `streaming...` while a turn's answer is
+//! arriving, grammar acquisition, which runs before the first frame and is
+//! seconds of download and C compile on a cold cache, and Lua's `print`, which is
+//! re-pointed there so it cannot land in the middle of the alternate screen. The
+//! bar exists before the TUI does, so a message set during startup is on screen
+//! the moment there is a screen.
 //!
 //! Compaction primitives: after a full user turn ends, the loop fires
 //! `turn_completed` (the conversation travels as `{ history = {...} }`) to
@@ -51,6 +60,7 @@ mod api;
 mod tools;
 
 use agent::grammars::Catalog;
+use agent::status::StatusKind;
 use agent::tui::{App, MarkdownHighlighter, Role};
 use anyhow::Result;
 use api::{Chat, TurnBuilder, TurnEvent, assistant_tool_message};
@@ -87,31 +97,31 @@ const MOUSE_OFF: &str = "\x1b[?1000l\x1b[?1006l";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    // Configuration lives in Lua (./agent.lua, else ~/.config/agent/agent.lua):
+    // Configuration lives in Lua (~/.config/agent/init.lua, if it exists):
     // the LLM endpoint (base_url / model / api_key — formerly AGENT_BASE_URL /
     // AGENT_MODEL / AGENT_API_KEY), the system prompt, and the tools
     // registered in `agent.mcps`. `config_vm` stays on the main thread: every
     // request reindexes that live table and re-reads the prompt, while
     // per-call MCP tool invocations build their own VM on the tool thread.
-    let config_vm =
-        agent::lua::new_vm_with_sink(None).map_err(|e| anyhow::anyhow!("config vm: {e}"))?;
-    let loaded = agent::lua::load_config_file(&config_vm).map_err(anyhow::Error::msg)?;
-    match agent::lua::config_path() {
-        Some(p) => println!(
-            "config: {} ({})",
-            p.display(),
-            if loaded {
-                "user Lua config loaded"
-            } else {
-                "no user config"
-            }
+    // The configuration is the user's own `~/.config/agent/init.lua`. On the
+    // first run there isn't one, so the shipped `lua/init.lua` is copied there
+    // and *that* is run — after which the file is theirs to edit, and `/reload`
+    // re-reads it. The origin is reported because "a file appeared in your home
+    // directory" is worth saying out loud, once, at the moment it happens.
+    let (config_vm, origin) =
+        agent::lua::new_agent_vm(None).map_err(|e| anyhow::anyhow!("config vm: {e}"))?;
+    use agent::lua::ConfigOrigin;
+    match origin {
+        ConfigOrigin::Seeded => println!(
+            "config: seeded ~/.config/agent/init.lua from the built-in one — \
+             edit it to configure the agent, /reload to re-read"
         ),
-        None => {
-            println!(
-                "config: no agent.lua in cwd or ~/.config/agent — using the defaults \
-                 (and so, no tools)"
-            )
+        ConfigOrigin::Existing => {
+            println!("config: ~/.config/agent/init.lua (user config loaded)")
         }
+        ConfigOrigin::Tree => println!(
+            "config: no writable ~/.config/agent — using the built-in defaults"
+        ),
     }
     let llm = agent::lua::llm_config(&config_vm).map_err(anyhow::Error::msg)?;
     let config = api::ChatConfig {
@@ -131,7 +141,7 @@ async fn main() -> Result<()> {
     // `agent.llm.memory` enables it, shared behind a mutex with Lua's
     // `agent.memory` primitives — the loop archives every message to it and
     // flushes at turn boundaries and on exit (`/save` flushes early). Binding
-    // is a startup decision: `/reload` re-reads agent.lua but cannot rebind
+    // is a startup decision: `/reload` re-reads the config but cannot rebind
     // the store (like the trigger channel). A failed open degrades to "no
     // persistence" rather than aborting the session.
     let mem_cfg = agent::lua::memory_config(&config_vm).map_err(anyhow::Error::msg)?;
@@ -199,14 +209,40 @@ async fn main() -> Result<()> {
 
     // Grammars come from the registry at runtime (no cargo involvement);
     // missing grammars degrade to plain text, so the TUI still works offline.
-    let mut catalog = Catalog::new();
-    let results = catalog
-        .ensure_many(&["markdown", "markdown_inline", "bash", "json"])
-        .await;
-    for (lang, r) in &results {
-        if let Err(e) = r {
-            eprintln!("[agent] grammar {lang} unavailable ({e}); that content stays plain");
+    //
+    // This runs *before* the first frame, and a cold language is a registry
+    // lookup, a tarball and a C compile — seconds of a blank screen otherwise.
+    // So it reports through the status line, which exists before the TUI does
+    // (see `crate::status`), and the last message is on screen the moment there
+    // is a screen. Per language rather than `ensure_many`, so the bar can count
+    // and name the step.
+    agent::status::attach();
+    app.set_status(agent::status::status_line().clone());
+    const GRAMMARS: [&str; 4] = ["markdown", "markdown_inline", "bash", "json"];
+    let mut catalog = Catalog::new().with_progress(|m| agent::status::info(m.to_string()));
+    let mut failed = Vec::new();
+    for (i, lang) in GRAMMARS.iter().enumerate() {
+        app.set_status_text(
+            format!("grammar {}/{}: {lang}", i + 1, GRAMMARS.len()),
+            StatusKind::Info,
+        );
+        if let Err(e) = catalog.ensure(lang).await {
+            // Kept up on the bar rather than printed: a failure the user never
+            // saw is one they hit again. The content still renders, as text.
+            app.set_status_text(
+                format!("grammar {lang} unavailable ({e:#}) — that content stays plain"),
+                StatusKind::Warn,
+            );
+            failed.push(lang.to_string());
         }
+    }
+    if failed.is_empty() {
+        app.set_status_text("ready", StatusKind::Done);
+    } else {
+        agent::status::warn(format!(
+            "ready — without highlighting for {}",
+            failed.join(", ")
+        ));
     }
 
     // Install the highlighter *before* pushing anything — including the
@@ -230,17 +266,23 @@ async fn main() -> Result<()> {
             "assistant" => {
                 if let Some(content) = msg["content"].as_str() {
                     app.push(Role::Assistant, content.to_string());
-                } else if let Some(names) = tool_call_names(msg) {
-                    // The archive stores the calls, not the rendered boxes:
-                    // a resumed tool round collapses to one named box.
-                    app.push_boxed(
-                        Role::Assistant,
-                        format!("invoked tools: {names}"),
-                        "tools".into(),
-                    );
                 }
+                // A tool round is silent on resume, exactly as it is live. There
+                // was a summary box here — `invoked tools: read_file, bash` —
+                // reconstructed from the archive's call names, and it was the
+                // last thing in the loop that admitted a tool had run. Live
+                // turns say nothing, so a resumed turn that said something would
+                // be describing history the user cannot otherwise see. Keeping
+                // it would have made a tool's visibility depend on whether the
+                // session was fresh.
+                //
+                // The gap this leaves is real and worth naming: panels are not
+                // archived, so a resumed session shows neither the summary nor
+                // the tool's own drawing. Tools that report themselves will
+                // report themselves again on the next turn; what is lost is
+                // only the *visual* of what a past turn did.
             }
-            _ => {} // tool results: their call's box already tells the story
+            _ => {} // tool results: invisible, as they are live
         }
     }
     let system_prompt = match agent::lua::system_prompt(&config_vm) {
@@ -252,7 +294,7 @@ async fn main() -> Result<()> {
         Role::Assistant,
         format!(
             "agent ready — {}{system_prompt} · tools: {}. Type a message and press Enter \
-             (/reload re-reads agent.lua; /save flushes the log to disk).",
+             (/reload re-reads the config; /save flushes the log to disk).",
             chat.model(),
             chat.tools()
                 .iter()
@@ -289,11 +331,11 @@ async fn main() -> Result<()> {
 }
 
 /// One unit of work the agent loop multiplexes: a terminal event, the next
-/// turn event (`None` = the current turn's stream ended), a finished tool
-/// call from its background thread, a pending user-permission ask from the
-/// running tool (`None` = the ask channel closed), the reactor's timer poke
-/// for a suspended `turn_completed` handler, or a periodic pulse while a
-/// tool runs.
+/// turn event (`None` = the current turn's stream ended), a step of the tool
+/// call in flight (which finishes on its own, not on a thread of its own), a
+/// pending user-permission ask from the running tool (`None` = the ask channel
+/// closed), the reactor's timer poke for a suspended `turn_completed` handler,
+/// or a periodic pulse while a tool runs.
 enum Tick {
     Key(CrosstermEvent),
     Turn(Option<Result<TurnEvent, anyhow::Error>>),
@@ -322,14 +364,17 @@ async fn next_turn_event(
     }
 }
 
-/// A finished tool call: the call identity (for the transcript) plus the
+/// A finished tool call: the identity the `tool` message must quote, and the
 /// outcome — `Ok((body, content))` or an executor error message. Produced by
 /// the flight below, whether it finished normally, was refused by the dispatch
 /// gate, or raised.
+///
+/// The name and the arguments are deliberately **not** here. They were, until
+/// this stopped putting a box in the transcript: the box was the only reader.
+/// What a call was, and how it went, is now either something the tool drew or
+/// something it did not.
 struct ToolOutcome {
     id: String,
-    name: String,
-    arguments: String,
     result: Result<(String, String), String>,
 }
 
@@ -342,8 +387,6 @@ struct ToolOutcome {
 /// tool), or finished. The loop resumes it — see `advance_tool`.
 struct ToolFlight<'lua> {
     id: String,
-    name: String,
-    arguments: String,
     run: agent::lua::ToolRun<'lua>,
     step: agent::lua::ToolStep,
 }
@@ -353,8 +396,6 @@ impl ToolFlight<'_> {
     fn failed(&self, why: String) -> ToolOutcome {
         ToolOutcome {
             id: self.id.clone(),
-            name: self.name.clone(),
-            arguments: self.arguments.clone(),
             result: Err(why),
         }
     }
@@ -428,8 +469,6 @@ fn start_next_tool<'lua>(
             None,
             Some(ToolOutcome {
                 id: id.clone(),
-                name: name.clone(),
-                arguments: arguments.clone(),
                 result: Err(why),
             }),
         )
@@ -448,13 +487,7 @@ fn start_next_tool<'lua>(
     }
     match agent::lua::ToolRun::start(vm, &name, &arguments) {
         Ok(Some((run, step))) => Ok((
-            Some(ToolFlight {
-                id,
-                name,
-                arguments,
-                run,
-                step,
-            }),
+            Some(ToolFlight { id, run, step }),
             None,
         )),
         // The registry holds no such tool. It is the only place a tool can come
@@ -493,8 +526,6 @@ fn advance_tool(
         ToolStep::Returned(body) => (
             Some(ToolOutcome {
                 id: flight.id.clone(),
-                name: flight.name.clone(),
-                arguments: flight.arguments.clone(),
                 result: Ok((body.clone(), body.clone())),
             }),
             None,
@@ -511,52 +542,46 @@ fn advance_tool(
     })
 }
 
-/// Fold a finished tool call into the conversation: the result (or the error) in
-/// the transcript, and the `tool` message the model reads back. The round's
-/// panel ops are drained here too, so everything the tool drew lands at once.
+/// Fold a finished tool call into the conversation: the `tool` message the
+/// model reads back, and whatever the tool drew, drained here so it all lands at
+/// once.
+///
+/// **A tool call puts nothing in the transcript.** Not its arguments, not its
+/// result, not an error. There was a box per call for exactly that, and it was
+/// the wrong shape twice over: it repeated the output of any tool that already
+/// had a panel, and for the ones that did not it was a wall of raw JSON
+/// arguments and result envelopes — the loudest thing on screen, and the least
+/// informative.
+///
+/// A tool is therefore **responsible for its own reporting**, which is also the
+/// only arrangement that can be formatted properly. `agent.panel` is the
+/// mechanism, and the shell is the worked example: it opens a panel titled with
+/// the command and appends stdout as it arrives. A tool that wants to be seen
+/// draws itself; a tool that wants to be quiet is quiet.
+///
+/// That includes failure. A tool that fails says so, in whatever form suits it.
+/// If a tool fails silently, so be it — the model reads the error in `history`
+/// either way, and the transcript is the model's account rather than a duplicate
+/// of the wire format.
+///
+/// The consequence to be aware of: a tool that draws nothing is invisible, and
+/// nothing in the loop will draw for it.
 fn fold_tool_outcome(
     app: &mut App,
     history: &mut Vec<serde_json::Value>,
     outcome: ToolOutcome,
     round_sink: Option<&agent::panels::PanelSink>,
 ) {
-    let ToolOutcome {
-        id,
-        name,
-        arguments,
-        result,
-    } = outcome;
-    match result {
-        Ok((body, content)) => {
-            // bash's visual is its streamed stdout panel — created and fed by
-            // the Lua driver while the sandbox ran, so no JSON result box here;
-            // the other tools keep their plain call + result box.
-            if name != "bash" {
-                app.push_boxed(
-                    Role::Assistant,
-                    format!("{name} {arguments}\n\n{body}"),
-                    name.clone(),
-                );
-            }
-            history.push(json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": content,
-            }));
-        }
-        Err(msg) => {
-            app.push_boxed(
-                Role::Assistant,
-                format!("{name} {arguments}\n\n{msg}"),
-                "error".into(),
-            );
-            history.push(json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": json!({"error": msg}).to_string(),
-            }));
-        }
-    }
+    let ToolOutcome { id, result, .. } = outcome;
+    let content = match result {
+        Ok((_body, content)) => content,
+        Err(msg) => json!({"error": msg}).to_string(),
+    };
+    history.push(json!({
+        "role": "tool",
+        "tool_call_id": id,
+        "content": content,
+    }));
     if let Some(s) = round_sink {
         app.drain_panel_ops(s);
     }
@@ -572,10 +597,10 @@ struct PendingQuestion {
 /// The per-request tool catalog: exactly what the user's `agent.mcps` registry
 /// holds, and nothing else — the sandboxed shell included (`lua/bash_tool.lua`
 /// is a connection like any other, so a mode that lists no connections offers
-/// the model no tools at all). `vm` is the main-thread config VM — the live Lua
-/// table is reindexed on every call and **never cached in Rust**, so an
-/// agent.lua edit (picked up by `/reload`) is advertised on the very next
-/// request (see `agent::lua`'s config section).
+/// the model no tools at all). `vm` is the config VM — the live Lua table is
+/// reindexed on every call and **never cached in Rust**, so a config edit
+/// (picked up by `/reload`) is advertised on the very next request (see
+/// `agent::lua`'s config section).
 fn tool_defs(vm: &mlua::Lua) -> Result<Vec<api::ToolDef>> {
     Ok(tools::adopt_mcp_tools(
         agent::lua::mcps_tool_defs(vm).map_err(anyhow::Error::msg)?,
@@ -584,11 +609,11 @@ fn tool_defs(vm: &mlua::Lua) -> Result<Vec<api::ToolDef>> {
 
 /// Whether a tool call may run: only a name this request actually offered.
 ///
-/// The tool VM loads a *fresh* registry (it re-runs `agent.lua`), so "not
-/// advertised" is not by itself "not callable" — a mode that replaced
-/// `agent.mcps`, an unregistered tool, or an old tool call replayed out of the
-/// history would each find a working tool by name. The request's own tool list
-/// is the gate, so what the model was shown is exactly what it can run.
+/// A tool is called by name against the *live* registry, so "not advertised"
+/// is not by itself "not callable" — a mode that replaced `agent.mcps`, an
+/// unregistered tool, or an old tool call replayed out of the history would
+/// each find a working tool by name. The request's own tool list is the gate,
+/// so what the model was shown is exactly what it can run.
 fn may_run(name: &str, offered: &std::collections::HashSet<String>) -> Result<(), String> {
     if offered.contains(name) {
         Ok(())
@@ -609,9 +634,9 @@ fn offered_tools(chat: &Chat) -> std::collections::HashSet<String> {
 
 /// Re-derive the advertised tool list from the live registry before a request
 /// and swap the chat only when the set actually changed (reindexing every
-/// request is what keeps an agent.lua edit immediate; the swap is the minimal
-/// step that surfaces the change to the frozen `api::Chat`, which fixes its
-/// tools at connect time).
+/// request is what keeps a config edit immediate; the swap is the minimal step
+/// that surfaces the change to the frozen `api::Chat`, which fixes its tools at
+/// connect time).
 fn refresh_chat_tools(chat: &mut Chat, config: &api::ChatConfig, vm: &mlua::Lua) -> Result<()> {
     let tools = tool_defs(vm)?;
     if serde_json::to_string(&tools)? != serde_json::to_string(chat.tools())? {
@@ -646,9 +671,8 @@ fn request_history(vm: &mlua::Lua, history: &[Value]) -> Vec<Value> {
 /// system prompt and the tool registry from — so what it configures is what the
 /// next turn uses: a mode it switches, a setting it writes, a flag it arms to
 /// carry state to the next event. Each `agent.on_timeout(...)` wait suspends the
-/// coroutine and arms a reactor timer instead of freezing the loop; the old
-/// `spawn_blocking` background thread is gone. Its `agent.trigger(...)` command
-/// arrives back here through the loop's trigger channel.
+/// coroutine and arms a reactor timer instead of freezing the loop, and its
+/// `agent.trigger(...)` command arrives back here through the trigger channel.
 fn start_turn_completed<'a>(
     vm: &'a mlua::Lua,
     history: &[Value],
@@ -731,22 +755,6 @@ fn replay_history(path: &std::path::Path, n: usize) -> Vec<Value> {
             eprintln!("[agent] memory replay failed: {e}");
             Vec::new()
         }
-    }
-}
-
-/// The tool names in an archived assistant tool-call message, joined for the
-/// resumed-history transcript (the log stores the calls, not the rendered
-/// per-call boxes). `None` when the message carries no tool calls.
-fn tool_call_names(msg: &Value) -> Option<String> {
-    let names: Vec<&str> = msg["tool_calls"]
-        .as_array()?
-        .iter()
-        .filter_map(|c| c["function"]["name"].as_str())
-        .collect();
-    if names.is_empty() {
-        None
-    } else {
-        Some(names.join(", "))
     }
 }
 
@@ -873,25 +881,15 @@ async fn run<W: Write>(
                 // call is over and there is nothing to wait for.
                 continue;
             }
-            // A question the tool is waiting on. Its wording is drawn here rather
-            // than only as a panel overlay, so a tool with no panel (every file
-            // operation) still shows the user what it is asking.
-            if let Some(q) = question {
-                if !q.text.is_empty() {
-                    app.push_boxed(
-                        Role::Assistant,
-                        format!(
-                            "{}\n\n{}",
-                            q.text,
-                            if q.always {
-                                "[y]es  [n]o  [a]lways"
-                            } else {
-                                "[y]es  [n]o"
-                            }
-                        ),
-                        "ask".into(),
-                    );
-                }
+            // A question the tool is waiting on. The tool already put it on
+            // screen — `panel:ask` is a member function, so the dialog is on the
+            // panel that raised the question and there is nothing here to place.
+            //
+            // All the loop does is remember that a question is outstanding, so a
+            // key press can be read as a verdict. It is told about the same
+            // question on every tick until it is answered, which is why the
+            // re-report is ignored rather than acted on.
+            if let Some(q) = question.filter(|q| !q.text.is_empty()) {
                 pending_question = Some(q);
             }
         }
@@ -955,18 +953,22 @@ async fn run<W: Write>(
                                     )),
                                 };
                                 pending_verdict = Some(agent::lua::verdict_to_lua(vm, &answer));
-                                app.push_boxed(
-                                    Role::Assistant,
-                                    format!(
-                                        "{}",
-                                        match choice {
-                                            AskChoice::Yes => "allowed",
-                                            AskChoice::Always => "allowed, and remembered",
-                                            AskChoice::No => "denied",
-                                        }
-                                    ),
-                                    "ask".into(),
-                                );
+                                // The decision goes on the status bar, not into
+                                // the transcript. A cold command asks dozens of
+                                // times, and a message per answer buried the run
+                                // it was reporting on; the bar is one line and
+                                // holds exactly the latest.
+                                let outcome = match choice {
+                                    AskChoice::Yes => "allowed",
+                                    AskChoice::Always => "allowed, and remembered",
+                                    AskChoice::No => "denied",
+                                };
+                                let kind = if choice == AskChoice::No {
+                                    agent::status::StatusKind::Warn
+                                } else {
+                                    agent::status::StatusKind::Done
+                                };
+                                app.set_status_text(outcome, kind);
                             }
                             None => match key.code {
                                 KeyCode::Char('c')
@@ -1030,7 +1032,7 @@ async fn run<W: Write>(
                             }
                         } else if text.strip_prefix("/reload").is_some() {
                             // A local command: reload the user config (picks
-                            // up agent.lua edits), then re-derive the tool
+                            // up config edits), then re-derive the tool
                             // catalog from its fresh `agent.mcps` — nothing
                             // cached in Rust — so the next request already
                             // advertises the new tool set and the new system
@@ -1058,9 +1060,10 @@ async fn run<W: Write>(
                                             format!(
                                                 "config {} — tools: {} · {prompt}",
                                                 if loaded {
-                                                    "reloaded (./agent.lua)"
+                                                    "reloaded (~/.config/agent/init.lua)"
                                                 } else {
-                                                    "reloaded (defaults: no agent.lua)"
+                                                    "reloaded (built-in defaults: no \
+                                                     ~/.config/agent/init.lua)"
                                                 },
                                                 names.join(", ")
                                             ),
@@ -1158,10 +1161,7 @@ async fn run<W: Write>(
                 // handler: resume its coroutine where it yielded. A returned
                 // (or errored) handler is done; a fresh wait arms the next
                 // timer.
-                let step = match event.as_mut() {
-                    Some(run) => Some(run.step()),
-                    None => None,
-                };
+                let step = event.as_mut().map(|run| run.step());
                 match step {
                     Some(Ok(agent::lua::EventStep::Waiting { ms })) => {
                         event_rx = Some(start_event_timer(ms));
@@ -1181,6 +1181,7 @@ async fn run<W: Write>(
             Tick::Turn(Some(Err(e))) => {
                 stream = None;
                 builder = TurnBuilder::new();
+                app.clear_status();
                 app.push_boxed(
                     Role::Assistant,
                     format!("turn failed: {e:#}"),
@@ -1188,6 +1189,11 @@ async fn run<W: Write>(
                 );
             }
             Tick::Turn(Some(Ok(ev))) => {
+                // The turn is live. The bar is the only place that says so —
+                // a streamed answer can take a while to say anything, and the
+                // request's own latency is spent *before* this first event,
+                // with the last frame still up.
+                app.set_status_text_if_changed("streaming...", StatusKind::Info);
                 match &ev {
                     TurnEvent::Reasoning(d) => {
                         // Streamed live into its own borderless "reasoning"
@@ -1213,9 +1219,14 @@ async fn run<W: Write>(
                 // Reasoning and answer content were already streamed live into
                 // their "reasoning"/"response" blocks; nothing to flush.
                 stream = None;
+                // "streaming..." described a turn that has now ended, and a
+                // tool round is not streaming — so the bar goes empty rather
+                // than stale. Anything a tool reports sets it again.
+                app.clear_status();
                 let turn = builder.finish();
                 // What this request cost, for `agent.llm.usage` (read-only, and
-                // seeded into every later VM).
+                // written here so a `turn_completed` handler reads the turn that
+                // just finished).
                 agent::lua::record_usage(vm, turn.tokens());
                 // The answer content was already streamed live into the panel's
                 // "response" block (content events -> stream_append_boxed); do
@@ -1233,11 +1244,12 @@ async fn run<W: Write>(
                 if continuing {
                     tool_rounds += 1;
                     history.push(assistant_tool_message(&turn.tool_calls));
-                    // Queue the round's calls and start the first one. Tools
-                    // run on background threads (see `start_next_tool`) so the
-                    // loop keeps rendering; panel ops from policy Lua and the
-                    // bash stream panel buffer in the round's shared sink,
-                    // drained every frame while the tools run.
+                    // Queue the round's calls and start the first one. A tool
+                    // is a coroutine on the config VM that the loop steps (see
+                    // `start_next_tool`), so it only runs between frames; panel
+                    // ops from policy Lua and the bash stream panel buffer in
+                    // the round's shared sink, drained every frame while the
+                    // tools run.
                     tool_queue = turn
                         .tool_calls
                         .iter()
@@ -1287,7 +1299,7 @@ async fn run<W: Write>(
 
         // Apply any panel ops that streamed in since the last frame — a
         // running bash command appends its stdout chunks to the round's sink
-        // on its own thread, so the box fills live.
+        // as the loop steps it, so the box fills live.
         if let Some(s) = &round_sink {
             app.drain_panel_ops(s);
         }
@@ -1376,14 +1388,16 @@ mod tests {
     #[test]
     fn only_the_tools_a_request_offered_may_run() {
         let offered: std::collections::HashSet<String> =
-            ["bash".to_string(), "read_file".to_string()].into_iter().collect();
-        assert!(may_run("bash", &offered).is_ok());
-        assert!(may_run("read_file", &offered).is_ok());
+            ["bash.bash".to_string(), "fs.read".to_string()].into_iter().collect();
+        // Names are qualified by their connection, so the gate is checked
+        // against the names a request actually carries.
+        assert!(may_run("bash.bash", &offered).is_ok());
+        assert!(may_run("fs.read", &offered).is_ok());
 
-        // A mode's dropped tool: well-formed, registered in the fresh VM the
-        // tool call would load, and still refused.
-        let e = may_run("write_file", &offered).unwrap_err();
-        assert!(e.contains("write_file"), "{e}");
+        // A mode's dropped tool: well-formed, registered in the config the
+        // tool call would run on, and still refused.
+        let e = may_run("fs.write_file", &offered).unwrap_err();
+        assert!(e.contains("fs.write_file"), "{e}");
         assert!(e.contains("not one of the tools offered"), "{e}");
 
         // The empty catalog of a no-tools mode refuses everything.
@@ -1421,20 +1435,117 @@ mod tests {
             assert_eq!(ask_choice(code, true), None, "{code:?} is not an answer");
         }
     }
-
+    /// A tool call is invisible in the transcript: not its arguments, not its
+    /// result, not an error. A tool reports itself, or does not.
+    ///
+    /// This inverts the rule that was here an hour ago, and the inversion is
+    /// deliberate. The box existed to make a silent call checkable, and it did
+    /// the opposite: raw JSON arguments above a raw result envelope, the
+    /// loudest thing on screen for a tool that had said nothing. And a tool that
+    /// *had* spoken — the shell, `apply_patch` — got its output printed twice.
+    ///
+    /// The model is unaffected, which is the part that must not break: the
+    /// result is still archived as a `tool` message, so a failure the user
+    /// cannot see is still a failure the model can see and act on.
     #[test]
-    fn tool_call_names_lists_calls_from_an_archived_message() {
-        // The shape the loop archives: assistant, content null, calls array.
-        let msg = serde_json::json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
-                {"id": "call_2", "type": "function", "function": {"name": "probe_tool", "arguments": "{}"}},
-            ],
-        });
-        assert_eq!(tool_call_names(&msg).unwrap(), "bash, probe_tool");
-        assert!(tool_call_names(&serde_json::json!({"role": "user"})).is_none());
-        assert!(tool_call_names(&serde_json::json!({"tool_calls": []})).is_none());
+    fn a_tool_call_leaves_nothing_in_the_transcript_but_still_reaches_the_model() {
+        let render = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 12))
+                    .expect("terminal");
+            terminal.draw(|frame| app.render(frame)).expect("draw");
+            let buf = terminal.backend().buffer();
+            (0..12)
+                .flat_map(|y| {
+                    (0..60)
+                        .map(move |x| {
+                            buf.cell((x, y))
+                                .map(|c| c.symbol())
+                                .unwrap_or(" ")
+                                .to_string()
+                        })
+                })
+                .collect::<String>()
+        };
+
+        // A success, with a panel in the sink and without. Neither prints.
+        for drew in [true, false] {
+            let mut app = App::default();
+            let mut history = Vec::new();
+            let sink = agent::panels::PanelSink::default();
+            if drew {
+                // `Create` only registers the panel; the message appears on the
+                // first `Append`, so a sink holding a bare `Create` renders as
+                // an empty panel and would make this test pass for the wrong
+                // reason.
+                sink.push(agent::panels::PanelOp::Create {
+                    id: 1,
+                    title: "cat /etc/hostname".into(),
+                    boxed: true,
+                    conceal_box: false,
+                });
+                sink.push(agent::panels::PanelOp::Append {
+                    id: 1,
+                    text: "may-Legion-R9000P-AFR10H\n".into(),
+                });
+            }
+            fold_tool_outcome(
+                &mut app,
+                &mut history,
+                ToolOutcome {
+                    id: "call_1".into(),
+                    result: Ok((r#"{"ok":true,"result":{"n":3}}"#.into(), "{}".into())),
+                },
+                Some(&sink),
+            );
+            assert_eq!(
+                history.len(),
+                1,
+                "the model reads the result back: {history:?}"
+            );
+            assert_eq!(history[0]["role"], "tool");
+            assert_eq!(history[0]["tool_call_id"], "call_1");
+            // The only thing on screen is what the tool drew — nothing else.
+            let screen = render(&mut app);
+            assert!(
+                !screen.contains("ok\":true") && !screen.contains("tool_call_id"),
+                "the result is not printed (drew={drew}):\n{screen}"
+            );
+            assert_eq!(
+                screen.contains("cat /etc/hostname"),
+                drew,
+                "the tool's own panel is the whole visual (drew={drew}):\n{screen}"
+            );
+        }
+
+        // A failure is silent too. The tool is in charge of saying so; this one
+        // chose not to, and the transcript honours that.
+        let mut app = App::default();
+        let mut history = Vec::new();
+        let sink = agent::panels::PanelSink::default();
+        fold_tool_outcome(
+            &mut app,
+            &mut history,
+            ToolOutcome {
+                id: "call_2".into(),
+                result: Err("the sandbox refused to start".into()),
+            },
+            Some(&sink),
+        );
+        assert_eq!(history.len(), 1);
+        assert!(
+            history[0]["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("the sandbox refused to start")),
+            "the model still learns it failed: {:?}",
+            history[0]
+        );
+        let screen = render(&mut app);
+        assert!(
+            !screen.contains("refused to start"),
+            "and the user is told nothing by the loop:\n{screen}"
+        );
     }
+
+
 }

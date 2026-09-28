@@ -4,7 +4,8 @@
 //!
 //! [`AsyncSandbox`] owns a spawned [`seccomp::Sandbox`] (the non-blocking
 //! coroutine substrate) plus dup'd [`AsyncFd`]s for its four live fds
-//! (listener, stdout, stderr, and the per-run stdin write end). [`drive`]
+//! (listener, stdout, stderr, and the per-run stdin write end).
+//! [`AsyncSandbox::drive`]
 //! maps the engine's [`seccomp::Sandbox::poll_slots`] — the single source of
 //! truth for which fd is worth awaiting — onto `select!`, then hands each
 //! readiness token to the existing non-blocking [`seccomp::Sandbox::step`].
@@ -12,7 +13,7 @@
 //! The suspend/resume contract travels over channels instead of callbacks:
 //!
 //! - a [`Verdict::Ask`] freezes the tracee; [`Ask`] is sent on `ask_tx` and
-//!   [`drive`] **awaits** the verdict on `answer_rx`, so the reactor stays
+//!   [`AsyncSandbox::drive`] **awaits** the verdict on `answer_rx`, so the reactor
 //!   free while the policy engine (or the user, or a Lua coroutine) decides.
 //!   While frozen, buffered output keeps draining before the await.
 //! - tracee stdin is fed through `input_rx` into [`seccomp::Sandbox`]'s
@@ -66,7 +67,7 @@ pub struct Ask {
     pub request: u64,
 }
 
-/// Channel ends the driver's caller holds while [`drive`] runs: the asks it
+/// Channel ends the driver's caller holds while [`AsyncSandbox::drive`] runs: the asks it
 /// must answer, the verdicts it feeds back, and the stdin it may stream into
 /// the tracee's isolated stdin pipe.
 pub struct Channels(

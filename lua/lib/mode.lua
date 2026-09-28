@@ -66,8 +66,8 @@
 -- The first `set` captures what it replaced (`agent.mcps`, the prompt) as the
 -- baseline; `agent.mode.set()` with no name puts it back, so a mode is always
 -- reversible. Registration survives a `/reload`: this module is cached in
--- `package.loaded`, so re-running `agent.lua` *replaces* a mode's spec rather
--- than duplicating it, and re-registering the active mode re-applies it.
+-- `package.loaded`, so re-running a user config *replaces* a mode's spec
+-- rather than duplicating it, and re-registering the active mode re-applies it.
 --
 -- Nothing re-triggers inference: a switch takes effect from the next turn.
 -- Call `agent.trigger()` yourself if you want it now.
@@ -80,8 +80,8 @@ local M = {}
 ---
 --- It exists because the other two options cannot express "all the tools", and
 --- both of those are already modes. A mode that *lists* every connection would
---- have to be written after the config registered them all — `agent.lua` decides
---- that order, and a mode required one line too early silently loses a tool. A
+--- have to be written after the config registered them all — a user config
+--- decides that order, and a mode required one line too early loses a tool. A
 --- sentinel is read at switch time instead, so it cannot go stale, and it cannot
 --- be got wrong by a connection that is registered later.
 local KEEP_TOOLS = "all"
@@ -216,6 +216,28 @@ function M.get(name)
   return modes[name or active]
 end
 
+--- Drop a registered mode. The active one is switched off first, so
+--- `current()` is never left naming a mode that no longer exists. `true` when it
+--- was registered.
+---
+--- This exists because modes ship built in (`lua/init.lua` registers `coding` and
+--- `compact`), so "I do not want that mode" is a real request and not a way to
+--- arrange for one never to have been there.
+function M.forget(name)
+  if modes[name] == nil then return false end
+  if active == name then M.set() end
+  modes[name] = nil
+  return true
+end
+
+--- Drop every registered mode, leaving the prompt and the registry exactly as
+--- they are — the "do not touch the state" counterpart to `set`. For a test that
+--- wants a neutral `agent`, and for a config that would rather start from nothing
+--- than from the built-ins.
+function M.forget_all()
+  for name in pairs(modes) do modes[name] = nil end
+end
+
 --- Every registered mode name, sorted.
 function M.names()
   local out = {}
@@ -244,7 +266,7 @@ end
 -- Self-test: `agent.mode._selftest()` raises on any failure.
 --
 -- Non-destructive: the registry, the active mode and the baseline are
--- snapshotted first, so running it on a *configured* VM (a user's `agent.lua`
+-- snapshotted first, so running it on a *configured* VM (a user config has
 -- already registered modes) leaves every one of them as it found them.
 -- --------------------------------------------------------------------------
 
@@ -258,10 +280,10 @@ function M._selftest()
     local coding = M.new("coding", {
       description = "edit the repo",
       system_prompt = "CODING",
-      mcps = { fs = { name = "fs", tools = { read_file = true } } },
+      mcps = { fs = { name = "fs", tools = { read = true } } },
     })
     assert(coding.system_prompt == "CODING")
-    assert(coding.mcps.fs.tools.read_file == true)
+    assert(coding.mcps.fs.tools.read == true)
     assert(not pcall(M.new, "", {}), "an empty name is refused")
     assert(not pcall(M.new, "x", "nope"), "a non-table spec is refused")
     assert(not pcall(M.new, "x", { system_prompt = 5 }), "a non-string prompt is refused")

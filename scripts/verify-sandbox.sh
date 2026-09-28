@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full regression gate for the sandbox substrate (src/seccomp.rs,
+# Full regression gate for the sandbox substrate (src/seccomp/,
 # src/async_sandbox.rs), the Lua policy bridge (src/lua.rs), the MCP
 # client substrate (src/mcp.rs), and the Lua→TUI panel op stream
 # (src/panels.rs) — the files touched by the "ready to use" hardening: live

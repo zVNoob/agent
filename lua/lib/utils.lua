@@ -1167,7 +1167,7 @@ M.table = tbl
 -- whole registry Rust reindexes per request:
 --
 --   local conn = { name = "my-tools", tools = {} }
---   conn.tools.read_file = agent.utils.tool("Read a file.", schema, function(args) ... end)
+--   conn.tools.read = agent.utils.tool("Read a file.", schema, function(args) ... end)
 --   agent.mcps["my-tools"] = conn
 function M.tool(description, inputSchema, callback)
   local tool = {

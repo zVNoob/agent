@@ -1,13 +1,13 @@
 //! Headless agent probe: drive a real chat-completions server (e.g. a local
 //! llama.cpp `llama serve` running Gemma 4 E2B) through the **same tool
 //! round-trip the TUI's `run` loop performs** — the model requests a tool →
-//! the agent executes it from the Lua registry (`agent.mcps` on a fresh VM; the
-//! `bash` tool runs through the seccomp sandbox + Lua policy) → the result is
-//! fed back → the model continues.
+//! the agent executes it from the Lua registry (`agent.mcps` on the probe's
+//! own config VM; the `bash` tool runs through the seccomp sandbox + Lua
+//! policy) → the result is fed back → the model continues.
 //!
-//! The catalog is the registry too, so a tool the model calls that `agent.lua`
-//! does not register is an error here exactly as it is in the TUI. Asks
-//! auto-deny: the probe has no user, so the shell stays read-only.
+//! The catalog is the registry too, so a tool the model calls that the
+//! configuration does not register is an error here exactly as it is in the
+//! TUI. Asks auto-deny: the probe has no user, so the shell stays read-only.
 //!
 //! Each argv argument after the program name is one user turn (shared
 //! history). Output is machine-labeled so a script can tell model content,
@@ -21,14 +21,15 @@
 //! [done]
 //! ```
 //!
-//! Config: `./agent.lua` (the LLM endpoint and the system prompt, the same
-//! Lua configuration the TUI reads); the `AGENT_BASE_URL` / `AGENT_MODEL` /
+//! Config: `~/.config/agent/init.lua` (the LLM endpoint and the system prompt,
+//! the same Lua configuration the TUI reads); the `AGENT_BASE_URL` / `AGENT_MODEL` /
 //! `AGENT_API_KEY` env vars remain a dev-harness override of the endpoint when
 //! *any* is set.
 //!
 //! Events: after `[done]`, the probe fires the same `turn_completed` event the
-//! TUI fires — the conversation as `{ history = {...} }` — on a fresh VM with
-//! a panel sink, so a handler's `agent.panel` ops print as `[event-op]`.
+//! TUI fires — the conversation as `{ history = {...} }` — on that same config
+//! VM, whose panel sink is what prints a handler's `agent.panel` ops as
+//! `[event-op]`.
 //! Unlike the TUI, the probe has no idle loop, so `agent.trigger` is not bound
 //! (it returns `false` inside handlers): check it if your compaction handler
 //! depends on the write side.
@@ -45,7 +46,7 @@ use std::io::Write;
 
 const MAX_TOOL_ROUNDS: usize = 8;
 
-/// The agent's configuration lives in Lua (`./agent.lua` — the LLM endpoint,
+/// The agent's configuration lives in Lua (`~/.config/agent/init.lua` — the LLM endpoint,
 /// system prompt, and conversation-log settings, read via `agent::lua`); the
 /// `AGENT_*` env vars still override the *endpoint* here when set, so an
 /// existing headless invocation keeps working unchanged. The system prompt has
@@ -54,9 +55,11 @@ const MAX_TOOL_ROUNDS: usize = 8;
 /// can open the same store the TUI does (path + on/off from
 /// `agent.llm.memory`).
 fn config_from_lua_or_env() -> (api::ChatConfig, String, agent::lua::MemoryConfig) {
-    let vm = agent::lua::new_vm_with_sink(None)
-        .map_err(|e| e.to_string())
-        .and_then(|vm| agent::lua::load_config_file(&vm).map(|_| vm));
+    // The user's own `~/.config/agent/init.lua`, seeded on first run — the same
+    // configuration the TUI reads, not a second opinion.
+    let vm = agent::lua::new_agent_vm(None)
+        .map(|(vm, _)| vm)
+        .map_err(|e| e.to_string());
     // The prompt is pure Lua config: unlike the endpoint, it has no env
     // override, so a Lua failure just means "no system prompt".
     let prompt = vm
@@ -106,9 +109,8 @@ async fn main() -> Result<()> {
     // sink is where a handler's `agent.panel` ops land, exactly as the TUI's
     // round sink collects them; the probe prints them at `[done]`.
     let event_sink = agent::panels::PanelSink::default();
-    let vm = agent::lua::new_vm_with_sink(Some(&event_sink))
-        .map_err(|e| e.to_string())
-        .and_then(|vm| agent::lua::load_config_file(&vm).map(|_| vm))
+    let vm = agent::lua::new_agent_vm(Some(&event_sink))
+        .map(|(vm, _)| vm)
         .unwrap_or_else(|e| {
             eprintln!("[probe] warning: Lua config unavailable ({e}); no tools advertised");
             agent::lua::new_vm().expect("a bare agent VM")
@@ -138,7 +140,7 @@ async fn main() -> Result<()> {
     let mut saved_upto: usize = 0;
 
     // The tool catalog is the Lua registry, reindexed exactly as the TUI does
-    // per request: whatever `agent.lua` registered (nothing is built in).
+    // per request: whatever the configuration registered.
     let tool_defs = agent::lua::mcps_tool_defs(&vm)
         .map(tools::adopt_mcp_tools)
         .unwrap_or_default();
@@ -233,8 +235,9 @@ async fn main() -> Result<()> {
                 for c in &turn.tool_calls {
                     println!("[tool-call] {} {}", c.name, c.arguments);
                     // The same gate the TUI applies: only a name this request
-                    // offered may run. The tool VM reloads `agent.lua`, so
-                    // "registered" alone would let a dropped tool back in.
+                    // offered may run. A tool is called by name against the
+                    // live registry, so "registered" alone would let a dropped
+                    // tool back in.
                     if !offered.contains(&c.name) {
                         let msg = format!("`{}` is not one of the tools offered", c.name);
                         println!("[tool-result] {{\"error\": {msg:?}}}");
@@ -276,9 +279,10 @@ async fn main() -> Result<()> {
             println!("[done]");
             // Fire `turn_completed` exactly like the TUI's loop: same payload
             // shape — `{ history = {...} }`, the conversation without the
-            // leading system message — on a fresh VM, with a sink so a
-            // handler's agent.panel ops are visible headless. agent.trigger
-            // is NOT bound here (no idle loop to drive), so it returns false.
+            // leading system message — on the probe's own config VM, whose
+            // sink makes a handler's agent.panel ops visible headless.
+            // agent.trigger is NOT bound here (no idle loop to drive), so it
+            // returns false.
             let start = messages
                 .first()
                 .and_then(|m| m["role"].as_str())

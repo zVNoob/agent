@@ -30,7 +30,3 @@ tar = "0.4"
 # LuaJIT from source (the C compiler and `make` grammar acquisition already
 # require), so no system LuaJIT install is needed.
 mlua = { version = "0.12", features = ["luajit", "vendored"] }
-
-[[bin]]
-name = "test_trace"
-path = "src/test_trace.rs"

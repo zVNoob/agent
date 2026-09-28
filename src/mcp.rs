@@ -5,7 +5,7 @@
 //! tool registry) lives in Lua ([`crate::lua`]), so this module stays
 //! stateless at the protocol level.
 //!
-//! - the **JSON text boundary**: [`install`] adds `agent.api.json_encode` /
+//! - the **JSON text boundary**: [`install_bridge`] adds `agent.api.json_encode` /
 //!   `agent.api.json_decode` to the `agent` namespace, converting between Lua
 //!   values and JSON text. The bridge walks [`mlua::Value`] directly over
 //!   `serde_json` — no extra mlua features — and distinguishes JSON arrays
@@ -14,11 +14,11 @@
 //!   `{}`); see [`lua_to_json`].
 //! - the **stdio framing**: one JSON-RPC message per line on each pipe
 //!   ([`read_line`] / [`write_line`]), used by the `mcp_fake` reference
-//!   server ([`crate::bin`] `mcp_fake`) — the MCP stdio transport, against
+//!   server (`src/bin/mcp_fake.rs`) — the MCP stdio transport, against
 //!   servers that run *inside* the seccomp sandbox (`agent.mcp` in
 //!   [`crate::lua`]).
-//! - the **streamable HTTP(S) transport**: `reqwest` on a dedicated
-//!   background thread (see the transport section below) — the MCP streamable
+//! - the **streamable HTTP(S) transport**: `reqwest` as a task on the agent's
+//!   own single reactor (see the transport section below) — the MCP streamable
 //!   HTTP transport, driven from Lua by the `agent.http` stream objects
 //!   in [`crate::lua`].
 //! - the **wire types**: the JSON-RPC 2.0 [`Message`] shape the MCP protocol
@@ -140,22 +140,25 @@ pub fn write_line<W: std::io::Write>(w: &mut W, line: &str) -> std::io::Result<(
 // ---------------------------------------------------------------------------
 // Streamable HTTP(S) transport.
 //
-// `reqwest` runs on a dedicated background thread (its own current-thread
-// tokio runtime), so the inherently synchronous Lua pump never owns the
-// reactor. Lua fires a request with `agent.api.http_req` or opens an SSE stream
-// with `agent.api.sse_open`, receives a numeric **handle**, and pumps results
-// with `agent.api.http_step` / `agent.api.sse_step` — one buffered event per call.
-// Response bodies stream in as `chunk` events; SSE `data:` lines arrive as
-// `event` events; the terminal event (done/error) unregisters the handle.
+// `reqwest` runs as a task on the agent's own single reactor — there is no
+// transport thread, because the caller is already a coroutine on that reactor.
+// The response is consumed by *polling*, never by waiting, which is what lets
+// the synchronous Lua pump drive it. Lua fires a request with
+// `agent.api.http_req` or opens an SSE stream with `agent.api.sse_open`,
+// receives a numeric **handle**, and pumps results with `agent.api.http_step` /
+// `agent.api.sse_step` — one buffered event per call. Response bodies stream in
+// as `chunk` events; SSE `data:` lines arrive as `event` events; the terminal
+// event (done/error) unregisters the handle.
 //
-// Thread-safety: the transport thread only ever touches Rust data. Lua values
-// (event tables) are materialized on the owning thread at pump time, from the
-// per-handle queues. Rust owns TLS, HTTP framing, and SSE parsing; everything
-// above the byte level (protocol, correlation, callbacks) is Lua's — see
-// `agent.http` in [`crate::lua`].
+// The transport task only ever touches Rust data: per-handle event queues,
+// behind a mutex, filled by the task and drained by the pump. Lua values (event
+// tables) are materialized at pump time, on the thread that owns the VM. Rust
+// owns TLS, HTTP framing, and SSE parsing; everything above the byte level
+// (protocol, correlation, callbacks) is Lua's — see `agent.http` in
+// [`crate::lua`].
 // ---------------------------------------------------------------------------
 
-/// How long the transport thread idles between abort checks on a live stream.
+/// How long a live stream's task waits between abort checks.
 const STREAM_POLL: Duration = Duration::from_millis(500);
 
 /// One buffered event of an in-flight HTTP request.
@@ -325,7 +328,7 @@ async fn http_req_task(client: reqwest::Client, spec: HttpReqSpec) {
     }
 }
 
-/// One SSE GET, executed on the transport thread. Each complete event is
+/// One SSE GET, run as a task on the agent's reactor. Each complete event is
 /// queued as it parses; EOF queues `Done`.
 async fn sse_task(
     client: reqwest::Client,
@@ -528,10 +531,8 @@ fn lua_reverse_dns(_: &Lua, ip: String) -> mlua::Result<Option<String>> {
     };
     // A literal loopback/link-local name needs no resolver, and the resolver
     // cannot answer for it anyway.
-    if let std::net::IpAddr::V4(v4) = addr {
-        if v4.is_loopback() {
-            return Ok(Some("localhost".into()));
-        }
+    if matches!(addr, std::net::IpAddr::V4(v4) if v4.is_loopback()) {
+        return Ok(Some("localhost".into()));
     }
     // Port 0 is a placeholder: a reverse lookup keys on the address alone.
     let mut names = match std::net::ToSocketAddrs::to_socket_addrs(&(addr, 0)) {
@@ -641,9 +642,9 @@ fn lua_http_close(_: &Lua, handle: i64) -> mlua::Result<bool> {
     Ok(true)
 }
 
-/// `agent.api.sse_open(url, headers) -> handle` — open an SSE stream on the
-/// transport thread. Consume with `agent.api.sse_step`; `Accept: text/event-stream`
-/// is the caller's header choice.
+/// `agent.api.sse_open(url, headers) -> handle` — open an SSE stream as a task
+/// on the agent's reactor. Consume with `agent.api.sse_step`;
+/// `Accept: text/event-stream` is the caller's header choice.
 fn lua_sse_open(_: &Lua, (url, headers): (String, Table)) -> mlua::Result<i64> {
     let headers = lua_headers_to_vec(&headers)?;
     let t = http_transport();
@@ -741,8 +742,8 @@ pub fn install_bridge(lua: &Lua, api: &Table) -> mlua::Result<()> {
     Ok(())
 }
 
-fn lua_json_encode(lua: &Lua, value: Value) -> mlua::Result<String> {
-    let json = lua_to_json(lua, &value)?;
+fn lua_json_encode(_: &Lua, value: Value) -> mlua::Result<String> {
+    let json = lua_to_json( &value)?;
     serde_json::to_string(&json)
         .map_err(|e| mlua::Error::RuntimeError(format!("agent.api.json_encode: {e}")))
 }
@@ -766,7 +767,7 @@ fn lua_json_decode(lua: &Lua, text: String) -> mlua::Result<Value> {
 ///   is `{}`). Mixed or non-dense integer keys error — JSON cannot express
 ///   them.
 /// - functions / userdata / threads → error (not JSON-able)
-pub fn lua_to_json(lua: &Lua, v: &Value) -> mlua::Result<Json> {
+pub fn lua_to_json(v: &Value) -> mlua::Result<Json> {
     match v {
         Value::Nil => Ok(Json::Null),
         Value::Boolean(b) => Ok(Json::Bool(*b)),
@@ -785,7 +786,7 @@ pub fn lua_to_json(lua: &Lua, v: &Value) -> mlua::Result<Json> {
             let mut saw_str = false;
             for pair in t.pairs::<Value, Value>() {
                 let (k, val) = pair?;
-                let j = lua_to_json(lua, &val)?;
+                let j = lua_to_json(&val)?;
                 match &k {
                     Value::Integer(i) if *i >= 1 => {
                         saw_int = true;

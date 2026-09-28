@@ -13,9 +13,11 @@
 --
 -- The run itself is `agent.bash` (lua/lib/bash.lua) under the default policy in
 -- `lua/policy.lua` — a table of syscall name -> callback whose keys are the
--- sandbox's interception mask. That policy traps `openat`, `connect`, `bind` and
--- `sendto`, and **asks** about each rather than deciding: the question is shown
--- as an overlay on the result panel, the answer is handed back to the frozen
+-- sandbox's interception mask. That policy traps `openat`, `unlinkat`,
+-- `renameat`/`renameat2`, `chmod`/`fchmodat`, the `*xattr` calls, `connect`,
+-- `bind` and `sendto`, and **asks** about each rather than deciding: the
+-- question is shown as a dialog at the bottom of the
+-- result panel, the answer is handed back to the frozen
 -- syscall, and an "always" remembers the path or the endpoint so the next
 -- command does not ask. The working directory is trusted outright
 -- (`lua/init.lua`), so work in this repository asks for nothing and everything
@@ -24,7 +26,7 @@
 -- trusted for.
 --
 -- The result is the MCP shape. `result` is always present (stdout, stderr,
--- exit_code / exit_signal, syscalls, denied, denied_reason) so the model sees
+-- exit_code / exit_signal, denied, denied_reason) so the model sees
 -- the full outcome; `ok = false` means the tool itself did not complete — a
 -- missing `cmdline`, or a write the user refused (which arrives as
 -- `denied_reason`). A command that merely exits non-zero is `ok = true` with its
@@ -32,7 +34,9 @@
 --
 -- The result panel is created before the sandbox spawns, each stdout chunk is
 -- appended as it arrives, and a status line finishes it — so the TUI shows the
--- command's output *streaming* instead of hanging until the run completes.
+-- command's output *streaming* instead of hanging until the run completes. The
+-- panel is titled with the command itself, so what ran is visible without
+-- expanding anything.
 
 local M = { name = "bash", tools = {} }
 
@@ -45,8 +49,16 @@ local function run(args)
     return { ok = false, error = "bash: 'cmdline' is required and must be a non-empty string" }
   end
 
-  -- One panel for the whole run: the stream, the ask overlay, and the status.
-  local p = agent.panel("bash result", { boxed = true, conceal_box = false })
+  -- One panel for the whole run: the stream, the ask dialogs, and the status.
+  -- The title is the command line, so a collapsed box and a glance at a live
+  -- one both say what is being run rather than "bash result". Whitespace runs
+  -- are collapsed and the ends trimmed, because the title is drawn inside a
+  -- one-row border: a command spanning several lines, or merely indented, would
+  -- otherwise break that border's alignment. A title still too long for the
+  -- width is cut by the renderer (with an ellipsis), not here — the panel keeps
+  -- the full command either way, in the transcript of the model's own call.
+  local title = (args.cmdline:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""))
+  local p = agent.panel(title, { boxed = true, conceal_box = false })
   local s = agent.bash(args.cmdline, require("policy"), {
     on_stdout = function(chunk)
       -- A panel append is a bridge call; a tool that loses its panel must not
@@ -54,21 +66,15 @@ local function run(args)
       pcall(function() p:append(chunk) end)
     end,
   })
-  -- The ask handler: an asking policy re-yields the question here. Show it as an
-  -- overlay inside the panel box, put it to the user, and clear the overlay
-  -- before the sandbox resumes.
+  -- The ask handler: an asking policy hands the question here, and `p:ask`
+  -- puts it on *this* panel as a dialog and waits for the verdict. That is the
+  -- whole ask protocol from this side — there is no second copy of the question
+  -- anywhere in the transcript, and nothing has to guess which panel the
+  -- question belongs to.
   --
-  -- How the question reaches the user depends on who is driving this tool call.
-  -- On the reactor — the TUI, which runs the whole call as a coroutine and
-  -- resumes it — the ask is *yielded* up: the driver owns the prompt, and
-  -- blocking on `agent.api.ask_user` here would block the very loop that has to
-  -- draw it. Anywhere else (the probe, the tests) there is no driver, so ask
-  -- directly and block for the answer, exactly as before.
-  --
-  -- The ask's own `always` flag is what decides whether the prompt offers
-  -- `[a]lways` beside yes and no: a question with a path to remember offers it
-  -- (the `for_syscall` shape the shipped policy asks), and one without does
-  -- not. The overlay names the choices the user actually has.
+  -- `always` decides whether the dialog offers `[a]lways` beside yes and no: a
+  -- question with a path to remember offers it (the `for_syscall` shape the
+  -- shipped policy asks), and one without does not.
   local r = s:run(function(a)
     local text, always
     if type(a) == "table" then
@@ -77,14 +83,7 @@ local function run(args)
     else
       text = tostring(a)
     end
-    p:overlay(text .. (always and "\n\n[y]es  [n]o  [a]lways" or "\n\n[y]es  [n]o"))
-    -- Yield the ask itself, not the text: the driver reads `description` and
-    -- `always` off it and shows the same wording this overlay does.
-    local verdict = agent.__on_reactor
-        and coroutine.yield(type(a) == "table" and a or { description = text })
-        or agent.api.ask_user(text, always)
-    p:clear_overlay()
-    return verdict
+    return p:ask(text, always)
   end)
 
   local exit = r.exit or {}
@@ -93,7 +92,11 @@ local function run(args)
     stderr = r.stderr or "",
     exit_code = exit.code,
     exit_signal = exit.signal,
-    syscalls = r.syscalls or 0,
+    -- No `syscalls` count: it was the one field in here that said nothing about
+    -- the command. `denied` already says how many syscalls were stopped, which
+    -- is the only number a reader can act on, and a raw total of every openat
+    -- and connect was noise in every result — the kind of field that costs the
+    -- model a few hundred tokens per call to learn to skip.
     denied = r.denied or 0,
     denied_reason = r.denied_reason,
   }
@@ -126,7 +129,7 @@ local function run(args)
 M.tools.bash = agent.utils.tool(
   "Run a shell command (`bash -c`) through the seccomp sandbox under a Lua syscall "
   .. "policy. Reading and writing files, and reaching the network, ask the user "
-  .. "first — shown as an overlay on the result panel, and \"always\" makes that "
+  .. "first — shown as a dialog at the bottom of the result panel, and \"always\" makes that "
   .. "path or endpoint stop asking. The working directory is already trusted, so "
   .. "work there is silent (headless runs deny every ask). Returns stdout/stderr, "
   .. "the exit status, and the syscall/denied counters.",

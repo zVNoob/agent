@@ -162,10 +162,10 @@ impl Turn {
                 (Some(n), Some(pps)) => Some(format!("--- {n} tokens, {pps:.0} tok/s ---")),
                 _ => Some(serde_json::to_string_pretty(t).unwrap_or_default()),
             }
-        } else if let Some(u) = &self.usage {
-            Some(serde_json::to_string_pretty(u).unwrap_or_default())
         } else {
-            None
+            self.usage
+                .as_ref()
+                .map(|u| serde_json::to_string_pretty(u).unwrap_or_default())
         }
     }
 }
@@ -211,10 +211,8 @@ impl TurnBuilder {
                     self.tool_calls.push(ToolCallAcc::default());
                 }
                 let slot = &mut self.tool_calls[d.index];
-                if let Some(id) = d.id {
-                    if !id.is_empty() {
-                        slot.id = id;
-                    }
+                if let Some(id) = d.id.filter(|id| !id.is_empty()) {
+                    slot.id = id;
                 }
                 if let Some(n) = d.name {
                     slot.name = n;
@@ -254,6 +252,14 @@ impl TurnBuilder {
 
 /// Parse one SSE `data:` payload into a list of caller-visible events.
 /// Pure: no printing, no side effects beyond `acc` bookkeeping.
+/// The payload of one SSE `data:` line, or `None` when the line is not one:
+/// a different field, the `[DONE]` sentinel, or an empty payload.
+fn sse_payload(line: &str) -> Option<&str> {
+    line.strip_prefix("data:")
+        .map(str::trim)
+        .filter(|payload| *payload != "[DONE]" && !payload.is_empty())
+}
+
 fn acc_sse(payload: &str, acc: &mut TurnAccState) -> Vec<TurnEvent> {
     let mut events = Vec::new();
     let Ok(evt) = serde_json::from_str::<Value>(payload) else {
@@ -321,10 +327,8 @@ impl TurnAccState {
             self.tool_calls.push(ToolCallAcc::default());
         }
         let slot = &mut self.tool_calls[delta.index];
-        if let Some(id) = &delta.id {
-            if !id.is_empty() {
-                slot.id = id.clone();
-            }
+        if let Some(id) = delta.id.as_ref().filter(|id| !id.is_empty()) {
+            slot.id = id.clone();
         }
         if let Some(n) = &delta.name {
             slot.name = n.clone();
@@ -419,11 +423,9 @@ impl Chat {
                 for &b in chunk.iter() {
                     if b == b'\n' {
                         let line = String::from_utf8_lossy(&line_buf).trim().to_string();
-                        if let Some(payload) = line.strip_prefix("data:").map(str::trim) {
-                            if payload != "[DONE]" && !payload.is_empty() {
-                                for event in acc_sse(payload, &mut acc) {
-                                    yield Ok(event);
-                                }
+                        if let Some(payload) = sse_payload(&line) {
+                            for event in acc_sse(payload, &mut acc) {
+                                yield Ok(event);
                             }
                         }
                         line_buf.clear();
@@ -435,11 +437,9 @@ impl Chat {
             // Trailing line without a newline at EOF.
             if !line_buf.is_empty() {
                 let line = String::from_utf8_lossy(&line_buf).trim().to_string();
-                if let Some(payload) = line.strip_prefix("data:").map(str::trim) {
-                    if payload != "[DONE]" && !payload.is_empty() {
-                        for event in acc_sse(payload, &mut acc) {
-                            yield Ok(event);
-                        }
+                if let Some(payload) = sse_payload(&line) {
+                    for event in acc_sse(payload, &mut acc) {
+                        yield Ok(event);
                     }
                 }
             }

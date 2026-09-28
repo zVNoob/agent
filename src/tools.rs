@@ -48,13 +48,13 @@ mod tests {
                 }),
             },
             agent::lua::McpToolDef {
-                name: "read_file".into(),
+                name: "read".into(),
                 description: "read a file".into(),
                 parameters: serde_json::json!({ "type": "object" }),
             },
         ]);
         let names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
-        assert_eq!(names, ["bash", "read_file"], "order is the registry's own");
+        assert_eq!(names, ["bash", "read"], "order is the registry's own");
         assert_eq!(tools[0].kind, "function");
         assert_eq!(tools[0].function.description, "run a command");
         assert_eq!(

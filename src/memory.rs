@@ -50,7 +50,7 @@
 //!
 //! The agent loop and Lua both write this log. The TUI opens one `Memory`
 //! (path from `agent.llm.memory`, see `agent::lua`) and shares it behind a
-//! process-wide `Arc<Mutex<Memory>>` ([`bind_memory`] in `agent::lua`): the
+//! process-wide `Arc<Mutex<Memory>>` ([`bind_memory`](crate::lua::bind_memory)): the
 //! loop archives each history message as it lands (a watermark — never
 //! rewrites, compaction just clamps it) and flushes at turn boundaries and on
 //! exit; `agent.memory.append / latest / flush / path` expose the same store
@@ -58,8 +58,9 @@
 //! [`read_tail`]) into the transcript and request history, so a fresh session
 //! continues where the last one left off.
 //!
-//! Single-owner *within* one lock critical section; the `Mutex` makes the
-//! cross-thread sharing sound (Lua tool/event VMs run on background threads).
+//! Single-owner *within* one lock critical section; the `Mutex` is what makes
+//! the store reachable from both sides of the boundary — the loop and the Lua
+//! coroutines it drives share it, and neither can assume it is alone in it.
 //! There is still exactly one `Memory` per process.
 
 use std::collections::VecDeque;

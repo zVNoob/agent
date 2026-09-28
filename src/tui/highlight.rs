@@ -386,6 +386,7 @@ fn normalize_markdown_injections(injections: &str) -> Option<String> {
 /// - any `(#predicate …)` clause that references one of them as an argument is
 ///   dropped whole, because its target capture is about to disappear (keeping
 ///   it would turn the query invalid: "capture not used in pattern").
+///
 /// Predicates with only literal/string arguments, e.g. `(#set! conceal "")`,
 /// are kept verbatim (they are harmless no-ops for tree-sitter-highlight).
 ///
@@ -427,10 +428,7 @@ fn strip_meta_captures(query: &str) -> Option<String> {
                 if j < n && b[j] == b'#' {
                     let end = clause_end(query, i).unwrap_or(n);
                     let args = clause_capture_args(query, i, end);
-                    if args
-                        .iter()
-                        .any(|name| META.iter().any(|m| *m == name.as_str()))
-                    {
+                    if args.iter().any(|name| META.contains(&name.as_str())) {
                         changed = true; // drop the whole predicate clause
                     } else {
                         out.push_str(&query[i..end]);
@@ -641,7 +639,7 @@ impl MarkdownHighlighter {
         self.highlight_message_with_conceal(text).segments
     }
 
-    /// Highlight a message body into [`HighlightedMessage`]: the styled
+    /// Highlight a message body into a `HighlightedMessage`: the styled
     /// segments (identical to [`Self::highlight_message`], which delegates
     /// here) plus the concealed marker ranges.
     ///

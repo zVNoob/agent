@@ -112,11 +112,11 @@ pub struct Message {
     /// Display state: a boxed message collapsed to just its title and bottom
     /// border rows. Toggled by clicking the box (see [`TurnPanel::handle_click`]).
     pub(crate) collapsed: bool,
-    /// When set, a boxed message draws a user-permission overlay at the bottom
-    /// *inside* its box: a compact framed panel with the ask description and
-    /// an allow/deny key prompt. Set and cleared via [`PanelOp::Overlay`];
-    /// only boxed messages render it (see [`overlay_rows`]).
-    pub(crate) overlay: Option<String>,
+    /// When set, a boxed message draws a user-permission *dialog* at the bottom
+    /// *inside* its box: a compact framed panel with the ask description and a
+    /// key prompt. Set and cleared via [`PanelOp::Overlay`]; only boxed
+    /// messages render it (see [`overlay_rows`]).
+    pub(crate) overlay: Option<Overlay>,
     /// When set, the message is a *split* panel ([`PanelOp::Split`]): the box
     /// renders `panes` as framed sub-regions — side-by-side columns when the
     /// width allows, stacked below a rule when it doesn't — instead of one
@@ -214,14 +214,14 @@ fn dim_spans(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 }
 
 /// A composition "subclass" of the chat renderer's *base* path: messages
-/// that opted into a box [`Message::boxed`] are framed in a bordered title
+/// that opted into a box (`Message::boxed`) are framed in a bordered title
 /// bar (`┌─ tool −…─┐` … `└─…─┘`) for tool-call visuals — except the
-/// borderless "reasoning"/"response" blocks (see [`is_borderless_box`]),
+/// borderless "reasoning"/"response" blocks (see `is_borderless_box`),
 /// which render as plain messages (reasoning dimmed). Inside a framed box
 /// the original non-conceal segment path renders the raw text — markup
 /// markers stay visible no matter the conceal toggle, exactly like the base
-/// renderer, *unless* the message's [`Message::conceal_box`] opts its
-/// content into the conceal path. Clicking a framed box toggles its collapse
+/// renderer, *unless* the message's `conceal_box` opts its content into the
+/// conceal path. Clicking a framed box toggles its collapse
 /// (see [`TurnPanel::handle_click`]).
 #[derive(Debug, Default)]
 pub struct BorderedRenderer;
@@ -539,12 +539,15 @@ impl TurnPanel {
                 Self::rehighlight_pane(&mut self.highlighter, p);
                 self.messages[idx].dirty = true;
             }
-            PanelOp::Overlay { id, text } => {
+            PanelOp::Overlay { id, text, always } => {
                 let Some(idx) = self.ensure_panel(id) else {
                     return;
                 };
                 let msg = &mut self.messages[idx];
-                msg.overlay = text;
+                msg.overlay = text.map(|t| Overlay {
+                    text: t,
+                    always,
+                });
                 msg.dirty = true; // the overlay adds rows inside the box
                 if msg.overlay.is_some() {
                     // A pending permission ask must be legible: expand a
@@ -699,7 +702,7 @@ impl TurnPanel {
         });
     }
 
-    /// Toggle markup concealment (see [`ChatRenderer`]); returns the new state.
+    /// Toggle markup concealment (see `ChatRenderer`); returns the new state.
     pub fn toggle_conceal(&mut self) -> bool {
         let on = !self.renderer.conceal_enabled();
         self.renderer.set_conceal(on);
@@ -719,7 +722,7 @@ impl TurnPanel {
     }
 
     /// Scroll one row toward the bottom; follow re-engages automatically
-    /// once the view reaches the bottom (see [`Self::resolve_scroll`]).
+    /// once the view reaches the bottom (see `Self::resolve_scroll`).
     pub fn scroll_down(&mut self) {
         self.scroll += 1;
     }
@@ -1051,6 +1054,38 @@ fn message_lines(msg: &Message, text_w: usize, conceal: bool) -> Vec<Line<'stati
     out
 }
 
+/// Cut `title` to at most `room` cells, marking the cut with `…`.
+///
+/// Titles are model- and tool-authored text — the `bash` tool puts the command
+/// line there — so "assume it fits" is not safe, and a box whose top border is
+/// wider than its area wraps and destroys the frame. Cells, not bytes: the box
+/// is drawn with a `chars()`-based fill, so this measures the same way (and
+/// inherits the same wide-character approximation, noted in the module docs).
+/// A `room` too small for the ellipsis itself is left empty rather than filled
+/// with one.
+fn fit_title(title: &str, room: usize) -> String {
+    if title.chars().count() <= room {
+        return title.to_string();
+    }
+    if room == 0 {
+        return String::new();
+    }
+    if room == 1 {
+        return "…".to_string();
+    }
+    let head: String = title.chars().take(room - 1).collect();
+    format!("{head}…")
+}
+
+/// A pending permission dialog on a boxed message: what is being asked, and
+/// whether the answer has something to remember (which is what offers
+/// `[a]lways`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Overlay {
+    pub text: String,
+    pub always: bool,
+}
+
 /// A boxed message's rows, replacing the role tag row: a title border
 /// (`┌─ <tool> [−] ─…─┐`), content rows `│ … │` wrapping the base path at
 /// `content_w - 4` (or the conceal path when the box opts in and the toggle
@@ -1062,8 +1097,24 @@ fn boxed_lines(msg: &Message, content_w: usize, conceal: bool) -> Vec<Line<'stat
     let title = msg.boxed.as_deref().unwrap_or("tool");
     let indicator = if msg.collapsed { "[+]" } else { "[−]" };
 
-    // Title border, filled with ─ to exactly `content_w` cells.
-    let mut top = format!("┌─ {title} {indicator} ");
+    // Title border, filled with ─ to exactly `content_w` cells. The title is
+    // cut to whatever the frame leaves, so a title longer than the box is
+    // shortened instead of overflowing — an overflowing border wraps to the next
+    // terminal row and the box stops being a box.
+    //
+    // The reserved width is every cell around the title: `┌─ `, the space after
+    // it, the indicator, the space before the fill, *and* the closing `┐`. The
+    // last one is the easy one to forget, and forgetting it is off by exactly
+    // one cell on every row.
+    let fixed = "┌─ ".chars().count() // 3
+        + 1 // space between title and indicator
+        + indicator.chars().count()
+        + 1 // space between indicator and fill
+        + "┐".chars().count();
+    let mut top = format!(
+        "┌─ {} {indicator} ",
+        fit_title(title, content_w.saturating_sub(fixed))
+    );
     let fill = content_w.saturating_sub(top.chars().count() + 1);
     top.push_str(&"─".repeat(fill));
     top.push('┐');
@@ -1106,10 +1157,18 @@ fn boxed_lines(msg: &Message, content_w: usize, conceal: bool) -> Vec<Line<'stat
     out
 }
 
-/// The key prompt drawn as the overlay panel's title: the user answers the
-/// pending permission ask with `y` (allow) or `n` (deny) while the sandbox
-/// keeps the asking syscall frozen.
-const OVERLAY_PROMPT: &str = "[y] allow \u{00B7} [n] deny";
+/// The key prompt drawn as the dialog's title: the user answers the pending
+/// permission ask with `y` (allow) or `n` (deny) while the sandbox keeps the
+/// asking syscall frozen — and with `a` as well when the question had something
+/// to remember, which is the only case where "always" is an answer the agent
+/// can act on rather than a promise it cannot keep.
+fn overlay_prompt(always: bool) -> String {
+    if always {
+        "[y]es \u{00B7} [n]o \u{00B7} [a]lways".to_string()
+    } else {
+        "[y]es \u{00B7} [n]o".to_string()
+    }
+}
 
 /// Style of the overlay's frame and title. Deliberately distinct from the
 /// body rows: bold yellow on a dark band reads as a modal inset, so the ask
@@ -1144,19 +1203,30 @@ fn overlay_body_style() -> Style {
 /// [`message_rows`].
 fn overlay_rows(msg: &Message, content_w: usize) -> Vec<Line<'static>> {
     let inner = content_w.saturating_sub(4);
-    let desc = msg.overlay.as_deref().unwrap_or("");
+    let Some(overlay) = msg.overlay.as_ref() else {
+        return Vec::new();
+    };
+    let desc = overlay.text.as_str();
     let title = overlay_title_style();
     let body = overlay_body_style();
     let mut out = Vec::new();
 
-    // Mini-panel top border, filled with ─ to the full inner width.
-    let mut top = format!("┌─ {OVERLAY_PROMPT} ");
+    // Mini-panel top border, filled with ─ to the full inner width. The key
+    // prompt lives in the title, so it stays on one line and never competes
+    // with the description for the row budget below.
+    let mut top = format!("┌─ {} ", overlay_prompt(overlay.always));
     let fill = inner.saturating_sub(top.chars().count() + 1);
     top.push_str(&"─".repeat(fill));
     top.push('┐');
     out.push(frame_row(top, title));
 
-    let text_w = inner.saturating_sub(2);
+    // The dialog's own box is `inner` cells wide, so its body row
+    // `│ text │` has to come to `inner` too: four cells of chrome — the two
+    // borders and the two spaces. This was `inner - 2`, which made every body
+    // row a cell wider than the border it sits in: a broken right edge, easy to
+    // miss when the dialog was a rare overlay and impossible to miss now that
+    // every question is drawn this way.
+    let text_w = inner.saturating_sub(4);
     let mut lines = wrap_lines(desc, text_w);
     if lines.is_empty() {
         lines.push(String::new());
@@ -1820,7 +1890,7 @@ mod tests {
 
         // Streaming more text re-measures only the appended message. The last
         // message is a user one, so a fresh assistant message is started.
-        panel.stream_append(" three four".into());
+        panel.stream_append(" three four");
         // " three four" wraps to 3 rows at text width 4; "one" and "two"
         // keep their cached single rows.
         assert_eq!(panel.content_height(content_w), 5);
@@ -1866,6 +1936,314 @@ mod tests {
         assert_eq!(lines[0].spans[1].content.as_ref(), "**bold**");
     }
 
+    /// The loop's side of a permission ask: the question becomes a dialog at the
+    /// bottom of the panel that raised it, and leaves again when answered.
+    ///
+    /// This is the whole of the ask's *display* — the tool emits no dialog of its
+    /// own, so there is exactly one place that decides where a question appears.
+    /// Several panels, several dialogs: can two be open at once, and does each
+    /// question land on the panel that raised it?
+    ///
+    /// Both, and the second half is the one that matters. `panel:ask` sets the
+    /// dialog on **its own** panel by id, so two panels asking in turn each get
+    /// their own dialog and neither can land on the other — which is what a
+    /// "most recent boxed message" heuristic could not promise, and did not
+    /// deliver once an answer had been rendered between the two questions.
+    #[test]
+    fn several_panels_are_open_at_once_and_each_dialog_stays_on_its_own() {
+        let mut panel = TurnPanel::default();
+        for (id, title) in [(1u64, "cat /etc/hostname"), (2, "cat /etc/hosts")] {
+            panel.apply_op(PanelOp::Create {
+                id,
+                title: title.into(),
+                boxed: true,
+                conceal_box: false,
+            });
+            panel.apply_op(PanelOp::Append {
+                id,
+                text: "output\n".into(),
+            });
+        }
+        assert_eq!(panel.messages.len(), 2, "both panels are open at once");
+
+        let show = |p: &TurnPanel| {
+            BorderedRenderer::lines(&p.messages, 56, true)
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<String>>()
+        };
+        let dialog_for = |rows: &[String], path: &str| {
+            rows.iter()
+                .any(|l| l.contains("want to read") && l.contains(path))
+        };
+
+        // Panel 1 asks. The dialog is inside panel 1's box, and nowhere else.
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: Some("The process want to read /etc/hostname".into()),
+            always: true,
+        });
+        let rows = show(&panel);
+        assert!(dialog_for(&rows, "/etc/hostname"), "panel 1's own: {rows:?}");
+        assert!(
+            !dialog_for(&rows, "/etc/hosts"),
+            "and not on the other panel: {rows:?}"
+        );
+        // Both boxes are still on screen, and panel 2 is untouched.
+        assert!(rows.iter().any(|l| l.contains("cat /etc/hostname")));
+        assert!(rows.iter().any(|l| l.contains("cat /etc/hosts")));
+
+        // Panel 1 is answered: its dialog goes, its box stays.
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: None,
+            always: false,
+        });
+        // Panel 2 now asks, and the two never overlap.
+        panel.apply_op(PanelOp::Overlay {
+            id: 2,
+            text: Some("The process want to read /etc/hosts".into()),
+            always: true,
+        });
+        let rows = show(&panel);
+        assert!(
+            !dialog_for(&rows, "/etc/hostname"),
+            "the first dialog is gone: {rows:?}"
+        );
+        assert!(dialog_for(&rows, "/etc/hosts"), "the second is on panel 2: {rows:?}");
+        assert_eq!(
+            rows.iter()
+                .filter(|l| l.contains("┌─ [y]es"))
+                .count(),
+            1,
+            "exactly one dialog on screen at a time: {rows:?}"
+        );
+
+        panel.apply_op(PanelOp::Overlay {
+            id: 2,
+            text: None,
+            always: false,
+        });
+        let rows = show(&panel);
+        assert_eq!(
+            rows.iter().filter(|l| l.contains("want to read")).count(),
+            0,
+            "and none left after both are answered: {rows:?}"
+        );
+        assert_eq!(panel.messages.len(), 2, "still two panels, neither grown");
+    }
+
+    #[test]
+    fn a_permission_dialog_rides_the_bottom_of_the_tool_panel() {
+        let mut panel = TurnPanel::default();
+
+        // This is the path `panel:ask` takes, from Lua: the panel sets the
+        // dialog on *itself* by id. Nothing searches the transcript for "the
+        // panel this probably belongs to" — that search is what put a question
+        // on whichever message happened to be boxed last, which is how a dialog
+        // ended up on the previous answer instead of on the tool that asked.
+        panel.apply_op(PanelOp::Create {
+            id: 1,
+            title: "cat /etc/hostname".into(),
+            boxed: true,
+            conceal_box: false,
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "some output\n".into(),
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "more output\n".into(),
+        });
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: Some("The process want to read /etc/hostname".into()),
+            always: true,
+        });
+        assert_eq!(
+            panel.messages.len(),
+            1,
+            "a dialog is not a message: the transcript does not grow"
+        );
+
+        let content_w = 52;
+        let render = |p: &TurnPanel| {
+            BorderedRenderer::lines(&p.messages, content_w, true)
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<String>>()
+        };
+        let shown = render(&panel);
+        for (i, l) in shown.iter().enumerate() {
+            assert_eq!(
+                l.chars().count(),
+                content_w,
+                "row {i} is exactly the box width, or the border is broken: {l:?}"
+            );
+        }
+        assert!(
+            shown[0].starts_with("┌─ cat /etc/hostname"),
+            "the panel keeps its own title: {:?}",
+            shown[0]
+        );
+        // The dialog is a framed mini-panel: its top border carries the key
+        // prompt, the question is the body under it.
+        let dlg_top = shown
+            .iter()
+            .position(|l| l.contains("┌─ [y]es"))
+            .expect("the dialog's key prompt is drawn");
+        assert!(
+            shown[dlg_top].contains("[a]lways"),
+            "offered, because a path can be remembered: {:?}",
+            shown[dlg_top]
+        );
+        let question = shown[dlg_top + 1]
+            .contains("The process want to read /etc/hostname");
+        assert!(
+            question,
+            "and the question is its body: {:?}",
+            shown[dlg_top + 1]
+        );
+        let dialog = dlg_top;
+        // At the bottom: after the streamed output, before the box's own border.
+        let last_body = shown.len() - 2;
+        assert!(
+            dialog > shown.iter().position(|l| l.contains("more output")).unwrap(),
+            "below the output: {shown:?}"
+        );
+        assert!(
+            dialog < last_body,
+            "and inside the box, above the closing border: {shown:?}"
+        );
+
+        // Asking again replaces the dialog rather than adding to it, so a run
+        // that asks fifty times leaves one message and one dialog.
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: Some("The process want to read /etc/hosts".into()),
+            always: true,
+        });
+        assert_eq!(panel.messages.len(), 1, "still one message");
+
+        let shown = render(&panel);
+        assert!(
+            shown.iter().any(|l| l.contains("/etc/hosts")),
+            "the new question replaces the old: {shown:?}"
+        );
+        assert_eq!(
+            shown.iter().filter(|l| l.contains("┌─ [y]es")).count(),
+            1,
+            "exactly one dialog, showing the new question and not both: {shown:?}"
+        );
+
+        // Answered: the panel is the tool's alone again.
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: None,
+            always: false,
+        });
+        let shown = render(&panel);
+        assert!(
+            !shown.iter().any(|l| l.contains("want to read")),
+            "the dialog is gone: {shown:?}"
+        );
+        assert!(shown.iter().any(|l| l.contains("more output")), "output kept");
+        assert!(
+            !shown.iter().any(|l| l.contains("want to read")),
+            "and clearing again changes nothing"
+        );
+    }
+
+    /// A question with nothing to remember must not offer `always`: the answer
+    /// would be a promise the agent cannot keep.
+    #[test]
+    fn the_dialog_offers_always_only_when_there_is_something_to_remember() {
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Create {
+            id: 1,
+            title: "run".into(),
+            boxed: true,
+            conceal_box: false,
+        });
+        // A panel materializes on its first text, not on Create.
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "x".into(),
+        });
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: Some("The process want to reach example.com".into()),
+            always: false,
+        });
+        let flat: String = BorderedRenderer::lines(&panel.messages, 52, true)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(flat.contains("[y]es") && flat.contains("[n]o"), "{flat}");
+        assert!(!flat.contains("[a]lways"), "nothing to remember: {flat}");
+    }
+
+    /// A title is model- and tool-authored text — `bash` puts the command line
+    /// there — so a long one must be cut, not allowed to overflow. An overflowed
+    /// top border wraps to the next terminal row and the box stops being a box,
+    /// which is exactly what this pins.
+    #[test]
+    fn a_title_too_long_for_the_box_is_cut_not_overflowed() {
+        let m = Message {
+            boxed: Some("echo hello && ls -la /very/long/path/to/somewhere".into()),
+            ..msg("hi", vec![], vec![])
+        };
+        let lines = BorderedRenderer::lines(std::slice::from_ref(&m), 40, true);
+        for (i, l) in lines.iter().enumerate() {
+            let row: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert_eq!(row, 40, "row {i} is exactly the box width, not wider");
+        }
+        let top = &lines[0].spans[0].content;
+        assert!(top.starts_with("┌─ echo hello"), "{top}");
+        assert!(
+            top.contains('…'),
+            "the cut is visible rather than silent: {top}"
+        );
+        assert!(top.ends_with('┐'), "{top}");
+    }
+
+    /// …at any width a box can be drawn at, which is 9 cells: the frame alone
+    /// (`┌─ `, a space, the indicator, a space, `┐`) is 9, so below that there is
+    /// no box to hold its width — a pre-existing floor, not something the title
+    /// handling introduces, and narrow enough that no real terminal gets there.
+    #[test]
+    fn the_title_border_holds_its_width_at_every_drawable_size() {
+        let long = "x".repeat(200);
+        for w in 9..60usize {
+            let m = Message {
+                boxed: Some(long.clone()),
+                ..msg("hi", vec![], vec![])
+            };
+            let lines = BorderedRenderer::lines(std::slice::from_ref(&m), w, true);
+            for l in &lines {
+                let row: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
+                assert_eq!(row, w, "width {w}: no row may exceed the box");
+            }
+        }
+    }
+
+    /// A title that fits is passed through untouched — the cut is for the
+    /// overflow case only, and must not cost the common one.
+    #[test]
+    fn a_title_that_fits_is_untouched() {
+        assert_eq!(fit_title("ls -la", 10), "ls -la");
+        assert_eq!(fit_title("exactly-10", 10), "exactly-10");
+        assert_eq!(fit_title("elevenchars", 10), "elevencha…");
+        // A title of exactly the room is not cut: nothing was lost.
+        assert_eq!(fit_title("abc", 3), "abc");
+        // Too small for anything but the marker.
+        assert_eq!(fit_title("abc", 1), "…");
+        assert_eq!(fit_title("abc", 0), "");
+    }
+
+    /// A title that fits gets the full border treatment, at exactly the box
+    /// width — the baseline the cutting above has to preserve.
     #[test]
     fn boxed_message_renders_a_full_box() {
         let m = Message {
@@ -1902,10 +2280,13 @@ mod tests {
 
     #[test]
     fn panel_overlay_renders_inside_the_box_and_counts_rows() {
-        // A pending permission ask rides the PanelOp::Overlay op: it renders
-        // as a framed mini-panel at the bottom *inside* the box (never
-        // outside), pins the viewport so it is visible, expands a collapsed
-        // box, and clearing it restores the plain boxed rows.
+        // A pending permission dialog rides the PanelOp::Overlay op — which is
+        // how a *tool* draws one, and how the loop's own rendering reaches the
+        // same code (see `a_permission_dialog_rides_the_bottom_of_the_tool_panel`,
+        // which is the path the TUI actually takes). It renders as a framed
+        // mini-panel at the bottom *inside* the box (never outside), pins the
+        // viewport so it is visible, expands a collapsed box, and clearing it
+        // restores the plain boxed rows.
         let mut panel = TurnPanel::default();
         panel.apply_op(PanelOp::Create {
             id: 1,
@@ -1921,6 +2302,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: Some(desc.into()),
+            always: true,
         });
         assert_eq!(panel.messages.len(), 1);
         assert!(
@@ -1945,8 +2327,9 @@ mod tests {
         assert!(
             joined
                 .iter()
-                .any(|l| l.contains("[y] allow") && l.contains("deny")),
-            "the key prompt is the overlay title: {joined:?}"
+                .any(|l| l.contains("[y]es") && l.contains("[a]lways")),
+            "the key prompt is the dialog title, and offers `always` because the \
+             question had something to remember: {joined:?}"
         );
         assert!(
             joined.iter().any(|l| l.contains("requests write")),
@@ -1954,7 +2337,7 @@ mod tests {
         );
         // The overlay sits between the body and the outer bottom border.
         let body = joined.iter().position(|l| l.contains("two"));
-        let ov = joined.iter().position(|l| l.contains("[y] allow"));
+        let ov = joined.iter().position(|l| l.contains("[y]es"));
         let bot = joined
             .iter()
             .position(|l| l.starts_with('└') && !l.contains('│'));
@@ -1973,6 +2356,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: Some(desc.into()),
+            always: true,
         });
         assert!(
             !panel.messages[0].collapsed,
@@ -1984,7 +2368,7 @@ mod tests {
         );
 
         // Clearing the overlay returns the box to its plain rows.
-        panel.apply_op(PanelOp::Overlay { id: 1, text: None });
+        panel.apply_op(PanelOp::Overlay { id: 1, text: None, always: false });
         let m = &panel.messages[0];
         assert!(m.overlay.is_none());
         let inner = content_w.saturating_sub(4);
@@ -2095,7 +2479,7 @@ mod tests {
         // full box width with padding, so the right border stays aligned.
         let text = "a very long line that must wrap inside the tool box";
         let m = Message {
-            boxed: Some("read_file".into()),
+            boxed: Some("read".into()),
             ..msg(text, vec![], vec![])
         };
         let lines = BorderedRenderer::lines(std::slice::from_ref(&m), 20, true);
@@ -2671,7 +3055,10 @@ mod tests {
     #[test]
     fn split_panel_overlay_renders_inside_the_boxed_split() {
         let mut m = split_msg();
-        m.overlay = Some("applying…".into());
+        m.overlay = Some(Overlay {
+            text: "applying…".into(),
+            always: false,
+        });
         let lines = BorderedRenderer::lines(std::slice::from_ref(&m), 80, true);
         assert_eq!(
             lines.len(),
@@ -2686,6 +3073,10 @@ mod tests {
             flat.contains("applying"),
             "the ask/status seam draws inside the split box"
         );
-        assert!(flat.contains("allow"), "the overlay prompt row is present");
+        assert!(
+            flat.contains("[y]es"),
+            "the dialog's key prompt is present, and with no `always` offered — \
+             nothing about a split panel's status note is worth remembering"
+        );
     }
 }

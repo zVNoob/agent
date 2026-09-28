@@ -15,6 +15,15 @@
 --            startup — so work inside this repository asks nothing, and
 --            everything outside it asks.
 --
+--            …except a write to a name **nothing holds yet**. Creating is not
+--            asking: there is nothing to disturb and nothing to lose, and a
+--            prompt per created file trains the user to stop reading prompts.
+--            The new name is then write-trusted, so the create and its follow-up
+--            edits are one decision. An *overwrite* still asks, and the test is
+--            `os.rename(p, p)` on the resolved path — which succeeds on a file
+--            the process cannot even read, so a name that exists cannot be
+--            mistaken for one that does not.
+--
 --   connect  the process want to access {hostname} ({IP}) at port {port}
 --            The target it wants to *reach*. The hostname is a reverse lookup and
 --            is dropped when there is none; the address is the ground truth.
@@ -24,10 +33,52 @@
 --            names no address, it only marks an already-bound socket as
 --            accepting, so there is nothing to ask about.)
 --
+--   chmod    the process want to change the mode of {path}
+--   fchmodat the same, for the path form
+--            Metadata, not content, and still a permission change: `chmod +x` is
+--            how a payload becomes runnable. Write trust, the same table an
+--            overwrite asks on. (`fchmod` is not in the mask — it names no path,
+--            and holding a descriptor on a file already cost a grant.)
+--
+--   setxattr the process want to set the {attribute} of {path}
+--   lsetxattr the same, without following a final symlink
+--   removexattr / lremovexattr the same, removing
+--            `security.*` is what file capabilities are, and setting one can make
+--            a file run with privileges the agent was never given — `setcap`, and
+--            `setcap -r` through the remove calls. The attribute name is in the
+--            question, so `security.capability` reads differently from `user.*`.
+--            The getters are not gated; a read of one says little and asking
+--            about it would be noise.
+--
 --   sendto   the process want to send to {hostname} ({IP}) at port {port}
 --            UDP egress, which is `connect` without a handshake: a datagram
 --            leaves and the peer never replies, so nothing downstream would ever
 --            notice. It is in the mask for exactly that reason.
+--
+--   unlinkat  the process want to delete {path}
+--            Removing a name, asked on **write** trust: unlinking is not reading
+--            the file, it is the removal of the name. This is the gate that makes
+--            `rm` ask, and the file's contents are never read to answer it.
+--
+--   renameat  the process want to move {from} to {to}
+--   renameat2 the same, with flags
+--            Two questions, because a rename is two things. The source is asked
+--            first — without it the move does not happen. The target is asked
+--            **only when it already exists**, which is the difference between
+--            creating a name (already covered by the source) and destroying
+--            somebody else's.
+--
+--            Both names are gated because only one of them is ever called:
+--            glibc's `rename()` is `renameat2` now, so `mv` never reaches
+--            `renameat`. One without the other would look right and do nothing.
+--
+-- Note what is *not* in the mask on the filesystem side: `mkdirat` and `rmdir`.
+-- A new directory is therefore created without a question (which is what the
+-- rule above would conclude anyway), and `rm -r` reaches the gate through
+-- `unlinkat` on each name, one question per name. `linkat` and `symlinkat` are
+-- absent too, and are a real gap rather than a decision: a sandboxed command can
+-- hard-link or symlink inside a directory you have trusted. They are the next
+-- thing to add if you want them, and the shape is the `unlinkat` callback above.
 --
 -- Everything *not* named above is not intercepted at all — it runs straight
 -- through the kernel under its default (allow). So read this as what it is: a
@@ -36,6 +87,16 @@
 -- the host's network namespace; `ss` or `/proc/net/tcp` will list every listener
 -- on the machine, and anything bound to 127.0.0.1 that a command can guess is
 -- reachable. Asking is not confining.
+--
+-- That is the design, not a gap in it. The decision belongs to the user at the
+-- moment it matters, so the job here is to make the question answerable — name
+-- the path, or the host and the port, and offer `always` when there is something
+-- to remember — and then get out of the way. A policy that decided on its own
+-- what a command may do would be a different product with a different failure
+-- mode, so this one does not do that.
+--
+-- What it does provide is a floor under every decision it *does* make: a denied
+-- syscall is refused by the kernel, not by this table's opinion.
 --
 -- ## What "always" remembers
 --
@@ -82,16 +143,65 @@ local function reach_question(what, addr)
          " at port " .. tostring(sc.port_of(nil, addr) or "?")
 end
 
+--- Does something already hold this name?
+---
+--- `os.rename(p, p)` is the probe, and it is here rather than `io.open` for one
+--- reason. `io.open` follows the name and fails on anything the process may not
+--- *read*, so `/etc/shadow` — which very much exists — reads as absent, and
+--- absent is the one answer that skips the ask. Renaming a path onto itself is a
+--- documented no-op that succeeds exactly when the name is taken, whatever its
+--- mode and whoever owns it, and it costs no process.
+---
+--- Two failures do read as "not taken", and both are safe because the create
+--- cannot succeed anyway: a name below something that is not a directory
+--- (ENOTDIR), and a name whose parent may not be written (EACCES). The sandbox
+--- is a bare `fork()` with no `unshare`, so the command runs with the user's own
+--- permissions — there is no case where the gate is skipped and the write then
+--- lands.
+local function taken(path)
+  if type(path) ~= "string" or path == "" then return false end
+  return os.rename(path, path) ~= nil
+end
+
 local policy = {}
 
--- Every open is asked, read or write. The tty probe is bash checking whether it
--- has a terminal, not a file the user means, and asking about it would interrupt
--- the first syscall of every command.
+-- Every open is asked, read or write — with one exception, below. The tty probe
+-- is bash checking whether it has a terminal, not a file the user means, and
+-- asking about it would interrupt the first syscall of every command.
 policy.openat = function(sys)
   local flags = sc.arg(sys, "openat")
   if sc.is_tty_probe(flags) then return true end
   local path = sc.path(sys)
   if sc.check("openat", flags, "WRITE") then
+    -- **Creating** something new is not a question. Nothing is there to disturb
+    -- and nothing can be lost, so the alternative is a prompt before every file
+    -- the agent ever makes — and the cost of that is not a pause, it is a user
+    -- who stops reading the questions and starts pressing `a`.
+    --
+    -- The name is then recorded as write-trusted, so the create and the edits
+    -- that follow it are one decision rather than one per write. That also
+    -- silences *reads* of it, because `trust_write` records both tables — which
+    -- is right for a file the agent just made and is not true in general.
+    --
+    -- What this does not do is make an overwrite silent. `taken` is the whole
+    -- difference, and it is asked of the *resolved* path: a symlink to an
+    -- existing file resolves to that file, which is taken, so it asks. The same
+    -- resolution runs on every later write, so swapping a created file for a
+    -- symlink makes the next write ask about the symlink's target rather than
+    -- quietly following it.
+    --
+    -- …unless the name is inside a **read-only** grant, which is where the
+    -- system tree lives. "You may look here" is not "you may make things here",
+    -- and `/usr` is the case that proves it: without this the create rule would
+    -- let the agent drop a file into the system tree without a word, which is
+    -- the opposite of what granting it read-only meant. A working directory is
+    -- granted with `trust` and so is unaffected — work there still creates
+    -- quietly, as it must.
+    if not taken(path) and not ask.is_readonly(path)
+       and not ask.is_blocked(path) then
+      ask.trust_write(path)
+      return true
+    end
     return ask.ask_trust_write(
       path,
       "The process want to write " .. tostring(path) .. " (" ..
@@ -119,11 +229,122 @@ policy.bind = function(sys)
     " on " .. sc.describes_addr(addr))
 end
 
+-- Changing a file's mode. Metadata rather than content, but it is a permission
+-- change, and `chmod +x` is how a payload becomes runnable — so it asks on
+-- **write** trust, the same table an overwrite asks on.
+--
+-- `fchmod` is deliberately *not* in the mask. It takes a descriptor and no path,
+-- so there is nothing to name in a question, and reaching it means the process
+-- already holds an open descriptor on the file — which cost it read or write
+-- trust when it opened it. The path-based pair is what can be asked about, and
+-- the descriptor-based one is the narrow remainder of that same grant.
+local function ask_change_mode(sys)
+  local path = sc.path(sys)
+  return ask.ask_trust_write(
+    path, "The process want to change the mode of " .. tostring(path))
+end
+
+policy.chmod = ask_change_mode
+policy.fchmodat = ask_change_mode
+
+-- An extended attribute is metadata the filesystem does not otherwise expose,
+-- and `security.*` on it is what file capabilities are: setting one can turn an
+-- ordinary file into one that runs with privileges the agent was never given.
+-- That is `setcap`, and it is a permission change wearing a different hat.
+--
+-- The attribute's name is the second path, so the question names it — being told
+-- a `security.capability` is going onto a file is a different thing from being
+-- told an app is tidying up its own `user.*` metadata. `removexattr` is gated for
+-- the same reason: `setcap -r` goes through it.
+--
+-- The *getters* are not gated. Reading `security.capability` says whether a file
+-- has capabilities and nothing more, and gating reads would add a question to
+-- every program that inspects its own metadata for reasons of its own.
+local function ask_xattr(sys, verb)
+  local path, name = sc.path(sys, 1), sc.path(sys, 2)
+  return ask.ask_trust_write(
+    path,
+    "The process want to " .. verb .. " the " ..
+    (type(name) == "string" and name or "extended attributes") ..
+    " of " .. tostring(path))
+end
+
+policy.setxattr = function(sys) return ask_xattr(sys, "set") end
+policy.lsetxattr = function(sys) return ask_xattr(sys, "set") end
+policy.removexattr = function(sys) return ask_xattr(sys, "remove") end
+policy.lremovexattr = function(sys) return ask_xattr(sys, "remove") end
+
 -- UDP egress: the same question, and the same gate, for a datagram.
 policy.sendto = function(sys)
   local addr = sc.addr(sys)
   local host, port = server_key(addr)
   return ask.ask_server(host, port, reach_question("send to", addr))
 end
+
+-- Deleting a name. Gated on **write** trust in the path, not read: unlinking is
+-- not a read of the file, it is the removal of the name, and a path trusted for
+-- reading is trusted for nothing else. The same table `openat`'s write branch
+-- uses, so a directory trusted to be written to does not need a second grant for
+-- its files to be deletable.
+--
+-- This is what makes `rm` ask. It is also the only gate on the name itself: the
+-- file's *contents* are never read to answer it, so the question is about the
+-- path and nothing leaks about what is in it.
+policy.unlinkat = function(sys)
+  local path = sc.path(sys)
+  return ask.ask_trust_write(
+    path, "The process want to delete " .. tostring(path))
+end
+
+-- Moving a name. Two questions, because a rename is two things at once: the
+-- source stops existing under its own name, and — only when something is already
+-- there — the target's contents are destroyed by the arrival. The source is
+-- asked first, since without it the move does not happen at all.
+--
+-- The target is asked *only if it exists*, and that is not a shortcut: a rename
+-- onto a name nobody holds creates it, which is the source's permission already
+-- spoken for, whereas a rename onto a name somebody holds overwrites them. The
+-- existence test is `io.open` on the target, which follows symlinks — so a
+-- *dangling* symlink reads as absent and its replacement is not asked about.
+-- Lua 5.1 has no `lstat`, and a second process to ask the question properly
+-- would be a worse trade than naming the gap.
+local function ask_rename(sys)
+  local from, to = sc.path(sys, 1), sc.path(sys, 2)
+  if type(from) ~= "string" or from == "" then
+    return ask.deny("the move named no source path")
+  end
+  local moved = ask.of(
+    ask.ask_trust_write(
+      from, "The process want to move " .. from .. " to " .. tostring(to)))
+  if not moved then
+    return ask.deny("the move of " .. from .. " was not allowed")
+  end
+  if type(to) == "string" and to ~= "" then
+    local existing = io.open(to, "rb")
+    if existing then
+      existing:close()
+      local overwrote = ask.of(
+        ask.ask_trust_write(
+          to, "The process want to overwrite " .. to .. " by moving " .. from))
+      if not overwrote then
+        return ask.deny("overwriting " .. to .. " was not allowed")
+      end
+    end
+  end
+  return true
+end
+
+-- `renameat2` is the *same* operation with a flags argument, and it is the one
+-- that actually gets issued: glibc's `rename()` maps onto it, so `mv` on this
+-- machine never reaches `renameat` at all. Gating only `renameat` would have
+-- looked correct and left every real `mv` ungated, so both are in the mask.
+--
+-- The cost is a second round of questions for `mv -f` onto a name that already
+-- exists: coreutils first tries `RENAME_NOREPLACE`, the kernel answers EEXIST,
+-- and it retries as a plain `renameat`. The retry asks again, because a plain
+-- `yes` is remembered for one operation by design. `always` records both paths
+-- and the retry is silent.
+policy.renameat = ask_rename
+policy.renameat2 = ask_rename
 
 return policy

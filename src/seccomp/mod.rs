@@ -11,7 +11,7 @@
 //! intercepts each syscall *before it runs* and decides what to do:
 //!
 //! - [`Verdict::Allow`]  → reply `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, run normally
-//! - [`Verdict::Deny(e)`] → spoof an `errno` error return to the target
+//! - [`Verdict::Deny`]    → spoof the `errno` it carries as the error return
 //! - [`Verdict::Ask`]     → do NOT reply yet: the syscall stays frozen while
 //!   control is yielded back to the driver (see [`Sandbox::step`]); the driver
 //!   later calls [`Sandbox::resolve_ask`] to thaw it.
@@ -33,7 +33,7 @@
 //! *yield* — the suspension point where control hands back to the driver —
 //! never a final answer. Because a delivered `Deny` is final, it kills the
 //! whole tree in **both** delivery paths: the immediate decider path
-//! ([`Sandbox::handle_notification`]) and the frozen-ask path
+//! (`Sandbox::handle_notification`) and the frozen-ask path
 //! ([`Sandbox::resolve_ask`]); an `Allow` in the ask path thaws the tree with
 //! SIGCONT.
 //!
@@ -47,7 +47,7 @@
 //! unread notifications can't busy-spin it either. There is no per-sandbox
 //! polling anywhere.
 //!
-//! Process topology (same idea as `test_trace.rs`, the strace-mode reference):
+//! Process topology:
 //!
 //! 1. parent: `pipe2` ×2 (stdout, stderr) + `socketpair(AF_UNIX, STREAM|CLOEXEC)`
 //!    + `fork`
@@ -62,7 +62,7 @@
 //! Notes:
 //! - every descendant inherits the filter (it cannot be removed), so EOF on
 //!   the listener (`POLLHUP` / `ENOENT`) means the *whole tree* is gone.
-//! - RECV is poll-gated: [`Sandbox::handle_notification`] confirms with a
+//! - RECV is poll-gated: `Sandbox::handle_notification` confirms with a
 //!   zero-timeout `poll` that a notification is actually queued (or the
 //!   filter gone) before `NOTIF_RECV`, which can only return a real
 //!   notification or `ENOENT` — never block. This is required because a poll
@@ -634,7 +634,7 @@ fn resolve_program(program: &str) -> Result<PathBuf> {
 impl Sandbox {
     /// Set up the sandbox: the seccomp filter traps the syscalls named in
     /// `named` with `SECCOMP_RET_USER_NOTIF` — **always plus the
-    /// [`FORK_FAMILY`]**, which is masked unconditionally at the engine level
+    /// `FORK_FAMILY`**, which is masked unconditionally at the engine level
     /// (pid bookkeeping, the fork counter, and kill-on-deny all require
     /// intercepting forks) — and everything else runs straight through the
     /// kernel under its default (allow) without ever reaching the supervisor.
@@ -831,7 +831,7 @@ impl Sandbox {
     ///
     /// `listener_revents` must be the poll(2) result for this sandbox's
     /// listener fd (`0` if the listener was not ready or not registered).
-    /// RECV is poll-gated: [`Sandbox::handle_notification`] runs a zero-timeout
+    /// RECV is poll-gated: `Sandbox::handle_notification` runs a zero-timeout
     /// `poll` first (`POLLIN` ⇒ a notification is queued; `POLLHUP` ⇒ the
     /// filter died, RECV answers `ENOENT`), so step never sleeps and the
     /// poll loop alone still gates notification work. Returns:
@@ -982,7 +982,7 @@ impl Sandbox {
         out
     }
 
-    /// Diagnostic: one-line summary of the engine's own state (see [`probe`]).
+    /// Diagnostic: one-line summary of the engine's own state (see [`Sandbox::probe`]).
     pub fn state_desc(&self) -> String {
         format!(
             "tree_done={} pending={} out_eof={} err_eof={} stdin_closed={} stdin_q={} forks={} syscalls={} denied={} pids={}",
@@ -1042,7 +1042,7 @@ impl Sandbox {
 
     /// Close the per-run stdin pipe's write end: the tracee's next `read(0)`
     /// will see EOF once every copy of the write end is gone (the async
-    /// driver also drops its dup'd [`AsyncFd`]-owned copy).
+    /// driver also drops its dup'd [`AsyncFd`](tokio::io::unix::AsyncFd)-owned copy).
     pub fn close_stdin(&mut self) {
         if self.stdin_w >= 0 {
             unsafe {
@@ -1082,13 +1082,13 @@ impl Sandbox {
 
     /// Snapshot of every pid seen in the tree so far. The root child is
     /// always present; fork/clone children appear once they make their first
-    /// post-fork syscall (each is captured by [`Sandbox::handle_notification`]).
+    /// post-fork syscall (each is captured by `Sandbox::handle_notification`).
     pub fn pids(&self) -> Vec<libc::pid_t> {
         self.pids.iter().copied().collect()
     }
 
     /// fork()/clone()/vfork()/clone3() syscalls observed so far (the fork
-    /// hook; see [`Sandbox::handle_notification`]).
+    /// hook; see `Sandbox::handle_notification`).
     pub fn forks(&self) -> u64 {
         self.forks
     }
@@ -1129,7 +1129,7 @@ impl Sandbox {
     /// sibling *threads inside the asker's own process* are the one
     /// unreachable residual. Best-effort, like [`Sandbox::freeze`]: the stop
     /// is acknowledged (targets are polled in `/proc/<pid>/stat` until they
-    /// report `T`, bounded by [`FREEZE_ACK_TIMEOUT`]), because SIGSTOP's stop
+    /// report `T`, bounded by `FREEZE_ACK_TIMEOUT`), because SIGSTOP's stop
     /// transition lands on a scheduler tick. Thaw with [`Sandbox::resume`],
     /// typically via [`Sandbox::resolve_ask_frozen`]. Returns how many pids
     /// were actually stopped (0 means nothing was frozen, so the completion
@@ -1190,7 +1190,7 @@ impl Sandbox {
     /// The Lua-bridge verdict delivery for a tree frozen with
     /// [`Sandbox::freeze_others`]: answer the pending ask, and on `Allow`
     /// keep the siblings frozen until the allowed syscall has executed
-    /// ([`Sandbox::wait_completion`], bounded by [`COMPLETION_WAIT_MAX`])
+    /// ([`Sandbox::wait_completion`], bounded by `COMPLETION_WAIT_MAX`)
     /// before thawing — closing the TOCTOU window between the policy's path
     /// check and the kernel's own resolution. On `Deny` the whole tree is
     /// SIGKILLed inside [`Sandbox::resolve_ask`]; nothing is thawed.
@@ -1205,7 +1205,7 @@ impl Sandbox {
     }
 
     /// SIGKILL the whole captured tree. Runs automatically when a
-    /// [`Verdict::Deny`] is delivered ([`Sandbox::handle_notification`]) or
+    /// [`Verdict::Deny`] is delivered (`Sandbox::handle_notification`) or
     /// answered ([`Sandbox::resolve_ask`]), and from the destructor so a
     /// dropped [`Sandbox`] never leaves a live process tree behind.
     ///

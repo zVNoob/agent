@@ -141,16 +141,33 @@ end
 -- table that answers its own question and nothing else: `is_trusted` asks
 -- "trusted at all?", `is_write_trusted` asks "writable?".
 --
--- The tables live on the agent's own VM, and a tool call runs *on* that VM (as
--- a coroutine the event loop drives, see `agent.ask.drive_tool`'s replacement
--- `ToolRun` in `src/lua.rs`), so a path trusted while answering one question is
--- remembered by every later call. They are still per *process*, not per session:
--- they do not outlive the agent, and `/reload` does not clear them (it reloads
--- the config on the same VM).
+-- The tables live on the agent's own VM, and a tool call runs *on* that VM — a
+-- Lua coroutine the event loop steps, `ToolRun` in `src/lua.rs` — so a path
+-- trusted while answering one question is remembered by every later call. They
+-- are still per *process*, not per session: they do not outlive the agent, and
+-- `/reload` does not clear them (it reloads the config on the same VM).
 -- ==========================================================================
 local trust_tables = {
   general = {},
   write = {},
+  -- Granted to be *looked at* and nothing else. The system tree lives here, and
+  -- the distinction earns its own table: the general table is what a working
+  -- directory is granted with, and a create inside that must stay silent, while
+  -- a create inside a read-only grant must not be. Both are "trusted to read",
+  -- and only one of them is allowed to imply "may make things here".
+  readonly = {},
+  -- Paths that are *excluded*, whatever a grant above says. The other three are
+  -- permissive by construction — a directory grant covers its whole subtree, so
+  -- trusting a working directory trusts everything under it — and without a
+  -- negative there is no way to carve anything back out. `trust(cwd)` followed by
+  -- `forget(cwd .. "/.env")` is the shape that needs it: the second call used to
+  -- drop nothing, report success, and leave the file exactly as trusted as
+  -- before.
+  --
+  -- Consulted *first* by every reader, and a floor rather than a preference:
+  -- nothing can be granted over a block, so the order a config writes its grants
+  -- in does not decide the answer.
+  blocked = {},
 }
 
 -- The home directory, for a leading `~`.
@@ -242,12 +259,8 @@ end
 -- creation of the file, so the path is asked about precisely because it does
 -- not exist yet. With nothing to look at, the narrow reading is the honest one;
 -- a directory that does not exist yet is trusted by trusting its parent.
-local function record(into, path)
-  local full = resolve(path)
-  into[full] = { path = full, dir = exists(full) and is_dir(full) }
-  return full
-end
-
+--- Is `path` excluded? Declared before `record` because `record` refuses to
+--- grant over a block, and that refusal is the whole reason a block holds.
 -- Is `path` in this one table? Accepts the same shapes as `trust`, and does
 -- not require the path to exist: it answers for the path as given, which is
 -- what a policy callback holding a syscall's path needs.
@@ -272,6 +285,49 @@ local function drop(into, path)
   if into[full] == nil then return false end
   into[full] = nil
   return true
+end
+
+local function is_blocked(path)
+  if type(path) ~= "string" or path == "" then return false end
+  return in_one(trust_tables.blocked, path)
+end
+
+--- Lift a block on *exactly* this path — not one inherited from a blocked
+--- directory. `true` when a block was there.
+---
+--- Separate from `drop` because the distinction is the whole semantics: naming a
+--- path lifts the marker on that path, and nothing else.
+local function unblock_exact(path)
+  if type(path) ~= "string" or path == "" then return false end
+  local full = resolve(path)
+  if trust_tables.blocked[full] == nil then return false end
+  trust_tables.blocked[full] = nil
+  return true
+end
+
+local function record(into, path)
+  local full = resolve(path)
+  if into ~= trust_tables.blocked then
+    -- A block is a **preference**, not a floor: trusting a path that carries one
+    -- of its own means "this one after all", so the block is lifted and the
+    -- grant stands. Re-trusting is the natural way to change your mind, and
+    -- making the block un-overridable would mean a second mechanism for the same
+    -- job.
+    --
+    -- Exact, though, and that is the load-bearing word. A block on a *directory*
+    -- is a statement about a tree, so naming something inside it does not lift
+    -- it: `block("/a")` then `trust("/a/b")` is still refused, because the only
+    -- way to say "not in this tree" is to say it about the tree. Lift the
+    -- directory block itself, or grant the whole tree instead.
+    if trust_tables.blocked[full] ~= nil then
+      trust_tables.blocked[full] = nil
+    elseif is_blocked(full) then
+      error("agent.ask: '" .. full .. "' is inside a blocked path, so it cannot " ..
+            "be trusted — unblock that path, or block nothing", 3)
+    end
+  end
+  into[full] = { path = full, dir = exists(full) and is_dir(full) }
+  return full
 end
 
 -- One table, listed: `{ { path = ..., dir = ... }, … }`, sorted by path.
@@ -302,6 +358,73 @@ function M.trust(path)
   return record(trust_tables.general, path)
 end
 
+--- Trust a path to be *read* and nothing more: a grant to look, never to
+--- create, write, delete or move anything under it.
+---
+--- This is the table the dynamic linker lives in — `/usr`, `/lib`,
+--- `/etc/ld.so.cache` — because a cold command otherwise asks once per shared
+--- library and once per locale file, dozens of times before it does any work.
+--- It is separate from `trust` because "you may look here" and "you may make
+--- things here" are different promises, and only the first is true of a system
+--- directory. Returns the absolute path it resolved to.
+function M.trust_readonly(path)
+  return record(trust_tables.readonly, path)
+end
+
+--- Is `path` inside a read-only grant? A policy asks this before treating a
+--- write as a harmless create: inside `/usr`, making a new file is not a
+--- harmless thing to do without asking, however empty the name is.
+function M.is_readonly(path)
+  if is_blocked(path) then return false end
+  return in_one(trust_tables.readonly, path)
+end
+
+--- Take a read-only grant back. `true` when something was there.
+function M.forget_readonly(path)
+  return drop(trust_tables.readonly, path)
+end
+
+--- Exclude a path, whatever a grant above it says. A directory blocks its whole
+--- subtree, on a `/` boundary, exactly as a trust does.
+---
+--- This is the negative the other three tables need: a directory grant is
+--- permissive by construction, so `trust(cwd)` trusts everything under it and
+--- there is otherwise no way to take anything back out. `forget` below reaches
+--- the same place, and does this when there is no entry of its own to drop.
+---
+--- A block is a **preference**, so trusting a path that carries one of its own
+--- lifts it — see `record`. That makes this the wrong spelling for "not this one
+--- for now" if something later trusts the same path on its own; it is the right
+--- one for "not in this tree".
+---
+--- Returns the resolved path, or `nil` when there was already a block on exactly
+--- this path. A path *inside* an already-blocked directory is still recorded,
+--- because the entry is what `trust` has to find in order to lift it.
+function M.block(path)
+  local full = resolve(path)
+  if trust_tables.blocked[full] ~= nil then return nil end
+  return record(trust_tables.blocked, full)
+end
+
+--- Lift a block. `true` when one was there on exactly this path. A path is not
+--- trusted again by this — it simply stops being excluded, so whatever grant
+--- covers it applies as it always did. Lifting a *directory* block is the way to
+--- un-exclude a tree; a block nested inside one is lifted on its own.
+function M.unblock(path)
+  return unblock_exact(path)
+end
+
+--- Is this path excluded, by its own block or by one around it? Every reader
+--- consults this first, and a block is never overridden by a grant.
+function M.is_blocked(path)
+  return is_blocked(path)
+end
+
+--- The blocks, listed in the same shape as the trust tables.
+function M.blocked_paths()
+  return listing(trust_tables.blocked)
+end
+
 --- Trust a path for *writing* — which implies trusting it, so this records it
 --- in both tables. Returns the absolute path it resolved to.
 function M.trust_write(path)
@@ -313,19 +436,56 @@ end
 --- May the agent be at this path at all? The general table only — which is what
 --- an ask consults, and what a policy asks when the mode bits are not the point.
 function M.is_trusted(path)
-  return in_one(trust_tables.general, path)
+  if is_blocked(path) then return false end
+  -- A read-only grant counts: this is the question "may the agent be *at* this
+  -- path at all", and a path granted to be looked at is a path it may look from.
+  -- What a read-only grant does *not* answer is the next question down,
+  -- `is_write_trusted` — that one is the write table alone, and keeping it so
+  -- is what makes the loader grant read-only.
+  return in_one(trust_tables.general, path) or in_one(trust_tables.readonly, path)
 end
 
 --- May the agent *write* here? The write table only — a strictly narrower
 --- question, which is why it is a separate reader.
 function M.is_write_trusted(path)
+  if is_blocked(path) then return false end
   return in_one(trust_tables.write, path)
 end
 
 --- Stop trusting a path, in both tables. `true` when either had it.
+---
+--- When the path has **no entry of its own** this carves it out instead, by
+--- blocking it. That is what makes the obvious pair work:
+---
+---   agent.ask.trust(cwd)            -- the whole working directory
+---   agent.ask.forget(cwd .. "/.env") -- except this
+---
+--- A directory grant covers its subtree, so there is no entry for `.env` to drop
+--- — the second call used to remove nothing, report success, and leave the file
+--- exactly as trusted as before. A caller asking to stop trusting a path wants it
+--- untrusted; how that is achieved is the module's business, and the answer has
+--- to be a block because nothing else can express "trusted by inheritance, not
+--- by me".
+---
+--- `true` means something changed: an entry of its own was dropped, or a block
+--- was stood in front of an enclosing grant. Calling it twice is not an error
+--- and leaves nothing behind — the second call finds no entry *and* nothing
+--- trusted, and does neither thing.
+---
+--- `forget_write` is the narrow revocation and is *not* widened this way: there,
+--- "there was no write grant" is a real answer about a real state, and it is
+--- what `fs.hand_to_user` reports on.
 function M.forget(path)
   local hit = drop(trust_tables.general, path)
-  return drop(trust_tables.write, path) or hit
+  if drop(trust_tables.write, path) or hit then return true end
+  -- No entry of its own. If it is not trusted at all, there is nothing to do —
+  -- this is the "forgetting twice" case, and blocking here would leave a deny
+  -- entry behind that made a later `trust` of the same path fail.
+  if not M.is_trusted(path) then return false end
+  -- Trusted, but only by inheritance from a directory grant. That is the case
+  -- that needs the block, and the only thing that can express it.
+  M.block(path)
+  return true
 end
 
 --- Stop trusting a path as a write, leaving the general trust alone: the narrow
@@ -344,6 +504,13 @@ end
 --- The write table, listed: `{ { path = ..., dir = ... }, … }`, sorted.
 function M.trusted_write_paths()
   return listing(trust_tables.write)
+end
+
+--- The read-only table, listed in the same shape. The three lists are separate
+--- on purpose: `trusted_paths()` cannot tell you that `/usr` is a promise not to
+--- write, and that difference is the whole reason it is its own table.
+function M.trusted_readonly_paths()
+  return listing(trust_tables.readonly)
 end
 
 --- Forget everything, both tables (a test hook, and an escape hatch).
@@ -480,9 +647,29 @@ end
 -- a narrower question than "may I be here".
 --
 -- Must be called from inside a coroutine: one `agent.bash` creates for a policy
--- callback, or one `ask.drive_tool` creates for a tool callback. Anywhere else
--- the yield is refused and this says so.
-local function raise_ask(ask)
+-- callback, and one `ToolRun` (src/lua.rs) for a tool callback. Anywhere else the
+-- yield is refused and this says so.
+--
+-- `panel` is where the question is *drawn*, and it is the whole difference
+-- between a question and no question at all. A bare yield reaches the loop,
+-- which remembers that something is outstanding so a key press can be read as a
+-- verdict — and the loop draws nothing, because the design assumption was that
+-- every ask arrives through `panel:ask` and puts its own dialog up. An ask
+-- without a panel therefore asks a question nobody can see: the agent sits
+-- waiting, the input hint still reads "Enter sends", and `y` would answer
+-- something invisible. That is what the four file tools did, and the shell does
+-- not, because `bash_tool.lua` hands `s:run` a handler that asks on its panel.
+local function raise_ask(ask, panel)
+  -- A panel that cannot host a dialog (no `ask`) is not a reason to skip the
+  -- question — fall through to the bare yield, which is still better than
+  -- deciding on the user's behalf.
+  if type(panel) == "table" and type(panel.ask) == "function" then
+    -- `panel:ask` yields the same `{ description, always }` the bare yield
+    -- would, so the driver cannot tell the two apart; off the reactor it asks
+    -- through `agent.api.ask_user` and the VM's handler instead, so headless
+    -- runs and the tests behave exactly as before.
+    return panel:ask(ask.description, ask.always == true)
+  end
   -- LuaJIT lets a yield cross a pcall boundary, so wrapping it buys a clear
   -- error for the "asked from the wrong context" case.
   local ok, verdict = pcall(coroutine.yield, ask)
@@ -653,14 +840,16 @@ end
 -- Ask the user. Yields the ask table and returns the verdict the driver
 -- accepts: `true`, or a denial carrying its reason.
 --
--- Must be called from inside a policy callback — see `raise_ask`.
-function M.ask(what, extra)
+-- Must be called from inside a policy callback — see `raise_ask`. `panel`, when
+-- given, is where the question is drawn; see `raise_ask` for why that is not
+-- optional in practice.
+function M.ask(what, extra, panel)
   local ask = M.build(what, extra)
   -- A trusted path answers itself: the user has already vouched for it, in this
   -- config or in an earlier question this same run asked them. Write-trust
   -- counts — it implies the general trust that `trust_write` also records.
   if ask.path and M.is_trusted(ask.path) then return true end
-  local verdict = raise_ask(ask)
+  local verdict = raise_ask(ask, panel)
   -- "Always allow this": the answer carries the instruction to remember, and
   -- the asking side is the only one that knows the path — so the remembering
   -- happens here, where the ask table still has it. A verdict that says to
@@ -683,7 +872,7 @@ end
 --
 -- The ask is raised *unconditionally* once the answer is "not yet trusted", so
 -- the write variant really does ask when a path is trusted for reading only.
-local function ask_maybe_remember(path, msg, what, write)
+local function ask_maybe_remember(path, msg, what, write, panel)
   local full = resolve(path, write and "ask_trust_write" or "ask_trust_read")
   -- Which table answers is the whole difference between the two questions, so
   -- this is an if and not `write and a or b`: with the `and/or` idiom a *write*
@@ -705,7 +894,7 @@ local function ask_maybe_remember(path, msg, what, write)
   -- `always` is on offer: there is a path here, and remembering it is what the
   -- third answer means.
   local ask = M.build({ description = text, path = full, always = true })
-  local verdict = raise_ask(ask)
+  local verdict = raise_ask(ask, panel)
   local allowed, reason = M.of(verdict, text)
   if not allowed then return denial(reason) end
   if type(verdict) == "table" and verdict.trust then
@@ -725,15 +914,15 @@ end
 --- start with `~`; `msg` is the question (a default naming the path is used when
 --- it is missing). Returns `true`, or a denial carrying its reason — so a
 --- policy can `return` it straight from a callback, exactly like `ask`.
-function M.ask_trust_read(path, msg)
-  return ask_maybe_remember(path, msg, "reading", false)
+function M.ask_trust_read(path, msg, panel)
+  return ask_maybe_remember(path, msg, "reading", false, panel)
 end
 
 --- The same, for *writing* — a narrower question, so a path trusted for reading
 --- is still asked about. An "always" here is remembered as write-trust, in both
 --- tables, and can be taken back on its own with `forget_write`.
-function M.ask_trust_write(path, msg)
-  return ask_maybe_remember(path, msg, "writing", true)
+function M.ask_trust_write(path, msg, panel)
+  return ask_maybe_remember(path, msg, "writing", true, panel)
 end
 
 -- Drive a stream to completion, answering its asks. Without a handler an
@@ -945,6 +1134,73 @@ function M._selftest()
       M.forget("definitely/not/here")
     end
 
+    -- The blocklist, and the pair it exists for: a directory grant plus an
+    -- exclusion inside it. Before there was a block, `forget` on a subpath of a
+    -- trusted directory dropped nothing and reported success, so the file stayed
+    -- exactly as trusted as before.
+    -- `/usr` and `/tmp` because they are really there: a path that is *not*
+    -- there is recorded as a file and covers no subtree, which is the rule
+    -- above this section and not something to rediscover here.
+    M.forget_all()
+    M.trust("/tmp")
+    assert(M.is_trusted("/tmp/ask-secret.env"), "the directory covers it")
+    assert(M.forget("/tmp/ask-secret.env"), "and forgetting the file works")
+    assert(not M.is_trusted("/tmp/ask-secret.env"), "so it is not trusted")
+    assert(not M.is_write_trusted("/tmp/ask-secret.env"), "nor write-trusted")
+    assert(M.is_trusted("/tmp/ask-other.txt"), "while its sibling still is")
+    assert(#M.blocked_paths() == 1, "and the block is listed")
+    -- A block is a preference: trusting the same path again means "this one
+    -- after all", so the block is lifted and the grant stands.
+    assert(M.trust("/tmp/ask-secret.env") == "/tmp/ask-secret.env",
+           "trusting a blocked path lifts the block and grants")
+    assert(not M.is_blocked("/tmp/ask-secret.env"), "and the block is gone")
+    assert(M.is_trusted("/tmp/ask-secret.env"), "and the path is trusted again")
+    M.block("/tmp/ask-secret.env")
+    assert(M.trust_write("/tmp/ask-secret.env") ~= nil, "and for writing too")
+    assert(not M.is_blocked("/tmp/ask-secret.env"), "same, for a write grant")
+
+    -- But *exact*. A block on a directory is a statement about a tree, so
+    -- naming something inside it does not lift it — that is the one case where a
+    -- grant is still refused, and it is refused loudly.
+    M.block("/usr")
+    assert(not pcall(M.trust, "/usr/lib/ask-inside-blocked.so"),
+           "a path inside a blocked directory cannot be trusted")
+    assert(M.is_blocked("/usr/lib/ask-inside-blocked.so"), "and stays blocked")
+    -- Naming the blocked directory itself is exact, so that one does lift.
+    assert(M.trust("/usr") == "/usr", "the blocked directory can be re-trusted")
+    assert(not M.is_blocked("/usr"), "and its block is lifted")
+
+    -- `unblock` is the explicit spelling of the same lift, and still reports
+    -- whether there was a block to lift. The re-trust above already cleared it.
+    assert(not M.unblock("/usr"), "unblocking twice reports nothing was there")
+    M.block("/usr")
+    assert(M.unblock("/usr"), "unblocking a block reports it lifted")
+    assert(not M.is_blocked("/usr"), "and it is gone")
+    -- Unblock is the explicit lift, and puts the enclosing grant back because it
+    -- was never revoked — only stood in front of. Re-blocked first: the
+    -- re-trust above already lifted this one, and an `unblock` with nothing to
+    -- lift is not a round trip.
+    M.block("/tmp/ask-secret.env")
+    assert(M.unblock("/tmp/ask-secret.env"), "unblocking reports it lifted")
+    assert(M.is_trusted("/tmp/ask-secret.env"), "and the grant applies again")
+    assert(not M.is_blocked("/tmp/ask-secret.env"), "and it is not blocked")
+    -- A blocked *directory* blocks its subtree, on a / boundary, like a trust.
+    M.block("/usr")
+    assert(M.is_blocked("/usr/lib/x86_64-linux-gnu/libc.so.6"), "subtree")
+    assert(not M.is_blocked("/usrfoo"), "but not a sibling sharing the prefix")
+    M.unblock("/usr")
+    -- Forgetting a path that is not trusted at all does nothing: no block is
+    -- left behind that would make a later trust of the same path fail. This
+    -- needs a clean slate — under the `/tmp` grant above, the path *is* trusted
+    -- by inheritance, so forgetting it is a real exclusion and says so.
+    M.forget_all()
+    assert(not M.is_trusted("/tmp/ask-never-trusted"), "nothing trusts it to start")
+    assert(not M.forget("/tmp/ask-never-trusted"), "so there is nothing to forget")
+    assert(not M.is_blocked("/tmp/ask-never-trusted"), "and no block left behind")
+    assert(M.trust("/tmp/ask-never-trusted") ~= nil, "so it can still be trusted")
+    M.forget_all()
+    assert(not M.is_blocked("/tmp/ask-secret.env"), "forget_all clears blocks too")
+
     -- The composed helpers: a trusted path answers itself, with no question at
     -- all. (That they *ask* otherwise needs a live coroutine, so the Rust tests
     -- drive those through a real sandbox.)
@@ -956,6 +1212,21 @@ function M._selftest()
     -- between the two helpers, and the reason the write one asks anyway.
     assert(M.is_trusted("/etc/hostname") and not M.is_write_trusted("/etc/hostname"),
            "declared trust is not write trust")
+
+    -- The read-only table: trusted to be at, never to write. This is the system
+    -- tree's grant, and the pair of questions below is the whole difference
+    -- between "you may read /usr" and "you may install into it".
+    M.trust_readonly("/usr")
+    assert(M.is_readonly("/usr"), "the grant is read-only")
+    assert(M.is_readonly("/usr/lib/x86_64-linux-gnu/libc.so.6"),
+           "and covers a file inside it")
+    assert(M.is_trusted("/usr"), "being there to look is still trusted")
+    assert(not M.is_write_trusted("/usr"), "but writing there is not trusted")
+    assert(not M.is_trusted("/usrfoo"), "and the / boundary still holds")
+    assert(#M.trusted_readonly_paths() == 1, "it is listed on its own")
+    assert(M.forget_readonly("/usr"), "and can be taken back")
+    assert(not M.is_readonly("/usr"), "which stops the read-only trust")
+
     -- Asking from outside a policy callback is refused, exactly as `ask` is.
     assert(not pcall(M.ask_trust_write, "/etc/hosts", "write it?"),
            "an ask outside a policy callback is refused")

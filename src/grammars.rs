@@ -238,7 +238,14 @@ pub struct Catalog {
     cache_dir: PathBuf,
     registry: Option<HashMap<String, RegistryEntry>>,
     loaded: HashMap<String, LoadedGrammar>,
+    /// Where progress goes. A cold language is a registry lookup, a tarball and
+    /// a C compile — seconds, not milliseconds — so a caller that has somewhere
+    /// to show that needs to be told about it. `None` means silent.
+    progress: Option<ProgressFn>,
 }
+
+/// A progress sink: one human-readable line per acquisition step.
+type ProgressFn = Box<dyn Fn(&str)>;
 
 impl Default for Catalog {
     fn default() -> Self {
@@ -263,6 +270,25 @@ impl Catalog {
             cache_dir,
             registry,
             loaded: HashMap::new(),
+            progress: None,
+        }
+    }
+
+    /// Report acquisition progress to `f` — one human-readable line per step,
+    /// already formatted. Returns `self` so it chains off [`Catalog::new`].
+    ///
+    /// A callback rather than a `StatusLine` so this module keeps no opinion
+    /// about screens: the TUI points it at the status bar, a headless binary
+    /// points it at stderr, and a test collects the strings.
+    pub fn with_progress(mut self, f: impl Fn(&str) + 'static) -> Self {
+        self.progress = Some(Box::new(f));
+        self
+    }
+
+    /// Say `msg` to the progress callback, if there is one.
+    fn report(&self, msg: impl AsRef<str>) {
+        if let Some(f) = &self.progress {
+            f(msg.as_ref());
         }
     }
 
@@ -311,22 +337,29 @@ impl Catalog {
                     return Ok(self.loaded.get(lang).unwrap());
                 }
                 Err(e) => {
-                    // Stale/broken cache: fall through to rebuild.
-                    eprintln!(
-                        "[grammars] cached {lang} unusable ({e:#}); rebuilding from the registry"
-                    );
+                    // Stale/broken cache: fall through to rebuild. This used to
+                    // be an `eprintln!`, which in the TUI printed into the
+                    // middle of the alternate screen.
+                    self.report(format!(
+                        "cached {lang} unusable ({e:#}); rebuilding from the registry"
+                    ));
                 }
             }
         }
 
         // 2) Registry entry.
+        self.report(format!("fetching {lang} grammar…"));
         let entry = self.registry_entry(lang).await?;
 
         // 3) Source tarball at the latest release tag.
+        self.report(format!("downloading {lang} source…"));
         let tag = latest_tag(&self.client, &entry.parser_url).await?;
         let archive = download_source(&self.client, &entry.parser_url, &tag).await?;
 
-        // 4) Extract + compile into a temp dir, then atomically swap in.
+        // 4) Extract + compile into a temp dir, then atomically swap in. The
+        //    compile is the slow part — a full C build of a generated parser —
+        //    so it gets its own line rather than sharing the download's.
+        self.report(format!("building {lang} parser…"));
         let build = self.cache_dir.join(format!(".{lang}.build"));
         let _ = fs::remove_dir_all(&build);
         fs::create_dir_all(&build)
@@ -559,6 +592,34 @@ fn read_opt(p: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The progress hook is a plain callback, so this covers the plumbing: a
+    /// message reaches it, and a catalogue without one is silent rather than a
+    /// panic.
+    ///
+    /// What it does *not* cover is which steps of `ensure` report — those are on
+    /// the network-and-C-compiler path, which no test here runs. The list of
+    /// `report` calls in `ensure` is the thing to read when a progress message
+    /// goes missing.
+    #[test]
+    fn progress_reports_to_a_callback_and_is_otherwise_silent() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let catalog = Catalog::new().with_progress(move |m| sink.lock().unwrap().push(m.into()));
+
+        catalog.report("building bash parser…");
+        catalog.report(format!("cached {lang} unusable; rebuilding", lang = "json"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["building bash parser…", "cached json unusable; rebuilding"],
+            "the callback sees each line, in order, as given"
+        );
+
+        // No callback installed: reporting is a no-op, not a panic. This is the
+        // path the probe and `chat` take.
+        Catalog::new().report("nobody is listening");
+    }
 
     #[test]
     fn parse_registry_keeps_parsers_and_drops_meta() {

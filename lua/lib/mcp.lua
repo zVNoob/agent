@@ -18,18 +18,99 @@
 -- hand-built one has (compare `lua/fs.lua`):
 --
 --     agent.mcps["my-server"] = agent.mcp("my-server", func)
---     local r = agent.mcps["my-server"].read_file({ path = "/etc/hostname" })
+--     local r = agent.mcps["my-server"].read({ path = "/etc/hostname" })
 --     -- r = { ok, result, error, denied }
 --
 -- Nothing here touches the filesystem or the sandbox; the sandbox policy for
 -- `func`-backed transports is the caller's business, stated as a local table
 -- at the `agent.bash` call site (see `lua/lib/bash.lua`).
+--
+-- -- What an MCP tool call looks like ------------------------------------------
+--
+-- A tool call says nothing in the transcript: no arguments, no result, no
+-- error. A tool is in charge of its own reporting, and a *local* tool can be —
+-- it is Lua on this VM, so it calls `agent.panel` itself.
+--
+-- An MCP tool cannot be. Its code is on the other side of the wire, and nothing
+-- of ours runs while `tools/call` is in flight, so there is no arrangement in
+-- which it could ever draw. **So this module draws for it:** every wire call
+-- gets a panel titled `{connection}.{tool}`, opened before the request so a
+-- slow call is visibly in flight, filled with the result's text blocks, with
+-- `notifications/progress` appended as they arrive.
+--
+--     agent.mcps.mine = agent.mcp("mine", func)                  -- draws
+--     agent.mcps.mine = agent.mcp("mine", func, { draw = false }) -- silent
+--
+-- `draw = false` is the way to make an MCP call quiet, and it is exact: the
+-- callopts then go through untouched, so the request on the wire is byte for
+-- byte what it was, `_meta.progressToken` included.
 
 
 agent.mcps = agent.mcps or {}
 
 local function mcp_fail(msg, level)
   error("agent.mcp: " .. tostring(msg), level or 3)
+end
+
+-- Indented JSON, for the one place in this module that has to show a
+-- structured value as text: a tool result carrying no text block. The bridge's
+-- `json_encode` takes a value and nothing else, and a nested result on one
+-- wrapped line is exactly the unreadable wall this is here to avoid — so this
+-- is the small pretty-printer, not an option the primitive does not have.
+--
+-- A table is an array when its keys are exactly 1..n; anything else is an
+-- object. `json_decode` cannot tell an empty `{}` from an empty `[]`, so an
+-- empty table prints as `{}` — the only guess in here, and the harmless one.
+-- Object keys are sorted so the same result always renders the same way.
+local function json_pretty(value, indent)
+  indent = indent or ""
+  local t = type(value)
+  if t == "nil" then return "null" end
+  if t == "boolean" or t == "number" then return tostring(value) end
+  if t == "string" then
+    local ok, enc = pcall(agent.api.json_encode, value)
+    return ok and enc or ('"' .. value .. '"')
+  end
+  if t ~= "table" then return tostring(value) end
+  local count, max = 0, 0
+  for k in pairs(value) do
+    count = count + 1
+    if type(k) == "number" and k >= 1 and k % 1 == 0 and k > max then max = k end
+  end
+  local is_array = count > 0 and max == count
+  local inner, parts, i = indent .. "  ", {}, 0
+  if is_array then
+    for _, v in ipairs(value) do
+      i = i + 1
+      parts[i] = inner .. json_pretty(v, inner)
+    end
+  else
+    for k, v in pairs(value) do
+      i = i + 1
+      local ok, kenc = pcall(agent.api.json_encode, tostring(k))
+      parts[i] = inner .. (ok and kenc or tostring(k)) .. ": " .. json_pretty(v, inner)
+    end
+    table.sort(parts)
+  end
+  if i == 0 then return is_array and "[]" or "{}" end
+  return (is_array and "[\n" or "{\n") .. table.concat(parts, ",\n")
+         .. "\n" .. indent .. (is_array and "]" or "}")
+end
+
+-- Per-call streaming callbacks, validated where they are supplied. Hoisted out
+-- of `conn:request` because the drawing path *rewrites* the callopts it is
+-- given — and a rewrite must not launder a bad value past the check.
+local function check_callopts(callopts)
+  if callopts == nil then return end
+  if type(callopts) ~= "table" then
+    error("agent.mcp: callopts must be a table or nil, got " .. type(callopts), 2)
+  end
+  for _, k in ipairs({ "on_progress", "on_message" }) do
+    local v = callopts[k]
+    if v ~= nil and type(v) ~= "function" then
+      error("agent.mcp: callopts." .. k .. " must be a function or nil, got " .. type(v), 2)
+    end
+  end
 end
 
 local function connect(name, func, opts)
@@ -47,6 +128,9 @@ local function connect(name, func, opts)
   end
   if opts.protocolVersion ~= nil and type(opts.protocolVersion) ~= "string" then
     error("agent.mcp: opts.protocolVersion must be a string", 2)
+  end
+  if opts.draw ~= nil and type(opts.draw) ~= "boolean" then
+    error("agent.mcp: opts.draw must be a boolean or nil", 2)
   end
   for _, k in ipairs({ "on_message", "on_badline", "on_close" }) do
     local v = opts[k]
@@ -121,17 +205,7 @@ local function connect(name, func, opts)
   -- — the caller's table is never mutated.
   function conn:request(method, params, callopts)
     if not self.alive then return nil, "connection '" .. self.name .. "' is closed" end
-    if callopts ~= nil then
-      if type(callopts) ~= "table" then
-        error("agent.mcp: callopts must be a table or nil, got " .. type(callopts), 2)
-      end
-      for _, k in ipairs({ "on_progress", "on_message" }) do
-        local v = callopts[k]
-        if v ~= nil and type(v) ~= "function" then
-          error("agent.mcp: callopts." .. k .. " must be a function or nil, got " .. type(v), 2)
-        end
-      end
-    end
+    check_callopts(callopts)
     self.id = self.id + 1
     local id = self.id
     local pbody = params or {}
@@ -194,6 +268,74 @@ local function connect(name, func, opts)
     if agent.mcps[self.name] == self then agent.mcps[self.name] = nil end
   end
 
+  -- The panel an MCP tool call draws for itself.
+  --
+  -- A local tool calls `agent.panel` directly, because it is Lua running on
+  -- this VM. An MCP tool cannot: its code is on the other side of the wire, and
+  -- nothing of ours runs while `tools/call` is in flight. So with a tool call
+  -- saying nothing by itself, an MCP call would be *permanently* invisible —
+  -- there is no arrangement in which it could ever report. The connection
+  -- therefore draws on the tool's behalf: the same panel a local tool gets by
+  -- asking for one, arrived at from the other direction.
+  --
+  -- `{ draw = false }` on the connection opts out. That escape hatch is the
+  -- point rather than an afterthought — a tool call is silent by default now,
+  -- so without it there would be no way to make an MCP call quiet too.
+  local function draw_call(tname)
+    if opts.draw == false then return nil end
+    -- Titled the way tools are named everywhere else, `{connection}.{tool}`.
+    local p = agent.panel(conn.name .. "." .. tname, { boxed = true })
+    local self = {}
+    -- Every append is guarded: a panel is a convenience, and a tool call that
+    -- loses its panel must not lose its result with it. Same reasoning as
+    -- `lua/bash_tool.lua`.
+    function self:say(text)
+      if text == nil or text == "" then return end
+      pcall(function() p:append(tostring(text) .. "\n") end)
+    end
+    -- `notifications/progress`, appended as it arrives so a slow call is
+    -- visibly slow rather than apparently hung. Servers send these only because
+    -- `on_progress` below puts `_meta.progressToken` in the request.
+    function self:progress(msg)
+      local params = (type(msg) == "table" and msg.params) or nil
+      if type(params) ~= "table" then return end
+      local text = params.message
+      if type(text) ~= "string" or text == "" then
+        if params.progress == nil then return end
+        text = tostring(params.progress)
+        if params.total ~= nil then text = text .. "/" .. tostring(params.total) end
+      end
+      self:say(text)
+    end
+    return self
+  end
+
+  -- The text of an MCP tool result. Servers answer with
+  -- `{ content = [ { type = "text", text = "…" }, … ] }`, and the text is the
+  -- point; the envelope around it is not. A result carrying no text block at
+  -- all is shown as indented JSON instead, so nothing is ever reduced to
+  -- nothing.
+  --
+  -- A result *mixing* text and non-text blocks shows the text and drops the
+  -- rest. An image or an embedded resource has no text form, and printing its
+  -- JSON into the middle of prose is the noise this exists to avoid — a real
+  -- loss, and a deliberate one. Say so here rather than discovering it later.
+  local function result_text(result)
+    if type(result) ~= "table" then return tostring(result) end
+    if type(result.content) == "table" then
+      local out, n = {}, 0
+      for _, block in ipairs(result.content) do
+        if type(block) == "table" and block.type == "text"
+           and type(block.text) == "string" then
+          n = n + 1
+          out[n] = block.text
+        end
+      end
+      if n > 0 then return table.concat(out, "\n") end
+    end
+    return json_pretty(result)
+  end
+
   -- Single tool-invocation path, shared by the callable tool object and the
   -- public conn:invoke streaming entry point. `callopts` (nil or
   -- { on_progress, on_message }) forward to conn:request for per-call
@@ -203,6 +345,11 @@ local function connect(name, func, opts)
     if tool == nil then
       return { ok = false, error = "unknown tool '" .. tostring(tname) .. "'" }
     end
+    -- Only a tool that goes over the wire gets a panel. One with a Lua
+    -- `callback` is running here and can ask for its own, and drawing for it
+    -- would be the double output this is meant to prevent.
+    local panel = nil
+    if tool.callback == nil then panel = draw_call(tname) end
     if tool.policy ~= nil then
       if type(tool.policy) ~= "function" then
         return { ok = false, denied = true,
@@ -214,6 +361,10 @@ local function connect(name, func, opts)
                  error = "tool policy for '" .. tname .. "' must return a boolean" }
       end
       if not verdict then
+        -- The user's own refusal, reported in the call's panel: a tool call is
+        -- silent otherwise, and a refusal with no trace is the one failure the
+        -- user caused rather than discovered.
+        if panel then panel:say("denied by policy") end
         return { ok = false, denied = true,
                  error = "tool call to '" .. tname .. "' denied by policy" }
       end
@@ -227,11 +378,51 @@ local function connect(name, func, opts)
       return { ok = true, result = r, denied = false }
     end
     if not conn.alive then
+      if panel then panel:say("connection '" .. conn.name .. "' is closed") end
       return { ok = false, error = "connection '" .. conn.name .. "' is closed" }
     end
-    local resp, err = conn:request("tools/call", { name = tname, arguments = args or {} }, callopts)
-    if err then return { ok = false, error = err } end
-    if resp.error ~= nil then return { ok = false, error = resp.error } end
+    -- Per-round streaming, *chained* rather than replaced: a caller that passed
+    -- its own callbacks still gets them, and the panel gets the same stream.
+    -- Setting `on_progress` is also what puts `_meta.progressToken` in the
+    -- request — MCP's opt-in, so the server is being asked for progress it is
+    -- free to ignore. With `draw = false` the callopts go through untouched and
+    -- the bytes on the wire are exactly what they were.
+    local streaming = callopts
+    if panel then
+      -- The rewrite below would hide a bad `on_progress` behind a real
+      -- function, deferring the error to whenever a progress notification
+      -- happened to arrive — after the call was already half over the wire.
+      -- Checked here so the contract holds on this path too.
+      check_callopts(callopts)
+      streaming = {
+        on_progress = function(msg)
+          if callopts and callopts.on_progress then callopts.on_progress(msg) end
+          panel:progress(msg)
+        end,
+        on_message = callopts and callopts.on_message or nil,
+      }
+    end
+    local resp, err = conn:request("tools/call",
+                                   { name = tname, arguments = args or {} },
+                                   streaming)
+    if err then
+      if panel then panel:say("error: " .. tostring(err)) end
+      return { ok = false, error = err }
+    end
+    if resp.error ~= nil then
+      if panel then panel:say("error: " .. json_pretty(resp.error)) end
+      return { ok = false, error = resp.error }
+    end
+    if panel then
+      -- `isError` is how MCP says a tool failed while the call itself
+      -- succeeded, and a real server puts only a generic sentence in the
+      -- content ("Error executing tool boom") — the actual reason goes
+      -- elsewhere. Left unmarked, a failed call renders exactly like a
+      -- successful one, which is the one thing this panel must not do: the
+      -- model still gets the untouched result either way.
+      local failed = type(resp.result) == "table" and resp.result.isError
+      panel:say((failed and "error: " or "") .. result_text(resp.result))
+    end
     return { ok = true, result = resp.result, denied = false }
   end
 

@@ -43,7 +43,7 @@
 ---@field mcp fun(name: string, func: function, opts?: table): table Open an MCP connection.
 ---@field mcps table<string, table> The connection registry: name -> `{ name, tools }`.
 ---@field memory table The conversation log (`lua/init.lua`).
----@field mode table Named prompt + tool-set pairs (`lua/lib/mode.lua`).
+---@field mode table Named prompt + tool-set pairs: new / set / current / get / names / forget (`lua/lib/mode.lua`).
 ---@field on_timeout fun(ms: integer, fn?: function) Suspend, or sleep off the reactor.
 ---@field panel fun(title: string, opts?: table): table A result panel (`lua/lib/panel.lua`).
 ---@field seccomp table Flag and endpoint reading (`lua/lib/seccomp.lua`).
@@ -416,8 +416,9 @@ function agent.api.panel_clear_regions(id) end
 
 ---Set (`text`) or clear (`nil`) the overlay — the strip an ask is shown in.
 ---@param id integer
----@param text string?
-function agent.api.panel_overlay(id, text) end
+---@param text string? the question; nil clears the dialog
+---@param always boolean? whether the answer is one to remember
+function agent.api.panel_overlay(id, text, always) end
 
 ---Create a two-pane panel and return its id.
 ---@param title string

@@ -87,7 +87,7 @@ Rules:
   command, or a result; if something was not established, leave it out.
 - No preamble, no closing remarks, no offers to continue — the summary is the
   whole reply.
-- Prefer specifics over prose. "read_file errors on a missing path, returns
+- Prefer specifics over prose. "read errors on a missing path, returns
   `{ ok = false, error = ... }`" beats "there were some issues with reading".
 - Keep the user's own words for requirements and constraints; they are the part
   most easily lost.

@@ -17,7 +17,7 @@
 -- So this module is a registry, not a tool: `require("mcps").fs` is the whole
 -- file-tool connection, and `require("mcps").bash` the whole shell.
 --
---   fs     `lua/fs.lua`       read_file, list_dir, write_file, apply_patch.
+--   fs     `lua/fs.lua`       read, write_file, apply_patch.
 --                            Each asks before it touches anything, and "always"
 --                            remembers the path (see `lua/lib/ask.lua`). The
 --                            working directory is trusted by `lua/init.lua`, so
