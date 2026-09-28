@@ -159,7 +159,13 @@ pub fn parse_gh(url: &str) -> Result<(String, String)> {
 // XDG cache
 // ---------------------------------------------------------------------------
 
-fn cache_root() -> PathBuf {
+/// Where grammars are cached, resolved the standard way.
+///
+/// Public because a background acquisition task has to write to the *same*
+/// directory the foreground catalog reads from, and that catalog does not expose
+/// its own path. Two code paths guessing the location independently is how a
+/// worker ends up building a grammar nobody can find.
+pub fn cache_root() -> PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
@@ -245,7 +251,12 @@ pub struct Catalog {
 }
 
 /// A progress sink: one human-readable line per acquisition step.
-type ProgressFn = Box<dyn Fn(&str)>;
+/// `Send` so a [`Catalog`] can be built *inside* a background task and driven
+/// there: acquiring a grammar takes seconds of network and `cc`, which cannot
+/// happen on the thread that draws frames. The callback therefore has to be
+/// movable into that task, and every caller already satisfies it — the status
+/// line and the test sinks are `Mutex`-backed statics.
+type ProgressFn = Box<dyn Fn(&str) + Send>;
 
 impl Default for Catalog {
     fn default() -> Self {
@@ -280,8 +291,25 @@ impl Catalog {
     /// A callback rather than a `StatusLine` so this module keeps no opinion
     /// about screens: the TUI points it at the status bar, a headless binary
     /// points it at stderr, and a test collects the strings.
-    pub fn with_progress(mut self, f: impl Fn(&str) + 'static) -> Self {
+    pub fn with_progress(mut self, f: impl Fn(&str) + Send + 'static) -> Self {
         self.progress = Some(Box::new(f));
+        self
+    }
+
+    /// Put the cache somewhere else entirely, and re-read the registry copy
+    /// from there.
+    ///
+    /// [`Catalog::new`] resolves `$XDG_DATA_HOME`/`$HOME`, which is right for the
+    /// application and wrong for a test: a suite that downloads grammars must not
+    /// write a megabyte of `.so` into the user's data directory, and must not
+    /// depend on what happens to be cached there either. Pointed at a temp
+    /// directory, a test is hermetic in both directions — it cannot pollute the
+    /// cache and it cannot pass on the strength of a warm one it did not build.
+    pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = dir.into();
+        self.registry = fs::read(self.cache_dir.join("registry.json"))
+            .ok()
+            .and_then(|t| parse_registry(&String::from_utf8_lossy(&t)).ok());
         self
     }
 
@@ -591,6 +619,154 @@ fn read_opt(p: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A grammar this module has never heard of, acquired the way the app does
+    /// it: registry lookup, release resolution, tarball, `cc`, dlopen.
+    ///
+    /// `#[ignore]`d on purpose, and the reason is worth stating rather than
+    /// hiding behind a feature flag: this needs the network, a C compiler, and
+    /// several seconds of both. A suite that depended on it would be a suite that
+    /// fails on a train. It is run deliberately — `--ignored` — because the thing
+    /// it covers, the download-on-demand path, is the part of this module with
+    /// no offline substitute at all: the cache-hit path is one `if so.is_file()`,
+    /// and everything after it is the part that can actually break.
+    ///
+    /// The cache is a temp directory throughout. [`Catalog::new`] resolves
+    /// `$XDG_DATA_HOME`/`$HOME`, and a test that wrote a megabyte of `.so` into
+    /// the user's data directory — or worse, *passed* because of a warm cache it
+    /// did not build — would be worse than no test.
+    #[tokio::test]
+    #[ignore = "needs the network and a C compiler; run with --ignored"]
+    async fn an_unseen_grammar_is_fetched_compiled_and_loaded() {
+        let dir = std::env::temp_dir().join(format!("agent-grammar-fetch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        // `with_progress` takes an `Fn`, so the log needs interior mutability —
+        // the same shape `main.rs` uses, handing progress to the status line.
+        let steps: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = steps.clone();
+        let mut catalog = Catalog::new()
+            .with_cache_dir(&dir)
+            .with_progress(move |m| sink.lock().expect("steps").push(m.to_string()));
+
+        // `rust` is not in the app's own list, so this is genuinely cold: not
+        // fetched, not compiled, not cached anywhere this test can see.
+        let loaded = catalog
+            .ensure("rust")
+            .await
+            .expect("rust grammar acquires");
+        assert_eq!(loaded.name, "rust");
+        assert!(
+            loaded.highlights.is_some(),
+            "and its queries came with it, or nothing would be styled"
+        );
+
+        // It really was built here: the artefacts are on disk under the temp dir.
+        let built = dir.join("rust");
+        assert!(built.join("parser.so").is_file(), "a shared object was built");
+        assert!(
+            built.join("stamp.json").is_file(),
+            "and stamped, or the next run would rebuild it"
+        );
+        let steps = steps.lock().expect("steps").clone();
+        assert!(
+            steps.iter().any(|s| s.contains("rust")) && steps.len() > 1,
+            "and progress was reported, since this takes seconds: {steps:?}"
+        );
+
+        // Second half: a *fresh* catalog over the cache the first one filled must
+        // load with no network at all. That is the "subsequent runs are fully
+        // offline" claim, and it is the property that makes the first half
+        // affordable — a compile on every startup would be unusable.
+        let quiet: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let quiet_sink = quiet.clone();
+        let mut again = Catalog::new()
+            .with_cache_dir(&dir)
+            .with_progress(move |m| quiet_sink.lock().expect("quiet").push(m.to_string()));
+        let offline = again
+            .ensure("rust")
+            .await
+            .expect("the cache hit needs no network");
+        assert_eq!(offline.name, "rust");
+        assert!(
+            again.get("rust").is_some_and(|g| g.highlights.is_some()),
+            "and it carries its queries, so a cached grammar is as good as a fresh one"
+        );
+        // The offline claim, actually checked rather than asserted: every step of
+        // a fetch reports progress, and a cache hit reports nothing. An empty log
+        // is therefore proof the network was not used — which a passing `ensure`
+        // on a machine that happens to be online would not be.
+        assert!(
+            quiet.lock().expect("quiet").is_empty(),
+            "a cache hit reports no progress, so this proves no fetch happened"
+        );
+
+        // A language that does not exist fails cleanly rather than panicking, so
+        // a user asking for one gets a message instead of a crash.
+        let mut missing = Catalog::new().with_cache_dir(dir.join("empty"));
+        // No `expect_err`: the error type carries a `LoadedGrammar`, which is not
+        // `Debug`, and deriving one for a test is not worth it. Match instead.
+        match missing.ensure("definitely-not-a-language").await {
+            Ok(_) => panic!("a language that does not exist must not load"),
+            Err(e) => assert!(
+                !format!("{e:#}").is_empty(),
+                "and it fails with something to say, not a bare Err"
+            ),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The hand-dropped escape hatch: a `.so` in the cache directory with no
+    /// provenance is loaded as-is.
+    ///
+    /// `#[ignore]`d for the same reason as its sibling, and the reason is worth
+    /// being blunt about: the only compiled grammar available without a compiler
+    /// is the one in the *application's* cache, so a hermetic version of this test
+    /// would have to build one first — which is the test above. Reading the app's
+    /// cache to save a compile would put `$HOME` back in the test path, and that
+    /// is the rule this suite keeps: a test that depends on what happens to be
+    /// cached is a test that passes for the wrong reason on one machine and fails
+    /// on another.
+    #[tokio::test]
+    #[ignore = "needs a compiled grammar; borrows the app's cache, so run with --ignored"]
+    async fn a_hand_dropped_shared_object_is_loaded_and_stamped() {
+        let dir = std::env::temp_dir().join(format!("agent-grammar-drop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // The language has to match the symbol inside the `.so`: `ensure` looks
+        // up `tree_sitter_<lang>` and, if that entrypoint is not there, treats the
+        // cache as a miss and *fetches* instead. Which is the right call — a
+        // parser that cannot be loaded is no parser — but it means a hand-dropped
+        // `.so` that is misfiled under the wrong name is silently ignored, with
+        // nothing but a slow first request to show for it. Worth knowing before
+        // spending an afternoon on it.
+        let lang_dir = dir.join("bash");
+        fs::create_dir_all(&lang_dir).expect("scratch");
+        let source = cache_root().join("bash").join("parser.so");
+        let Ok(so) = fs::read(&source) else {
+            let _ = fs::remove_dir_all(&dir);
+            eprintln!("[skip] no compiled bash grammar available to reuse");
+            return;
+        };
+        fs::write(lang_dir.join("parser.so"), so).expect("drop the .so");
+        fs::write(lang_dir.join("highlights.scm"), "(x) @keyword\n").expect("queries");
+
+        let mut catalog = Catalog::new().with_cache_dir(&dir);
+        let loaded = catalog
+            .ensure("bash")
+            .await
+            .expect("a hand-dropped .so loads as-is");
+        assert_eq!(loaded.name, "bash");
+        assert_eq!(
+            loaded.highlights.as_deref(),
+            Some("(x) @keyword\n"),
+            "and the queries beside it, which is the whole point of the escape hatch"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// The progress hook is a plain callback, so this covers the plumbing: a

@@ -491,6 +491,20 @@ fn install_api(
     api.set("write", lua.create_function(lua_write_stdin)?)?;
     api.set("close_stdin", lua.create_function(lua_close_stdin)?)?;
     api.set("trigger", lua.create_function(lua_trigger)?)?;
+    // The `&Lua` argument is required by `create_function` and unused: these
+    // send on the same channel `agent.trigger` does, and the VM is not involved.
+    api.set(
+        "input_insert",
+        lua.create_function(|_: &Lua, text: String| lua_input_op(InputOp::Append(text)))?,
+    )?;
+    api.set(
+        "input_backspace",
+        lua.create_function(|_: &Lua, ()| lua_input_op(InputOp::Backspace))?,
+    )?;
+    api.set(
+        "input_clear",
+        lua.create_function(|_: &Lua, ()| lua_input_op(InputOp::Clear))?,
+    )?;
     api.set("ask_user", lua.create_function(lua_ask_user(on_ask))?)?;
     api.set("memory_path", lua.create_function(lua_memory_path)?)?;
     api.set("memory_append", lua.create_function(lua_memory_append)?)?;
@@ -1916,6 +1930,33 @@ pub enum AgentCommand {
         history: Option<Vec<serde_json::Value>>,
         user: Option<String>,
     },
+    /// Change the input line: [`InputOp`].
+    Input(InputOp),
+}
+
+/// What Lua may do to the input line.
+///
+/// The input box is loop state — a `String` on the `App` — and the `key` event is
+/// the only thing a config has to change it from. Until this existed the action
+/// vocabulary was the sole route to it, which meant the set of things a key
+/// could do was frozen into [`crate::tui::Action`] whether a user wanted it or
+/// not: there was no way for a binding to insert text, so a newline had to be
+/// `Action::Newline` and nothing else could ever type into the box on demand.
+///
+/// Append-only, and deliberately so. There is no cursor, so "insert" means "at
+/// the end", and a primitive that pretended otherwise would be inventing a
+/// position model the widget does not have. `Backspace` is the mirror of
+/// `Append` and the two together are enough to build anything a key table
+/// actually needs — a leader key inserting a snippet, a chord typing a
+/// character — without a second primitive for "delete a word".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputOp {
+    /// Append text to the input line.
+    Append(String),
+    /// Remove the last character, if there is one.
+    Backspace,
+    /// Empty the line, as `Ctrl+u` in readline does.
+    Clear,
 }
 
 /// The channel trigger commands ride to the agent loop: `agent.trigger` sends
@@ -1929,6 +1970,55 @@ static TRIGGER_TX: OnceLock<mpsc::UnboundedSender<AgentCommand>> = OnceLock::new
 /// Returns `None` when already bound — the TUI binds once at startup.
 pub fn bind_trigger_channel(tx: mpsc::UnboundedSender<AgentCommand>) -> Option<()> {
     TRIGGER_TX.set(tx).ok()
+}
+
+/// Fire a registered event and hand back what its handler returned, as a string.
+///
+/// This exists for the one event whose *return value is the answer*: `key`, where
+/// a handler returns the name of the action the key should perform, or nothing to
+/// leave the key to its default binding. Every other event ignores the return,
+/// and goes through [`fire_event_on_vm`] instead — which is the honest shape for
+/// a notification, and keeps "this event is a question" out of the generic path.
+///
+/// A handler that returns something other than a string or nil is an error: the
+/// caller has to be able to tell "no answer" from "a badly-typed answer", and
+/// quietly treating the second as the first is how a binding silently dies.
+///
+/// Runs as a plain call, like [`fire_event_on_vm`]: a keypress handler must not
+/// be able to yield. A `key` handler that slept would be holding up the only
+/// thread that reads input, and there is no reactor behind it to resume on.
+pub fn fire_event_returning(
+    lua: &Lua,
+    name: &str,
+    payload: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    let agent: Table = lua
+        .globals()
+        .get("agent")
+        .map_err(|e| format!("event: agent table: {e}"))?;
+    let events: Table = match agent.get("_events") {
+        Ok(t) => t,
+        // No registrations on this VM: events are opt-in, so nothing to ask.
+        Err(_) => return Ok(None),
+    };
+    let handler: mlua::Function = match events.get(name) {
+        Ok(f) => f,
+        Err(_) => return Ok(None), // no handler for this event: the default stands
+    };
+    let payload_lua =
+        crate::mcp::json_to_lua(lua, payload).map_err(|e| format!("event: payload: {e}"))?;
+    let answer: mlua::Value = handler
+        .call(payload_lua)
+        .map_err(|e| format!("event {name}: {e}"))?;
+    match answer {
+        mlua::Value::Nil => Ok(None),
+        mlua::Value::String(s) => Ok(Some(s.to_string_lossy().to_string())),
+        mlua::Value::Boolean(b) if !b => Ok(None),
+        other => Err(format!(
+            "event {name}: a handler must return an action name or nil, got {}",
+            other.type_name()
+        )),
+    }
 }
 
 /// Fire a registered event on `lua`, which must already have the user's
@@ -2348,6 +2438,34 @@ fn err_to_mlua(e: anyhow::Error) -> mlua::Error {
 /// [`AgentCommand`]) and the loop starts it at the next idle moment. Returns
 /// `true` when queued; `false` when no loop is bound to the channel (the
 /// headless probe, tests) so Lua can decide what that means.
+/// `agent.api.input_insert(text)` / `input_backspace()` / `input_clear()` — change
+/// the input line from Lua.
+///
+/// The route that makes the `key` event more than a picker. A handler that could
+/// only *name* an action had a closed vocabulary baked into Rust, so "insert a
+/// newline" had to be an action whether or not anyone wanted it, and nothing else
+/// could ever type into the box on demand. With this, a binding can do whatever
+/// Lua can do to the line, and the shipped table is free to stop treating
+/// `newline` as special.
+///
+/// Returns `true` when queued and `false` when no loop is attached — the same
+/// contract as [`agent.trigger`](crate::lua), and for the same reason: a binding
+/// that silently dropped its own edit would look like a key that does nothing.
+///
+/// Ungated, unlike a key *binding*: the letter rule ("a bare letter is a
+/// character first") governs which key may mean a command, and this is already
+/// inside a command. So a chord bound to `input_insert("0")` inserts a `0`
+/// mid-sentence, which is what a leader key is for.
+fn lua_input_op(op: InputOp) -> mlua::Result<bool> {
+    match TRIGGER_TX.get() {
+        Some(tx) => tx
+            .send(AgentCommand::Input(op))
+            .map_err(|_| mlua::Error::RuntimeError("agent.api.input_*: the agent loop is gone".into()))
+            .map(|_| true),
+        None => Ok(false),
+    }
+}
+
 fn lua_trigger(_: &Lua, args: mlua::MultiValue) -> mlua::Result<bool> {
     let cmd = match args.into_iter().next() {
         None => AgentCommand::RunTurn {
@@ -3409,6 +3527,11 @@ fn finished_table(lua: &Lua, r: seccomp::SandboxResult) -> mlua::Result<Table> {
     result.set("exit", exit)?;
     result.set("syscalls", r.syscalls as i64)?;
     result.set("denied", r.denied as i64)?;
+    // Always present, so `bash` can read it without a nil check, and true only
+    // when the user stopped the run. A killed tree and a command that failed on
+    // its own look identical without it — same signal, same exit — and the
+    // model reads "you interrupted this" very differently from "this broke".
+    result.set("interrupted", r.interrupted)?;
     t.set("result", result)?;
     Ok(t)
 }
@@ -3760,7 +3883,7 @@ mod tests {
             .expect("api_docs eval");
         // Every primitive is documented: the VM would not have built otherwise,
         // so the count is the bridge's size.
-        assert_eq!(count, 33, "lua/api.lua should annotate all 33 primitives");
+        assert_eq!(count, 36, "lua/api.lua should annotate all 36 primitives");
         assert!(problems.is_empty(), "malformed annotation entries: {problems}");
     }
 
@@ -6223,7 +6346,7 @@ mod tests {
             .eval()
             .expect("enumerate the bridge");
         let bridge: Vec<&str> = joined.lines().collect();
-        assert_eq!(bridge.len(), 33, "the bridge's size is part of the contract");
+        assert_eq!(bridge.len(), 36, "the bridge's size is part of the contract");
 
         let source = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua/agent_api.meta.lua"),
@@ -6253,7 +6376,7 @@ mod tests {
             invented.is_empty(),
             "lua/agent_api.meta.lua annotates these, which are not primitives: {invented:?}"
         );
-        assert_eq!(declared.len(), 33, "and it declares each one exactly once");
+        assert_eq!(declared.len(), 36, "and it declares each one exactly once");
     }
 
     /// `lua/mcps.lua` is the shipped connection set as one registry — the same
@@ -6374,9 +6497,15 @@ mod tests {
         // in force while `coding` is the coding prompt, and that the mode's own
         // spec carries it.
         let prompt = system_prompt(&lua).expect("coding prompt");
+        // Both halves, not one phrase. The prompt used to describe only the
+        // editing path, which left a task that changes nothing with no guidance
+        // at all; asserting on one remembered sentence would not have caught
+        // that, and would not catch a half-removed path either.
         assert!(
-            prompt.contains("coding agent") && prompt.contains("reading before you write"),
-            "the coding prompt is what is sent: {prompt:.80}"
+            prompt.contains("coding agent")
+                && prompt.contains("To understand code")
+                && prompt.contains("To change code"),
+            "the coding prompt is what is sent, with both paths in it: {prompt:.80}"
         );
         let spec_prompt: String = lua
             .load("return agent.mode.get('coding').system_prompt")
@@ -12586,5 +12715,323 @@ return policy
             cfg.path.display()
         );
     }
+/// The `key` event is a *question*, and its answer is the handler's return
+/// value — which is the whole reason it does not go through
+/// [`fire_event_on_vm`], where a return value is discarded.
+///
+/// Three answers, and the third is the one that matters: `nil` and `false`
+/// both mean "not bound, use the default", and a handler that returns
+/// something else is a broken binding table rather than an unbound key.
+/// Treating it as "unbound" would make the table fail silently, which is the
+/// failure mode [`Action::parse`] also refuses.
+#[test]
+
+fn the_key_event_hands_back_the_action_the_handler_named() {
+    let lua = new_vm().expect("VM");
+    lua.load(
+        r#"
+        SEEN = nil
+        agent.on_event("key", function(k)
+          SEEN = k.spec
+          if k.spec == "alt+c" then return "conceal" end
+          if k.spec == "q" then return "quit" end
+          return nil
+        end)
+    "#,
+    )
+    .exec()
+    .expect("register");
+
+    let spec = |lua: &mlua::Lua| -> Option<String> {
+        let seen: mlua::Value = lua.load("return SEEN").eval().expect("read back");
+        seen.as_string().map(|s| s.to_string_lossy().to_string())
+    };
+
+    let answer = fire_event_returning(&lua, "key", &json!({ "spec": "alt+c" }));
+    assert_eq!(answer.expect("no error").as_deref(), Some("conceal"));
+    assert_eq!(spec(&lua).as_deref(), Some("alt+c"), "and the key arrives");
+
+    assert_eq!(
+        fire_event_returning(&lua, "key", &json!({ "spec": "j" }))
+            .expect("no error"),
+        None,
+        "an unbound key is None, not an error: the default stands"
+    );
+    assert_eq!(spec(&lua).as_deref(), Some("j"), "and it was still asked");
+
+    // An event nobody registered is the same answer as an unbound key. The
+    // shipped config *does* register one, so it is removed rather than assumed
+    // away — and that is the interesting case anyway, because a user is expected
+    // to delete the table.
+    let bare = new_vm().expect("VM");
+    bare.load("agent._events.key = nil").exec().expect("unregister");
+    assert_eq!(
+        fire_event_returning(&bare, "key", &json!({ "spec": "q" })).expect("no error"),
+        None,
+        "events are opt-in: a VM with no handler has no opinion"
+    );
 }
 
+/// `nil` and `false` both mean "unbound", and anything else is a broken
+/// binding table that must not be allowed to pass for one.
+        /// What the user actually sees while a write is being decided.
+        ///
+        /// Every other test in this area checks the *ops* — that a panel was opened,
+        /// that an overlay was set on it, that the ids match. None of them render
+        /// anything, so "the ops are right" and "the user can see what they are
+        /// approving" are different claims, and only the second one is the one that
+        /// matters for a permission prompt: a write is the one tool call where the
+        /// content is the thing being consented to.
+        ///
+        /// The frame is built from the op *prefix* up to and including the ask. That
+        /// is the moment the user is looking at: the panel is filled, the dialog is
+        /// up, and the verdict has not been given — the tool then clears the overlay
+        /// on its way out, so replaying the whole stream would show the finished
+        /// state with no question on it, which is precisely what must not be
+        /// mistaken for the real one.
+        #[test]
+        fn a_write_being_decided_shows_its_content_and_the_dialog_together() {
+            use crate::panels::{PanelOp, PanelSink};
+
+            let dir = std::env::temp_dir().join(format!("agent-writeframe-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let target = dir.join("consent.rs");
+            let path = target.to_string_lossy().to_string();
+            let content = "fn main() {\n    let secret = 7;\n}\n";
+
+            // Refused, so nothing is written and the refusal lands in the panel too.
+            let sink = PanelSink::default();
+            invoke_mcp_tool_with_asks(
+                "fs.write_file",
+                &serde_json::json!({ "path": &path, "content": content }).to_string(),
+                Some(&sink),
+                Some(Rc::new(|_: &str, _: bool| AskAnswer::Deny(Some("no".into())))),
+                &ConfigSource::Tree,
+            )
+            .expect("invoke")
+            .expect("registered");
+
+            // The prefix: everything up to and including the question.
+            let prefix = PanelSink::default();
+            let mut saw_ask = false;
+            for op in sink.ops() {
+                saw_ask |= matches!(op, PanelOp::Overlay { text: Some(_), .. });
+                prefix.push(op);
+                if saw_ask {
+                    break;
+                }
+            }
+            assert!(saw_ask, "the write was questioned at all");
+
+            let mut app = crate::tui::App::default();
+            app.drain_panel_ops(&prefix);
+            let (w, h) = (76u16, 26u16);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+            terminal.draw(|frame| app.render(frame)).expect("draw");
+            let buf = terminal.backend().buffer().clone();
+            let frame: String = (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ").to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert!(
+                frame.contains("consent.rs"),
+                "the panel names the file being written:\n{frame}"
+            );
+            assert!(
+                frame.contains("let secret = 7;"),
+                "and shows the bytes that would land on disk — a permission prompt \
+                 about content the user cannot see is not consent:\n{frame}"
+            );
+            assert!(
+                frame.contains("[y]es") && frame.contains("[a]lways"),
+                "with the dialog on that same panel:\n{frame}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+    /// A second tool round gets its own panel, not the first round's.
+    ///
+    /// This is the bug, and it is invisible to any test that uses one sink: the
+    /// per-round sink that carries both the round's Lua and Rust id producers
+    /// restarts its counter, while the id→message map it is looked up in lives
+    /// for the whole session. So round two's first panel took an id round one had
+    /// used, found the existing record, and appended itself to that message — a
+    /// write's content landing in the read box above it, and its dialog drawn
+    /// there instead of on its own. The dialog usually ended up off the top of
+    /// the viewport, which is why the report was "it asks, and `y` works, but
+    /// there is no dialog".
+    ///
+    /// Built by hand rather than through two tool calls, because the harness makes
+    /// a fresh VM per call and would number both rounds from 1 for a different
+    /// reason — the same wrong number, arrived at honestly, which is worth
+    /// pinning here and leaving alone there.
+    #[test]
+    fn a_second_round_opens_its_own_panel_and_asks_on_it() {
+        use crate::panels::{PanelOp, PanelSink};
+
+        let mut app = crate::tui::App::default();
+
+        // Round one: a read, which is what a session almost always starts with.
+        let first = PanelSink::default();
+        let read_id = first.alloc_id();
+        first.push(PanelOp::Create {
+            id: read_id,
+            title: "fs.read".into(),
+            boxed: true,
+            conceal_box: true,
+        });
+        first.push(PanelOp::Append {
+            id: read_id,
+            text: "cppreact.hpp\n".into(),
+        });
+        app.drain_panel_ops(&first);
+
+        // Round two: a write, on a sink that continues the numbering.
+        let second = PanelSink::continuing_from(first.next_id());
+        let write_id = second.alloc_id();
+        second.push(PanelOp::Split {
+            id: write_id,
+            title: "write_file: cppreact.hpp".into(),
+            panes: vec![crate::panels::PaneInit {
+                caption: "2 lines".into(),
+                lang: Some("cpp".into()),
+            }],
+        });
+        second.push(PanelOp::Overlay {
+            id: write_id,
+            text: Some("Allow write cppreact.hpp".into()),
+            always: true,
+        });
+        app.drain_panel_ops(&second);
+
+        assert_ne!(
+            write_id, read_id,
+            "the two rounds must not share an id, or the second panel is the first"
+        );
+        assert_eq!(
+            app.panel.messages.len(),
+            2,
+            "two boxes on screen, not one with both jobs in it"
+        );
+        assert_eq!(app.panel.messages[0].text, "cppreact.hpp\n", "the read is its own");
+        assert!(
+            app.panel.messages[1].overlay.is_some(),
+            "and the dialog is on the write's panel, not the read's"
+        );
+        assert!(
+            app.panel.messages[0].overlay.is_none(),
+            "the read panel is left alone"
+        );
+    }
+
+    /// A restarted sink *would* collide, which is the bug this fix is about — so
+    /// it is pinned as a fact about [`PanelSink::default`] rather than left as a
+    /// trap for the next person to walk into.
+    #[test]
+    fn a_fresh_sink_starts_at_one_which_is_why_the_loop_continues_it() {
+        use crate::panels::PanelSink;
+        let a = PanelSink::default();
+        assert_eq!(a.alloc_id(), 1);
+        let b = PanelSink::continuing_from(a.next_id());
+        assert_eq!(b.alloc_id(), 2, "the mark carries");
+        assert_eq!(b.alloc_id(), 3);
+        assert_eq!(a.alloc_id(), 2, "and the old sink is unaffected");
+        assert_eq!(
+            PanelSink::default().alloc_id(),
+            1,
+            "a default sink really does restart — the hazard, stated"
+        );
+    }
+
+    #[test]
+    fn a_key_handler_that_answers_with_nonsense_is_an_error() {
+        for (body, why) in [
+            ("return false", "false means unbound, not an error"),
+            ("return 7", "a number is not an action name"),
+            ("return {}", "a table is not an action name"),
+        ] {
+            let lua = new_vm().expect("VM");
+            lua.load(format!("agent.on_event('key', function(k) {body} end)"))
+                .exec()
+                .expect("register");
+            let got = fire_event_returning(&lua, "key", &json!({ "spec": "q" }));
+            if why.starts_with("false") {
+                assert_eq!(got.expect("no error"), None, "{why}");
+            } else {
+                let err = got.expect_err(why);
+                assert!(err.contains("must return an action name"), "{why}: {err}");
+            }
+        }
+        // A handler that raises is reported as itself, with the event named.
+        let lua = new_vm().expect("VM");
+        lua.load("agent.on_event('key', function(k) error('boom') end)")
+            .exec()
+            .expect("register");
+        let err = fire_event_returning(&lua, "key", &json!({ "spec": "q" })).expect_err("raises");
+        assert!(err.contains("event key"), "the event is named: {err}");
+        assert!(err.contains("boom"), "and so is the failure: {err}");
+    }
+    /// The shipped config's binding table, row by row.
+    ///
+    /// This is the test that makes the table load-bearing in a *checked* way. Every
+    /// key Rust used to hold moved into it, so a deleted or misspelled row is not a
+    /// missing feature — it is an app you cannot type into, and nothing else would
+    /// say so: the loop reports no error and the key is simply a letter. Both
+    /// directions are pinned, so a row that starts resolving to something *else* is
+    /// as visible as one that stops resolving at all.
+    #[test]
+    fn the_shipped_binding_table_resolves_to_real_actions() {
+        let lua = new_vm().expect("VM");
+        let ask = |spec: &str| {
+            fire_event_returning(&lua, "key", &serde_json::json!({ "spec": spec }))
+                .expect("the handler did not raise")
+        };
+
+        for (spec, want) in [
+            ("enter", Some("send")),
+            ("esc", Some("quit")),
+            ("q", Some("quit")),
+            ("alt+c", Some("conceal")),
+            ("j", Some("scroll_down")),
+            ("down", Some("scroll_down")),
+            ("k", Some("scroll_up")),
+            ("up", Some("scroll_up")),
+            ("home", Some("top")),
+            ("end", Some("bottom")),
+            ("pageup", Some("scroll_up")),
+            ("pagedown", Some("scroll_down")),
+        ] {
+            assert_eq!(ask(spec).as_deref(), want, "{spec} is bound to {want:?}");
+        }
+
+        // `alt+enter` is a *call*, not a name: it queues an input edit and answers
+        // nothing. That is why the action list has one fewer entry than the table
+        // has rows, and why there is no `newline` action to return.
+        assert_eq!(ask("alt+enter"), None, "the newline is queued, not named");
+
+        // Unbound, so the letter gate and the two Rust keys are all that stand
+        // between a keypress and the input line.
+        assert_eq!(ask("ctrl+q"), None, "nothing is bound to ctrl+q");
+        assert_eq!(ask("f5"), None, "nor to f5");
+
+        // And every name the table can produce is one the app knows — the check that
+        // catches a typo in the table before it becomes a dead key.
+        for spec in [
+            "enter", "esc", "q", "alt+c", "j", "k", "home", "end", "pageup", "pagedown",
+        ] {
+            if let Some(name) = ask(spec) {
+                assert!(
+                    crate::tui::Action::parse(&name).is_ok(),
+                    "{spec} resolves to {name:?}, which is not an action"
+                );
+            }
+        }
+}
+}

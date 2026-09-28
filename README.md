@@ -186,6 +186,59 @@ mode) and `compact` (no tools at all, so a compaction turn can only answer). A
 config that wants neither drops them with `agent.mode.forget_all()`. See
 `lua/lib/mode.lua`.
 
+## Keys
+
+Rust binds two keys and nothing else: `Ctrl+c` (stop the running command) and
+`Ctrl+d` (leave). Everything else — `Enter` to send, `Esc` to leave, `q`,
+`Alt+c`, `Alt+Enter`, scrolling — is a config's business, bound by name in Lua:
+
+```lua
+agent.on_event("key", function(k) return BIND[k.spec] end)   -- see lua/init.lua §8
+```
+
+The handler is given `spec` (the chord as a table writes it — `alt+enter`,
+`ctrl+c`, `f5`), `char`, and the three modifier booleans, and returns an action
+name (`send`, `quit`, `interrupt`, `conceal`, `scroll_up`, `scroll_down`, `top`,
+`bottom`) or nothing, meaning the key keeps its default.
+
+**Returning a name is a shorthand, not the limit.** A handler can also call
+`agent.api.input_insert(text)` (or `input_backspace` / `input_clear`) and change
+the input line directly, so a binding is not limited to a set of actions frozen
+into Rust — a chord bound to `input_insert("0")` types a zero mid-sentence, which
+is what a leader key is for. That is why `Alt+Enter` is a line in
+`lua/init.lua` rather than a Rust default: it was kept here as a "fallback for
+terminals that cannot send the chord", which was never true, because such a
+terminal does not deliver a distinguishable event and Rust would not have
+received one either.
+
+**A bare letter is a character first and a command second.** A letter reaches an
+action only when the input line is empty; a chord always does. That one rule is
+what makes a flat table safe — without it, `BIND["q"] = "quit"` would quit the
+app halfway through the word "quick" — and it lives in Rust precisely so that a
+config gets it for free. It is also why leaving is `Ctrl+d` and not a letter.
+Input edits are exempt: by the time one is queued a command has already been
+chosen, so a leader key works mid-sentence.
+
+The event is **not fired while a permission question is on screen**: `y`/`n`/`a`
+are verdicts there, and a table that could redirect them could answer a question
+by accident. `Ctrl+c` is the exception that proves the rule — it *does* work with
+a question up, because the command asking is the one thing worth interrupting,
+and its tree is frozen on that very question.
+
+`Ctrl+c` reaches the sandbox through a per-run flag, not a signal: the caller
+that wants to interrupt has no reference to the running tree, which lives inside
+the tool's coroutine, and it cannot signal a pid because the tree grows as it
+forks. The request travels to the one place that can act on it, which kills the
+whole captured tree and lets the run finish the ordinary way — so the result
+comes back marked `interrupted` rather than looking like a command that crashed.
+The flag is per-run: an earlier global version let one request kill every
+concurrent sandbox, which is a bug the test suite found by having many.
+
+This is also where the click path meets the keyboard. `[y]es`/`[n]o` in a dialog
+are clickable, and a click is turned into the letter inside the brackets and run
+through the same `ask_choice` a keypress uses — so a pointer and a keypress are
+the same decision by construction rather than by two copies agreeing.
+
 ## The status bar
 
 The bottom row is one line, and it is the only place anything reports *in

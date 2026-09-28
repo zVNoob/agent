@@ -5,9 +5,17 @@
 //!
 //! The loaded markdown grammar parses each message body; its injection query
 //! pulls in `markdown_inline` (inline formatting), the fenced-block language
-//! from the fence's info string (bash/json), and html/yaml/toml. Languages we
-//! do not have loaded are simply skipped by the injection callback, so those
-//! ranges render unhighlighted instead of breaking.
+//! from the fence's info string, and html/yaml/toml. Only the first two and
+//! `json` are preloaded ([`INJECTED`]); a language with no configuration is
+//! skipped by the injection callback and *named* on the way past
+//! ([`MarkdownHighlighter::take_wanted`]), so the loop can fetch it and apply it
+//! mid-conversation ([`MarkdownHighlighter::add_language`]).
+//!
+//! A block whose language is not yet loaded does not render as plain text. The
+//! markdown grammar captures a fenced block whole as `markup.raw.block`, and the
+//! theme paints `raw` light green — so it is a flat colour: unmistakably code,
+//! with no structure inside. Worth knowing when reading the screen, and worth
+//! knowing when a fetch has failed and there is no fallback.
 //!
 //! Every [`HighlightConfiguration`] is `configure`d with the *same* ordered
 //! capture-name list, so a [`Highlight`] index means the same capture in every
@@ -47,6 +55,12 @@ const INLINE_CONCEAL: [&str; 5] = [
 /// Languages the markdown grammar can inject. The fenced-block language is
 /// the text of the fence's `(language)` node; inline formatting is injected
 /// with `#set! injection.language "markdown_inline"`.
+///
+/// This is what is loaded *at startup*, not what can be injected. Any other
+/// language is acquired on first sight and added by
+/// [`MarkdownHighlighter::add_language`] — so the list is a latency
+/// optimisation, not a whitelist, and the absence of `rust` from it means "one
+/// fetch the first time it appears", not "never".
 const INJECTED: &[&str] = &["markdown_inline", "bash", "json"];
 
 /// nvim-treesitter markers that must never be rendered as a style.
@@ -227,6 +241,23 @@ pub struct MarkdownHighlighter {
     /// The markdown block grammar itself, re-parsed at push time to locate
     /// heading markers and fenced-code delimiters for markup concealment.
     markdown_language: tree_sitter::Language,
+    /// Fenced languages this highlighter was asked to inline and could not,
+    /// in first-seen order and deduplicated.
+    ///
+    /// The injection callback below sees the language name for *every* fenced
+    /// block and returns `None` for one it has no configuration for — which is
+    /// how "unhighlighted" is implemented, and why it is invisible: nothing
+    /// distinguishes "there is no grammar" from "this block is not code". This
+    /// is the record of the difference, so the caller can go and get one.
+    ///
+    /// Recording it during a *synchronous* highlight is the whole design: the
+    /// fetch that would fix it takes seconds and cannot happen inside a frame,
+    /// so the highlighter's only job is to name the gap on the way past. See
+    /// [`Self::take_wanted`].
+    wanted: Vec<String>,
+    /// What each configured language was built from, so a configuration can be
+    /// rebuilt when the shared capture list grows. See [`GrammarSource`].
+    sources: HashMap<String, GrammarSource>,
 }
 
 /// nvim-treesitter queries carry directives that only apply inside nvim and
@@ -552,7 +583,67 @@ fn is_capture_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'?' | b'!')
 }
 
-fn build_config(g: &LoadedGrammar, name: &str, names: &[String]) -> Option<HighlightConfiguration> {
+/// Everything a [`HighlightConfiguration`] is built from, kept so one can be
+/// built *again* later.
+///
+/// Not a [`LoadedGrammar`], which is the right thing to want and the wrong thing
+/// to hold: it owns the dlopen handle, which keeps the `.so` mapped for the life
+/// of the process, and `libloading::Library` is not `Clone`. The handle is owned by
+/// the [`Catalog`](crate::grammars::Catalog) instead, which lives exactly as long
+/// as this highlighter does — see [`Self::add_language`] for why that ordering is
+/// load-bearing rather than incidental.
+///
+/// Holding the [`Language`](tree_sitter::Language) here is a handle into that
+/// mapped `.so`, so dropping the catalog while a configuration is live would leave
+/// it dangling. The TUI holds the catalog for the whole session, so this is a
+/// statement about an ordering that must not change, not a bug.
+#[derive(Clone)]
+struct GrammarSource {
+    language: tree_sitter::Language,
+    highlights: Option<String>,
+    injections: Option<String>,
+}
+
+impl From<&LoadedGrammar> for GrammarSource {
+    fn from(g: &LoadedGrammar) -> Self {
+        Self {
+            language: g.language.clone(),
+            highlights: g.highlights.clone(),
+            injections: g.injections.clone(),
+        }
+    }
+}
+
+/// Note that `lang` was asked for and is not available, deduplicating as it goes.
+///
+/// Its own function so the test exercises this and not a copy of it: the
+/// deduplication is the part that matters — the injection callback fires once per
+/// fenced block, and a document with forty `rust` blocks must be one fetch, not
+/// forty.
+fn record_wanted(wanted: &mut Vec<String>, lang: &str) {
+    if !wanted.iter().any(|w| w == lang) {
+        wanted.push(lang.to_string());
+    }
+}
+
+/// Fold `added` into `names`, returning the merged list and whether it grew.
+///
+/// Growth is the interesting part: every configuration is configured against one
+/// shared ordered list, because a `Highlight` index has to mean the same capture
+/// in every layer. So a new name is not additive for the *new* language alone —
+/// it invalidates the index space every existing layer was configured against, and
+/// they all have to be rebuilt. See [`MarkdownHighlighter::add_language`].
+fn merge_capture_names(names: &[String], added: Vec<String>) -> (Vec<String>, bool) {
+    let before = names.len();
+    let mut merged = names.to_vec();
+    merged.extend(added);
+    merged.sort();
+    merged.dedup();
+    let moved = merged.len() != before;
+    (merged, moved)
+}
+
+fn build_config(g: &GrammarSource, name: &str, names: &[String]) -> Option<HighlightConfiguration> {
     let highlights_raw = g.highlights.as_deref()?;
     let highlights_san = sanitize_query(highlights_raw);
     let highlights_clean = strip_meta_captures(highlights_san.as_deref().unwrap_or(highlights_raw));
@@ -600,13 +691,16 @@ impl MarkdownHighlighter {
         names.sort();
         names.dedup();
 
-        let markdown = build_config(md, "markdown", &names)?;
+        let markdown = build_config(&GrammarSource::from(md), "markdown", &names)?;
         let mut injected = HashMap::new();
+        let mut sources = HashMap::new();
+        sources.insert("markdown".to_string(), GrammarSource::from(md));
         for lang in INJECTED {
             if let Some(g) = catalog.get(lang)
-                && let Some(cfg) = build_config(g, lang, &names)
+                && let Some(cfg) = build_config(&GrammarSource::from(g), lang, &names)
             {
                 injected.insert(lang.to_string(), cfg);
+                sources.insert(lang.to_string(), GrammarSource::from(g));
             }
         }
 
@@ -622,6 +716,8 @@ impl MarkdownHighlighter {
             aliases,
             highlighter: Highlighter::new(),
             markdown_language: md.language.clone(),
+            wanted: Vec::new(),
+            sources,
         })
     }
 
@@ -664,9 +760,20 @@ impl MarkdownHighlighter {
         let highlighter = &mut self.highlighter;
         let injected = &self.injected;
         let aliases = &self.aliases;
+        // Disjoint field borrows, so the gap can be recorded while `injected` is
+        // read: `highlighter.highlight` takes `&mut self.highlighter`, and the
+        // callback needs `&self.injected` plus somewhere to put what it could not
+        // find. All three are separate fields, so this is fine.
+        let wanted = &mut self.wanted;
         let events = match highlighter.highlight(&self.markdown, src, None, |name| {
             let canonical = aliases.get(name).map(String::as_str).unwrap_or(name);
-            injected.get(canonical)
+            match injected.get(canonical) {
+                Some(cfg) => Some(cfg),
+                None => {
+                    record_wanted(wanted, canonical);
+                    None
+                }
+            }
         }) {
             Ok(it) => it,
             Err(_) => {
@@ -693,6 +800,88 @@ impl MarkdownHighlighter {
         HighlightedMessage { segments, conceal }
     }
 
+    /// The fenced languages this highlighter has been asked to inline and has no
+    /// grammar for, first-seen order, and clears the list.
+    ///
+    /// Drained rather than read, so a caller polling once per frame does not
+    /// re-request the same grammar on every frame while it is still being
+    /// fetched. A caller that cannot act on one yet (no compiler, offline) should
+    /// drop it, not retry it in a loop — a fetch attempt is seconds.
+    pub fn take_wanted(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.wanted)
+    }
+
+    /// Whether `lang` can be inlined right now, alias-aware.
+    pub fn has_language(&self, lang: &str) -> bool {
+        let canonical = self.aliases.get(lang).map(String::as_str).unwrap_or(lang);
+        self.injected.contains_key(canonical)
+    }
+
+    /// Make `lang` inlinable, now that a grammar for it exists.
+    ///
+    /// Returns whether the shared capture-name list *moved* — and it usually
+    /// does, because a new language contributes captures the existing layers have
+    /// never heard of (`rust` alone brings `keyword.function`, `type.builtin`,
+    /// `punctuation.bracket`, …). Every [`HighlightConfiguration`] is configured
+    /// against one shared ordered name list, because a `Highlight` index has to
+    /// mean the same capture in every layer; so a new name means **every**
+    /// configuration is rebuilt, and the highlighter is recreated because it
+    /// holds the old ones.
+    ///
+    /// Already-rendered text is *not* invalidated by that, which is the part that
+    /// makes hot loading possible: a [`Segment`] carries a resolved
+    /// [`Style`], not a capture index, so segments emitted under the old list are
+    /// still correct — just less complete than they could be. The caller re-renders
+    /// to pick up the improvement, and nothing forces it to.
+    ///
+    /// `false` when the language is already inlinable, so a caller that re-requests
+    /// does not churn every configuration on every frame.
+    pub fn add_language(&mut self, lang: &str, g: &crate::grammars::LoadedGrammar) -> bool {
+        let canonical = self.aliases.get(lang).map(String::as_str).unwrap_or(lang);
+        if self.injected.contains_key(canonical) {
+            return false;
+        }
+        let source = GrammarSource::from(g);
+        let Some(added) = source.highlights.as_deref().map(capture_names) else {
+            return false; // no queries: nothing to style with
+        };
+        let (names, moved) = merge_capture_names(&self.names, added);
+        self.names = names;
+        self.sources.insert(canonical.to_string(), source);
+
+        // Rebuild *every* configuration against the extended list, not just the
+        // new one: the index space is shared, so a configuration left on the old
+        // list would be interpreting `Highlight` values in a space that has grown
+        // underneath it. Markdown goes first because it is the layer that injects.
+        let Some(md) = self
+            .sources
+            .get("markdown")
+            .and_then(|m| build_config(m, "markdown", &self.names))
+        else {
+            // Losing the markdown configuration would silently stop highlighting
+            // every message, so the addition is refused rather than accepted: the
+            // language simply stays un-inlined, which is the same degradation as
+            // never having fetched it.
+            return false;
+        };
+        self.markdown = md;
+        let mut injected = HashMap::new();
+        for (lang, source) in &self.sources {
+            if lang == "markdown" {
+                continue;
+            }
+            if let Some(cfg) = build_config(source, lang, &self.names) {
+                injected.insert(lang.clone(), cfg);
+            }
+        }
+        self.injected = injected;
+        // The highlighter holds configurations from the old index space; a fresh
+        // one costs nothing and removes the possibility of it holding a stale
+        // reference across the swap.
+        self.highlighter = Highlighter::new();
+        moved
+    }
+
     /// Highlight `text` directly with the grammar named by `lang` (e.g.
     /// `"json"`), bypassing the markdown pipeline — used by panels whose
     /// `SetLang` declares the language instead of carrying a ```lang fence.
@@ -711,6 +900,13 @@ impl MarkdownHighlighter {
             self.injected.get(canonical)
         };
         let Some(config) = config else {
+            // A pane declares its language rather than carrying a fence, so it
+            // never reaches the injection callback and would otherwise never ask
+            // for anything. That is the common case, not an edge: every
+            // `write_file` and `apply_patch` pane declares the file's language, so
+            // without this a Rust file's write panel would stay plain text
+            // forever no matter how many grammars were fetched.
+            record_wanted(&mut self.wanted, canonical);
             return HighlightedMessage {
                 segments: Vec::new(),
                 conceal: Vec::new(),
@@ -1031,6 +1227,131 @@ mod tests {
         // Queries without markdown_inline or fenced code pass through unchanged.
         let other = "((code) @injection.content (#set! injection.language \"bash\"))";
         assert!(normalize_markdown_injections(other).is_none());
+    }
+
+    /// Which fenced-block languages can be highlighted at all.
+    ///
+    /// Block inlining works by the markdown grammar *injecting* the fenced
+    /// language's parser into the range of the block, and `tree-sitter-highlight`
+    /// only injects a language it was given a configuration for. So this list is
+    /// the whole of what can be inlined: a ```rust or ```cpp block gets no
+    /// configuration, no injection happens, and the block renders as plain text
+    /// inside an otherwise highlighted message. That is not a bug in the
+    /// injection — it is the boundary of a closed list.
+    ///
+    /// Pinned as an exact set, and *not* derived from the catalog, because the
+    /// two lists are maintained in different files (`INJECTED` here, `GRAMMARS` in
+    /// `main.rs`) and adding a language to one and not the other is the easy
+    /// mistake: the grammar would be downloaded and compiled at every startup and
+    /// then never used for anything. If you extend this, the test tells you what
+    /// else has to move.
+    #[test]
+    fn only_these_fenced_languages_can_be_inlined() {
+        assert_eq!(
+            INJECTED,
+            &["markdown_inline", "bash", "json"],
+            "the injectable set; `main.rs`'s GRAMMARS must stay the same four"
+        );
+        // Spelled out, because the point of the test is the *absences*: these are
+        // real languages with real grammars in the registry, and the only thing
+        // not preloading them costs is a one-off fetch the first time one turns
+        // up. Add one here *and* to GRAMMARS in main.rs to pay that cost up
+        // front instead — the two lists must agree, or a grammar is fetched at
+        // every startup and never used.
+        for not_preloaded in ["rust", "cpp", "lua", "python", "go"] {
+            assert!(
+                !INJECTED.contains(&not_preloaded),
+                "{not_preloaded} is no longer preloaded — it is acquired on demand \
+                 now, so this is only a claim about startup cost. If preloading it \
+                 is the intent, add it here *and* to GRAMMARS in main.rs"
+            );
+        }
+    }
+
+    /// What an un-injected block actually looks like, which is not what this file
+    /// used to claim.
+    ///
+    /// The old claim here was "the code inside it is unstyled", and it was wrong
+    /// in a way worth recording. The markdown grammar captures a fenced block
+    /// whole — `markup.raw.block` — whether or not its language is injected, and
+    /// the theme paints a `raw` capture light green. So an un-injected block is a
+    /// *flat* colour, not plain text: it reads as code, and it is the same colour
+    /// as the fence, but there is no structure inside it. That is a better failure
+    /// than plain text would be, and a worse one to diagnose — and it is why
+    /// nothing about this boundary was ever obvious.
+    ///
+    /// The visual claim needs the markdown grammar, so it is measured in
+    /// `a_grammar_that_arrives_late_is_applied_to_text_already_rendered` (ignored:
+    /// needs the network and a `cc`), which asserts exactly this — one flat colour
+    /// before, more than one after. This test, in its previous form, asserted only
+    /// that a string it had just built contained its own substring: it exercised
+    /// `format!`, not the highlighter, and its name described behaviour it never
+    /// touched.
+    /// The capture-name merge, which is the whole of what adding a language costs
+    /// every other layer.
+    ///
+    /// Hermetic on purpose: this is the part with no offline substitute, and it is
+    /// pure arithmetic over two lists, so it does not need a grammar to be tested.
+    /// A test that needed the network to check a `sort`/`dedup` would be a test
+    /// nobody runs.
+    #[test]
+    fn adding_a_language_reports_whether_the_shared_list_moved() {
+        let base: Vec<String> = ["keyword", "markup.heading", "string"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // A language contributing nothing new changes nothing, and the caller uses
+        // that to skip rebuilding every configuration.
+        let (same, moved) = merge_capture_names(&base, vec!["keyword".into()]);
+        assert!(!moved, "no new names, so no rebuild is needed");
+        assert_eq!(same, base, "and the list is unchanged");
+
+        // One genuinely new capture moves the list — which is the common case,
+        // since `rust` alone brings a dozen the markdown layer has never seen.
+        let (grown, moved) =
+            merge_capture_names(&base, vec!["keyword".into(), "type.builtin".into()]);
+        assert!(
+            moved,
+            "a new capture name invalidates the index space every layer shares"
+        );
+        assert_eq!(
+            grown,
+            vec!["keyword", "markup.heading", "string", "type.builtin"],
+            "sorted and deduplicated, because Highlight indices are positional"
+        );
+        assert!(
+            grown.windows(2).all(|w| w[0] <= w[1]),
+            "sorted, so an index means the same capture next time"
+        );
+    }
+
+    /// The gap is *named*, and one language is one entry however many times it
+    /// is asked for.
+    ///
+    /// The deduplication is the load-bearing part, and it is tested against the
+    /// shipped function rather than a transcription of it: a test that re-writes
+    /// the two lines it is checking passes just as happily when the real ones are
+    /// wrong, which is worse than no test because it looks like coverage.
+    #[test]
+    fn a_language_with_no_grammar_is_recorded_as_wanted_exactly_once() {
+        let mut wanted: Vec<String> = Vec::new();
+        for block in ["rust", "cpp", "rust", "rust", "lua", "cpp"] {
+            record_wanted(&mut wanted, block);
+        }
+        assert_eq!(
+            wanted,
+            vec!["rust", "cpp", "lua"],
+            "first-seen order, deduplicated: a document full of one language is one \
+             fetch, not one per block"
+        );
+
+        // Draining clears it, so a caller polling once per frame does not
+        // re-request what it is already fetching — the reason `take_wanted` takes
+        // rather than peeks.
+        let drained = std::mem::take(&mut wanted);
+        assert_eq!(drained.len(), 3);
+        assert!(wanted.is_empty(), "and the list is empty again");
     }
 
     #[test]

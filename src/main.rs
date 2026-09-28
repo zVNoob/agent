@@ -61,7 +61,7 @@ mod tools;
 
 use agent::grammars::Catalog;
 use agent::status::StatusKind;
-use agent::tui::{App, MarkdownHighlighter, Role};
+use agent::tui::{Action, App, Click, Effect, MarkdownHighlighter, Role};
 use anyhow::Result;
 use api::{Chat, TurnBuilder, TurnEvent, assistant_tool_message};
 use crossterm::event::{
@@ -75,7 +75,7 @@ use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Write, stderr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -312,6 +312,7 @@ async fn main() -> Result<()> {
         &mut chat,
         &config,
         &config_vm,
+        &mut catalog,
         replayed,
     )
     .await;
@@ -413,6 +414,78 @@ enum AskChoice {
     Yes,
     No,
     Always,
+}
+
+/// What a key does when nothing has been bound to it, and the one rule that is
+/// not a key at all: mid-turn, `Enter` is ignored, so a line being typed while
+/// the model streams is not submitted and lost. A key explicitly bound to an
+/// action skips the rule — it asked for what it asked for, and quietly dropping
+/// it is the dead binding the `key` event exists to remove.
+fn default_key(app: &mut App, key: crossterm::event::KeyEvent, busy: bool) -> Effect {
+    if busy && is_submit_key(&key) {
+        Effect::Continue
+    } else {
+        app.handle_key(key)
+    }
+}
+
+/// Ask the Lua `key` handler what a key press should do.
+///
+/// Returns `None` when nothing is bound to it, which is the normal case and
+/// means "carry on with the default". An `Err` is a binding that named an action
+/// the app does not have, or a handler that failed; the caller reports it and
+/// falls through to the default rather than swallowing the key, because a key
+/// that does nothing at all is the failure mode that makes a binding table
+/// unusable.
+///
+/// The payload is the whole contract with the Lua side, so it says three things
+/// and no more: `spec` — the chord as a binding table writes it, from
+/// [`key_spec`], the one spelling a table should match on — `char`, the
+/// printable character or null, and the three modifiers. There is deliberately
+/// no debug-formatted key name: that is a Rust enum's rendering, it would change
+/// whenever crossterm is upgraded, and `spec` already answers the question.
+fn resolve_key(vm: &mlua::Lua, key: &crossterm::event::KeyEvent) -> Option<Result<Action, String>> {
+    let modifiers = key.modifiers;
+    let payload = json!({
+        "spec": agent::tui::key_spec(key),
+        "char": match key.code {
+            KeyCode::Char(c) => Value::String(c.to_string()),
+            _ => Value::Null,
+        },
+        "ctrl": modifiers.contains(KeyModifiers::CONTROL),
+        "alt": modifiers.contains(KeyModifiers::ALT),
+        "shift": modifiers.contains(KeyModifiers::SHIFT),
+    });
+    match agent::lua::fire_event_returning(vm, "key", &payload) {
+        Ok(None) => None,
+        Ok(Some(name)) => Some(Action::parse(&name)),
+        Err(why) => Some(Err(why)),
+    }
+}
+
+/// Act on a verdict: put the answer the tool's coroutine will receive on its
+/// next step, and the human-readable outcome on the status bar.
+///
+/// The decision goes on the status bar, not into the transcript. A cold command
+/// asks dozens of times, and a message per answer buried the run it was
+/// reporting on; the bar is one line and holds exactly the latest.
+///
+/// One function for the keyboard and the mouse, so the two cannot disagree —
+/// a click and a keypress on the same letter must be the same decision, and
+/// the cheapest way to guarantee that is to have only one of them.
+fn record_verdict(app: &mut App, choice: AskChoice) -> agent::lua::AskAnswer {
+    let answer = match choice {
+        AskChoice::Yes => agent::lua::AskAnswer::Allow,
+        AskChoice::Always => agent::lua::AskAnswer::AllowAndTrust,
+        AskChoice::No => agent::lua::AskAnswer::Deny(Some("denied by user".to_string())),
+    };
+    let (outcome, kind) = match choice {
+        AskChoice::Yes => ("allowed", agent::status::StatusKind::Done),
+        AskChoice::Always => ("allowed, and remembered", agent::status::StatusKind::Done),
+        AskChoice::No => ("denied", agent::status::StatusKind::Warn),
+    };
+    app.set_status_text(outcome, kind);
+    answer
 }
 
 /// The three keys that answer a permission question, mapped to the three
@@ -614,6 +687,76 @@ fn tool_defs(vm: &mlua::Lua) -> Result<Vec<api::ToolDef>> {
 /// unregistered tool, or an old tool call replayed out of the history would
 /// each find a working tool by name. The request's own tool list is the gate,
 /// so what the model was shown is exactly what it can run.
+/// What the loop knows about grammars it has been asked for.
+///
+/// Its own type because the rules are the interesting part and the loop body is a
+/// poor place to find them: the loop is six hundred lines, and the failure this
+/// exists to prevent — a fetch that reported nothing leaving the queue wedged for
+/// the session — is invisible there and obvious here.
+///
+/// Two rules, both of which cost something to learn:
+/// * a language is fetched at most once per session, so a registry that is down or
+///   a fence naming a language nobody published costs one attempt rather than one
+///   per frame until the session ends;
+/// * a fetch is only started when the previous one has reported back, *including
+///   when it failed*. Forgetting the second half is a silent, session-long wedge.
+#[derive(Default)]
+struct GrammarQueue {
+    pending: VecDeque<String>,
+    asked: std::collections::HashSet<String>,
+    fetching: bool,
+}
+
+impl GrammarQueue {
+    /// Note that something on screen asked for `lang`. `false` if already asked
+    /// for, in which case it is not queued again.
+    fn request(&mut self, lang: String) -> bool {
+        if self.asked.insert(lang.clone()) {
+            self.pending.push_back(lang);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The next language to fetch, or `None` if none is waiting or one is already
+    /// in flight. Marking it in flight is what serialises them: two concurrent
+    /// `cc` runs would fight for the CPU the frame is trying to draw on.
+    fn take_next(&mut self) -> Option<String> {
+        if self.fetching {
+            return None;
+        }
+        let lang = self.pending.pop_front()?;
+        self.fetching = true;
+        Some(lang)
+    }
+
+    /// A fetch reported back. Returns whether it succeeded.
+    ///
+    /// The unconditional `fetching = false` is the whole point: a task that only
+    /// reported success would leave this `true` and everything behind it stuck.
+    fn finish(&mut self, ok: bool) -> bool {
+        self.fetching = false;
+        ok
+    }
+}
+
+/// How a background grammar acquisition ended.
+///
+/// The distinction is not cosmetic: the loop's "one fetch at a time" flag is only
+/// cleared by receiving one of these, so a task that failed *silently* would leave
+/// the flag set and every later grammar queued behind it would never be fetched —
+/// one unknown fence language permanently disabling highlighting for the session.
+/// A failure therefore has to travel the same path as a success.
+enum GrammarOutcome {
+    /// The worker wrote it to the cache. The loop can now `ensure` it, which is a
+    /// `dlopen` and nothing else.
+    Ready(String),
+    /// It could not be obtained. `why` is for the status line; the language stays
+    /// un-inlined, which is the degradation it already had.
+    Failed(String, String),
+}
+
 fn may_run(name: &str, offered: &std::collections::HashSet<String>) -> Result<(), String> {
     if offered.contains(name) {
         Ok(())
@@ -745,17 +888,114 @@ fn save_history(history: &[Value], saved_upto: &mut usize, turn_over: bool) {
 /// log (chronological order), parsed into request-history messages. Corrupt
 /// lines are skipped, never fatal — a torn record simply shortens the
 /// resumed context.
+///
+/// Tool results come back as a one-line record of *what ran* rather than what
+/// it printed. See [`rebuild_tool_results`] for why, and for what is kept.
 fn replay_history(path: &std::path::Path, n: usize) -> Vec<Value> {
     match agent::memory::read_tail(path, n) {
-        Ok(lines) => lines
-            .into_iter()
-            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-            .collect(),
+        Ok(lines) => {
+            let msgs: Vec<Value> = lines
+                .into_iter()
+                .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+                .collect();
+            rebuild_tool_results(msgs)
+        }
         Err(e) => {
             eprintln!("[agent] memory replay failed: {e}");
             Vec::new()
         }
     }
+}
+
+/// Replace every replayed tool result with a one-line record of the call.
+///
+/// A tool result is the bulkiest thing in the log by a wide margin — a
+/// `fs.read` is a whole file, a `bash` is whatever the command printed — and the
+/// replay window is a *count* of messages (20), not a budget of bytes. So the
+/// window is really "the last twenty messages, however large", and one archived
+/// `cat` of a source file can be most of a cold start's context while telling the
+/// model nothing it can use: the bytes are about a repository state that has
+/// since moved, and the model is being asked to continue a conversation, not to
+/// re-derive a file it can simply read again.
+///
+/// What is kept is the fact and its cost: which tool ran, and how much output
+/// was dropped. That is enough for the model to know the call happened and to
+/// re-read if it wants the contents, and it keeps the elision honest rather than
+/// silent — a replay that quietly showed nothing at all would be
+/// indistinguishable from one where no tool had run.
+///
+/// The `role` and `tool_call_id` are **not** touched. A `tool` message is only
+/// legal immediately after the assistant message that requested it, matched by
+/// id, so rewriting it into a `user` message or dropping the id would make the
+/// request invalid rather than merely terse. The arguments in that assistant
+/// message still name the tool and its target, which is why the summary does not
+/// repeat them.
+fn rebuild_tool_results(mut msgs: Vec<Value>) -> Vec<Value> {
+    // `tool_call_id` -> the tool's name, harvested from the assistant messages as
+    // the list is walked. A result with no entry here is one whose requesting
+    // assistant message fell outside the replay window, which the ordinary case
+    // rather than a rare one: the window is the newest 20 *messages*, so it
+    // starts mid-turn whenever the last session ended on a tool round.
+    let mut names: HashMap<String, String> = HashMap::new();
+    for msg in &msgs {
+        if msg["role"].as_str() != Some("assistant") {
+            continue;
+        }
+        for call in msg["tool_calls"].as_array().into_iter().flatten() {
+            if let (Some(id), Some(name)) =
+                (call["id"].as_str(), call["function"]["name"].as_str())
+            {
+                names.insert(id.to_string(), name.to_string());
+            }
+        }
+    }
+
+    // Drop the parentless results *before* rewriting, so the loop below can rely
+    // on every survivor having a name.
+    //
+    // This is not a tidy-up: a `tool` message is only legal immediately after the
+    // assistant message that requested it, matched by id, so a parentless one
+    // makes the whole request invalid. llama-server is lenient about it (checked:
+    // a request whose first message is a `tool` one comes back 200), but the
+    // shipped default endpoint is `https://api.openai.com/v1`, where that is a
+    // 400 — so a cold start would fail outright, on the default configuration,
+    // for anyone whose previous session ended inside a tool round. Which is most
+    // sessions, given the agent uses tools to do anything.
+    msgs.retain(|msg| {
+        msg["role"].as_str() != Some("tool")
+            || msg["tool_call_id"]
+                .as_str()
+                .is_some_and(|id| names.contains_key(id))
+    });
+
+    for msg in &mut msgs {
+        if msg["role"].as_str() != Some("tool") {
+            continue;
+        }
+        let bytes = msg["content"].as_str().map_or(0, str::len);
+        let who = msg["tool_call_id"]
+            .as_str()
+            .and_then(|id| names.get(id).map(String::as_str))
+            .unwrap_or("a tool");
+        let content = elided_line(who, bytes);
+        msg["content"] = Value::String(content);
+    }
+    msgs
+}
+
+/// `[used fs.read; 12.4 kB of output not replayed]`, in one line.
+fn elided_line(who: &str, bytes: usize) -> String {
+    if bytes == 0 {
+        return format!("[used {who}; no output]");
+    }
+    let (value, unit) = if bytes >= 1024 * 1024 {
+        (bytes as f64 / (1024.0 * 1024.0), "MB")
+    } else if bytes >= 1024 {
+        (bytes as f64 / 1024.0, "kB")
+    } else {
+        (bytes as f64, "B")
+    };
+    format!("[used {who}; {value:.1} {unit} of output not replayed]")
 }
 
 /// The agent loop: multiplex crossterm events with the LLM turn stream, keep
@@ -771,6 +1011,7 @@ async fn run<W: Write>(
     chat: &mut Chat,
     config: &api::ChatConfig,
     vm: &mlua::Lua,
+    catalog: &mut Catalog,
     initial_history: Vec<Value>,
 ) -> Result<()> {
     // The starting conversation: whatever earlier sessions archived and this
@@ -800,6 +1041,20 @@ async fn run<W: Write>(
     // the conversation at the top of the next iteration.
     let mut pending_outcome: Option<ToolOutcome> = None;
     let mut round_sink: Option<agent::panels::PanelSink> = None;
+    // The highest panel id handed out so far, carried across tool rounds: see
+    // `PanelSink::continuing_from` for why an id has to outlive its sink.
+    let mut next_panel_id: u64 = 0;
+    // Grammars the transcript has asked for, and the ones already asked for.
+    // A fetch is seconds of network and `cc`, so it cannot run here — it runs in
+    // a task and writes to the cache, and the loop picks the result up by polling
+    // `grammar_rx` rather than by selecting on it, because nothing about a
+    // finished fetch should be able to delay a key press.
+    let mut grammars = GrammarQueue::default();
+    // Completion only. Progress goes straight to the status line from the task —
+    // it is a process-global mutex-backed line, so it is safe from any thread and
+    // needs no channel, and keeping the two apart means this channel only ever
+    // carries one thing: a language that is ready.
+    let (grammar_tx, mut grammar_rx) = mpsc::unbounded_channel::<GrammarOutcome>();
     // The `turn_completed` event handler, driven **cooperatively on this
     // thread**: a coroutine that suspends at each `agent.on_timeout` wait
     // (the loop keeps rendering) and is resumed when its reactor timer fires.
@@ -844,6 +1099,9 @@ async fn run<W: Write>(
                 continue;
             }
             tool_flight = None;
+            // The round is over, so the next one restarts the sink — but not the
+            // numbering. Carried here, where the sink is still in hand.
+            next_panel_id = round_sink.as_ref().map_or(next_panel_id, |s| s.next_id());
             round_sink = None;
             // The continuation is another request: re-index the registry again so
             // the tools stay current even between rounds of one turn.
@@ -904,6 +1162,7 @@ async fn run<W: Write>(
                 tokio::select! {
                     ev = rx.recv() => ev.map(Tick::Key),
                     tev = next_turn_event(&mut stream) => Some(Tick::Turn(tev)),
+                    cmd = lua_rx.recv() => cmd.map(Tick::Lua),
                     _eev = next_event(&mut event_rx) => Some(Tick::Event(())),
                     _ = tokio::time::sleep(Duration::from_millis(20)) => Some(Tick::Pulse),
                 }
@@ -911,16 +1170,21 @@ async fn run<W: Write>(
                 tokio::select! {
                     ev = rx.recv() => ev.map(Tick::Key),
                     tev = next_turn_event(&mut stream) => Some(Tick::Turn(tev)),
+                    cmd = lua_rx.recv() => cmd.map(Tick::Lua),
                     _eev = next_event(&mut event_rx) => Some(Tick::Event(())),
                 }
             }
         } else {
             // Idle: wait for terminal input or a Lua-forced inference
-            // (agent.trigger). Commands sent while the loop is busy stay
-            // queued and are picked up at the next idle moment — right after
-            // the current turn finishes, which is when compaction handlers
-            // want to run anyway. A suspended `turn_completed` handler is
-            // resumed here too, on its timer pokes.
+            // (agent.trigger). A *forced inference* sent while the loop is busy
+            // stays queued until the next idle moment — right after the current
+            // turn finishes, which is when compaction handlers want to run
+            // anyway, and starting a second turn mid-stream would interleave two
+            // conversations. An input edit is not in that category: it is a
+            // keystroke the user is watching for, so the busy arms above poll
+            // this channel too and it lands on the same tick as the key press
+            // that asked for it. A suspended `turn_completed` handler is resumed
+            // here too, on its timer pokes.
             tokio::select! {
                 ev = rx.recv() => ev.map(Tick::Key),
                 cmd = lua_rx.recv() => cmd.map(Tick::Lua),
@@ -936,47 +1200,35 @@ async fn run<W: Write>(
                 if let Some(question) = pending_question.take() {
                     // A permission question is on screen (and, for the shell,
                     // also as the panel overlay): only a verdict answers it —
-                    // everything else is ignored until the user decides
-                    // (Ctrl+C / Esc still quit). `a` is a verdict only when the
-                    // question offered "always".
+                    // everything else is ignored until the user decides.
+                    // `a` is a verdict only when the question offered "always".
                     if key.kind == KeyEventKind::Press {
                         match ask_choice(key.code, question.always) {
                             Some(choice) => {
-                                // The answer is handed to the tool's coroutine on
-                                // the next step (the top of the loop), as the
-                                // value its question yielded for.
-                                let answer = match choice {
-                                    AskChoice::Yes => agent::lua::AskAnswer::Allow,
-                                    AskChoice::Always => agent::lua::AskAnswer::AllowAndTrust,
-                                    AskChoice::No => agent::lua::AskAnswer::Deny(Some(
-                                        "denied by user".to_string(),
-                                    )),
-                                };
+                                let answer = record_verdict(app, choice);
                                 pending_verdict = Some(agent::lua::verdict_to_lua(vm, &answer));
-                                // The decision goes on the status bar, not into
-                                // the transcript. A cold command asks dozens of
-                                // times, and a message per answer buried the run
-                                // it was reporting on; the bar is one line and
-                                // holds exactly the latest.
-                                let outcome = match choice {
-                                    AskChoice::Yes => "allowed",
-                                    AskChoice::Always => "allowed, and remembered",
-                                    AskChoice::No => "denied",
-                                };
-                                let kind = if choice == AskChoice::No {
-                                    agent::status::StatusKind::Warn
-                                } else {
-                                    agent::status::StatusKind::Done
-                                };
-                                app.set_status_text(outcome, kind);
                             }
                             None => match key.code {
+                                // The command asking is the one thing worth
+                                // interrupting here: its whole tree is frozen
+                                // on this very question, so this is the moment a
+                                // user is most likely to want it gone — and the
+                                // ask it is blocked on will never be answered.
+                                // The question is dropped, not restored.
                                 KeyCode::Char('c')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    agent::seccomp::request_interrupt();
+                                    app.set_status_text("interrupting…", StatusKind::Warn);
+                                }
+                                // Ctrl+d leaves even mid-question: the one way out
+                                // that has to work while a verdict is pending,
+                                // which is exactly when a user may want it.
+                                KeyCode::Char('d')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
                                     break;
                                 }
-                                KeyCode::Esc => break,
                                 _ => {
                                     // Not an answer: put the question back.
                                     pending_question = Some(question);
@@ -988,15 +1240,47 @@ async fn run<W: Write>(
                         pending_question = Some(question);
                     }
                 } else {
-                    // Mid-turn Enter is ignored: the typed text stays in the
-                    // input and submits once the current turn ends.
-                    let quit = if busy && is_submit_key(&key) {
-                        false
-                    } else {
-                        app.handle_key(key)
+                    // A Lua `key` handler gets first refusal (see `resolve_key`).
+                    // It is asked only here — never on the pending-question path
+                    // above — because `y`/`n`/`a` are verdicts, and a binding
+                    // table that could redirect one would be able to answer a
+                    // permission question by accident.
+                    let bound = match key.kind {
+                        KeyEventKind::Press => resolve_key(vm, &key),
+                        _ => None,
                     };
-                    if quit {
-                        break;
+                    let effect = match bound {
+                        // A binding that names an action still has to pass the
+                        // letter gate, or `BIND["q"] = "quit"` quits the app
+                        // mid-word. Refusing falls through to the text path, so
+                        // the letter types rather than vanishing.
+                        Some(Ok(_)) if !app.key_may_act(&key) => {
+                            default_key(app, key, busy)
+                        }
+                        Some(Ok(action)) => app.perform(action),
+                        Some(Err(why)) => {
+                            // Loud, and not fatal: the key still does whatever it
+                            // did before, so a typo in a binding table costs a
+                            // message on the bar rather than the key.
+                            app.set_status_text(format!("key binding: {why}"), StatusKind::Warn);
+                            default_key(app, key, busy)
+                        }
+                        None => default_key(app, key, busy),
+                    };
+                    match effect {
+                        Effect::Continue => {}
+                        Effect::Quit => break,
+                        Effect::Interrupt => {
+                            // A latch, not a signal from here: the sandbox is
+                            // inside the tool's coroutine and this thread has no
+                            // handle on it. The driver picks the request up at
+                            // the top of its next step, kills the whole captured
+                            // tree, and the run finishes the ordinary way — so
+                            // there is nothing to unwind, and the tool result
+                            // comes back marked interrupted.
+                            agent::seccomp::request_interrupt();
+                            app.set_status_text("interrupting…", StatusKind::Warn);
+                        }
                     }
                     if let Some(text) = app.take_submitted() {
                         if text.strip_prefix("/save").is_some() {
@@ -1105,56 +1389,88 @@ async fn run<W: Write>(
                     }
                 }
             }
-            Tick::Key(CrosstermEvent::Mouse(ev)) => {
-                app.handle_mouse(ev);
-            }
+            Tick::Key(CrosstermEvent::Mouse(ev)) => match app.handle_mouse(ev) {
+                // A click on one of the dialog's answers. The panel reports only
+                // the letter inside the brackets, and it goes through the same
+                // `ask_choice` the keyboard does, so a pointer and a key cannot
+                // come to mean different things — the one thing worth being
+                // careful about when a *permission* can be granted by either.
+                Click::Answer(letter) => {
+                    if let Some(question) = pending_question.take() {
+                        match ask_choice(KeyCode::Char(letter), question.always) {
+                            Some(choice) => {
+                                let answer = record_verdict(app, choice);
+                                pending_verdict = Some(agent::lua::verdict_to_lua(vm, &answer));
+                            }
+                            None => {
+                                // `a` answers only a question that offered
+                                // "always", and the dialog is not offering it —
+                                // so the click landed on an answer that does not
+                                // exist, and the question stays.
+                                pending_question = Some(question);
+                            }
+                        }
+                    }
+                }
+                // Box collapse is the panel's own business, handled inside
+                // `handle_mouse`; it decides nothing and so reports nothing.
+                Click::Toggled | Click::Nothing => {}
+            },
             Tick::Key(_) => {} // resize and friends: just redraw below
 
-            Tick::Lua(cmd) => {
+            Tick::Lua(cmd) => match cmd {
+                // A Lua handler changed the input line (`agent.api.input_*`).
+                // Its own arm rather than something done where the key was
+                // pressed, because this is the only place the loop owns the
+                // input, and the channel is the only thing a `key` handler can
+                // reach it through. It falls through to the redraw below like
+                // every other tick, which is what makes the change visible.
+                agent::lua::AgentCommand::Input(op) => app.apply_input_op(op),
                 // A Lua handler forced a new inference (agent.trigger): it may
                 // have replaced the in-memory history (a compacted history
                 // handed back — the write side of compaction) and/or supplied
                 // a user message. Only the idle select polls the channel, so
                 // the loop is between turns here.
-                let agent::lua::AgentCommand::RunTurn {
+                agent::lua::AgentCommand::RunTurn {
                     history: replacement,
                     user,
-                } = cmd;
-                if let Some(replacement) = replacement {
-                    let n = replacement.len();
-                    history = replacement;
-                    app.push_boxed(
-                        Role::Assistant,
-                        format!("history replaced by Lua ({n} messages); continuing."),
-                        "config".into(),
-                    );
-                }
-                if let Some(text) = user {
-                    // Mirror a normal submission: `App::send` also records the
-                    // user line in the transcript.
-                    app.push(Role::User, text.clone());
-                    history.push(json!({"role": "user", "content": text}));
-                }
-                tool_rounds = 0;
-                if let Err(e) = refresh_chat_tools(chat, config, vm) {
-                    app.push_boxed(
-                        Role::Assistant,
-                        format!("tools refresh failed: {e:#}"),
-                        "error".into(),
-                    );
-                } else {
-                    match chat.stream_turn(&request_history(vm, &history)).await {
-                        Ok(s) => stream = Some(s),
-                        Err(e) => {
-                            app.push_boxed(
-                                Role::Assistant,
-                                format!("request failed: {e:#}"),
-                                "error".into(),
-                            );
+                } => {
+                    if let Some(replacement) = replacement {
+                        let n = replacement.len();
+                        history = replacement;
+                        app.push_boxed(
+                            Role::Assistant,
+                            format!("history replaced by Lua ({n} messages); continuing."),
+                            "config".into(),
+                        );
+                    }
+                    if let Some(text) = user {
+                        // Mirror a normal submission: `App::send` also records the
+                        // user line in the transcript.
+                        app.push(Role::User, text.clone());
+                        history.push(json!({"role": "user", "content": text}));
+                    }
+                    tool_rounds = 0;
+                    if let Err(e) = refresh_chat_tools(chat, config, vm) {
+                        app.push_boxed(
+                            Role::Assistant,
+                            format!("tools refresh failed: {e:#}"),
+                            "error".into(),
+                        );
+                    } else {
+                        match chat.stream_turn(&request_history(vm, &history)).await {
+                            Ok(s) => stream = Some(s),
+                            Err(e) => {
+                                app.push_boxed(
+                                    Role::Assistant,
+                                    format!("request failed: {e:#}"),
+                                    "error".into(),
+                                );
+                            }
                         }
                     }
                 }
-            }
+            },
 
             Tick::Event(()) => {
                 // The reactor's timer fired for a suspended `turn_completed`
@@ -1255,7 +1571,13 @@ async fn run<W: Write>(
                         .iter()
                         .map(|c| (c.id.clone(), c.name.clone(), c.arguments.clone()))
                         .collect();
-                    round_sink = Some(agent::panels::PanelSink::default());
+                    // `continuing_from`, not a fresh sink: a panel id is scoped
+                    // to the transcript's id→message map, which outlives the
+                    // round, so a counter that restarted here would hand round
+                    // two's first panel an id round one had already used — and it
+                    // would be appended to *that* panel, putting a write's
+                    // content and its dialog in the read box above it.
+                    round_sink = Some(agent::panels::PanelSink::continuing_from(next_panel_id));
                     // A call that never started (refused by the dispatch gate,
                     // or not in the registry) lands in `pending_outcome` and
                     // takes the same finish path a completed call does.
@@ -1304,6 +1626,72 @@ async fn run<W: Write>(
             app.drain_panel_ops(s);
         }
 
+        // Grammars, in three steps: notice what the transcript asked for, start
+        // at most one fetch, and apply whatever finished. Applying means a cache
+        // hit on the foreground catalog (milliseconds) followed by a re-highlight
+        // of the transcript, which changes no row count and so does not move the
+        // viewport — the whole reason this can happen mid-conversation.
+        for lang in app.take_wanted_grammars() {
+            grammars.request(lang);
+        }
+        if let Some(lang) = grammars.take_next() {
+            let dir = agent::grammars::cache_root();
+            let tx = grammar_tx.clone();
+            tokio::spawn(async move {
+                let named = lang.clone();
+                let mut worker = agent::grammars::Catalog::new()
+                    .with_cache_dir(dir)
+                    .with_progress(move |m| agent::status::info(format!("{m} ({named})")));
+                let outcome = match worker.ensure(&lang).await {
+                    Ok(_) => GrammarOutcome::Ready(lang.clone()),
+                    // Not retried, deliberately: `GrammarQueue::asked` keeps the
+                    // language, so a registry that is down, or a fence naming a
+                    // language that was never published, costs one attempt rather
+                    // than one per frame for the rest of the session.
+                    Err(e) => GrammarOutcome::Failed(lang.clone(), format!("{e:#}")),
+                };
+                let _ = tx.send(outcome);
+            });
+        }
+        while let Ok(outcome) = grammar_rx.try_recv() {
+            // Unconditional and first: a failure has to clear this too, or the
+            // queue is wedged for the rest of the session.
+            let lang = match outcome {
+                GrammarOutcome::Ready(lang) => {
+                    grammars.finish(true);
+                    lang
+                }
+                GrammarOutcome::Failed(lang, why) => {
+                    grammars.finish(false);
+                    app.set_status_text(
+                        format!("{lang} highlighting unavailable ({why})"),
+                        StatusKind::Warn,
+                    );
+                    continue;
+                }
+            };
+            // A cache hit, so this is a `dlopen` and a read — no network on the
+            // thread that draws frames. (If the cached object turned out to be
+            // unloadable, `ensure` falls through to a rebuild *here*, which would
+            // stall the UI for as long as that takes. The worker having just built
+            // it is the reason that is not a real risk rather than a handled one.)
+            match catalog.ensure(&lang).await {
+                Ok(g) => {
+                    let n = app.add_grammar(&lang, g);
+                    app.set_status_text(
+                        format!("{lang} highlighting ready ({n} messages)"),
+                        StatusKind::Done,
+                    );
+                }
+                Err(e) => {
+                    app.set_status_text(
+                        format!("{lang} highlighting unavailable ({e:#})"),
+                        StatusKind::Warn,
+                    );
+                }
+            }
+        }
+
         // Archive this iteration's new history messages (watermark-backed, so
         // each message is logged exactly once). Flush when the turn is fully
         // over — no stream and no tool in flight — so every finished turn is
@@ -1326,6 +1714,139 @@ async fn run<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `key` event end to end, from a `KeyEvent` to the action the loop will
+    /// perform: the spec the table matches on, the parsing, and the two ways it
+    /// can come back empty.
+    #[test]
+    fn a_lua_binding_table_turns_a_key_press_into_an_action() {
+        let vm = agent::lua::new_vm().expect("VM");
+        vm.load(
+            r#"
+            local BIND = { ["ctrl+q"] = "quit", ["alt+j"] = "newline" }
+            SEEN = nil
+            agent.on_event("key", function(k)
+              SEEN = { spec = k.spec, char = k.char, alt = k.alt, ctrl = k.ctrl }
+              return BIND[k.spec]
+            end)
+        "#,
+        )
+        .exec()
+        .expect("register");
+        let key = |code, mods| KeyEvent::new(code, mods);
+
+        assert_eq!(
+            resolve_key(&vm, &key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Some(Ok(Action::Quit)),
+            "a bound chord performs what it was bound to"
+        );
+        assert_eq!(
+            resolve_key(&vm, &key(KeyCode::Char('j'), KeyModifiers::ALT)),
+            Some(Ok(Action::Newline)),
+            "and another"
+        );
+        assert_eq!(
+            resolve_key(&vm, &key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            None,
+            "an unbound key is no answer at all, so the default stands"
+        );
+
+        // The payload is the contract, so it is worth seeing what the handler
+        // was actually told.
+        let seen = |vm: &mlua::Lua| -> Value {
+            let v: mlua::Value = vm.load("return SEEN").eval().expect("read back");
+            agent::mcp::lua_to_json(&v).expect("to json")
+        };
+        let payload = seen(&vm);
+        assert_eq!(payload["spec"], "x");
+        assert_eq!(payload["char"], "x");
+        assert_eq!(payload["alt"], false);
+        assert_eq!(payload["ctrl"], false);
+
+        // A named key has no character, and says so rather than sending "".
+        resolve_key(&vm, &key(KeyCode::Enter, KeyModifiers::ALT));
+        let payload = seen(&vm);
+        assert_eq!(payload["spec"], "alt+enter");
+        assert!(
+            payload["char"].is_null(),
+            "a named key has no char: {payload}"
+        );
+
+        // A typo is an error the loop can report, not a silently dead binding.
+        vm.load("agent.on_event('key', function() return 'conceall' end)")
+            .exec()
+            .expect("re-register");
+        let got = resolve_key(&vm, &key(KeyCode::Char('c'), KeyModifiers::ALT))
+            .expect("the key was asked about");
+        let why = got.expect_err("a typo is not an action");
+        assert!(why.contains("conceall"), "{why}");
+        assert!(why.contains("conceal"), "and lists the real names: {why}");
+    }
+
+    /// A Lua binding *replaces* the Rust default for that key, rather than
+    /// deferring to it.
+    ///
+    /// This is the load-bearing detail of the whole arrangement, and the reason
+    /// the keys Rust keeps are a fallback rather than a floor: the loop asks Lua
+    /// first and falls through to the default table only when Lua returns
+    /// nothing, so a table entry for a key Rust also holds makes the Rust row
+    /// unreachable. Pinned because the alternative — Rust consulting its defaults
+    /// first — would silently make every binding unreachable for exactly the keys
+    /// a user is most likely to want to move, which is the opposite of what a
+    /// configurable key is for.
+    ///
+    /// `Ctrl+d` is the example because the override is *observable* there: bound
+    /// to `conceal` it does something visibly different from the default `quit`.
+    #[test]
+    fn a_lua_binding_replaces_the_rust_default_for_that_key() {
+        let vm = agent::lua::new_vm().expect("VM");
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        // The shipped config binds nothing for `ctrl+d`, so it falls through to
+        // the Rust default.
+        assert_eq!(
+            resolve_key(&vm, &ctrl_d),
+            None,
+            "unbound in Lua, so Rust's default stands"
+        );
+        let mut app = App::default();
+        assert_eq!(app.handle_key(ctrl_d), Effect::Quit, "and Rust's default is to leave");
+
+        // Bind it in Lua and the same key now means something else entirely.
+        vm.load(
+            r#"
+            agent.on_event("key", function(k)
+              if k.spec == "ctrl+d" then return "conceal" end
+            end)
+        "#,
+        )
+        .exec()
+        .expect("re-register");
+        assert_eq!(
+            resolve_key(&vm, &ctrl_d),
+            Some(Ok(Action::Conceal)),
+            "a table entry takes the key over"
+        );
+    }
+
+    /// The input primitives report honestly when nothing is listening.
+    ///
+    /// `false`, not a silent success: a binding whose edit went nowhere would look
+    /// like a key that does nothing, which is the one failure a keybinding feature
+    /// must not have. Same contract as `agent.trigger`, and for the same reason —
+    /// headless runs and the probe have no loop to drain the command.
+    #[test]
+    fn the_input_primitives_report_false_with_no_loop_attached() {
+        let vm = agent::lua::new_vm().expect("VM");
+        for call in [
+            "return agent.api.input_insert('x')",
+            "return agent.api.input_backspace()",
+            "return agent.api.input_clear()",
+        ] {
+            let got: bool = vm.load(call).eval().expect("eval");
+            assert!(!got, "{call} reports that nothing was queued");
+        }
+    }
 
     /// Sequence for [`unique_log`]: distinct paths across parallel tests.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1364,6 +1885,155 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A replayed tool result becomes a one-line record of the call.
+    ///
+    /// Four things are pinned, and the last two are the ones that would be easy
+    /// to break while making the transcript shorter: the summary must name the
+    /// tool (resolved through the parent assistant message, since a result does
+    /// not carry the name itself), and the `role`/`tool_call_id` pair must survive
+    /// untouched — a `tool` message is only legal after the assistant message
+    /// that requested it, so rewriting it into a `user` message would make the
+    /// request invalid rather than merely terse.
+    #[test]
+    fn a_replayed_tool_result_becomes_one_line_about_the_call() {
+        let bulky = "x".repeat(40_000);
+        let path = unique_log("replay-tool");
+        {
+            let mut mem = agent::memory::Memory::open(&path).unwrap();
+            for m in [
+                r#"{"role":"user","content":"read the file"}"#,
+                r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs.read","arguments":"{\"path\":\"a.rs\"}"}}]}"#,
+                &format!(
+                    r#"{{"role":"tool","tool_call_id":"call_1","content":"{bulky}"}}"#
+                ),
+            ] {
+                mem.append(m).unwrap();
+            }
+            mem.flush().unwrap();
+        }
+        let replayed = replay_history(&path, 10);
+        let tool = replayed
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("the result is still a message");
+
+        assert_eq!(tool["role"], "tool", "still a tool message");
+        assert_eq!(tool["tool_call_id"], "call_1", "and still paired by id");
+        let content = tool["content"].as_str().expect("a string");
+        assert!(
+            content.contains("fs.read"),
+            "it names the tool, resolved from the parent: {content}"
+        );
+        assert!(
+            content.contains("not replayed"),
+            "and says the output is gone rather than pretending it was empty: {content}"
+        );
+        assert!(
+            content.len() < 120,
+            "one line, not 40 kB: {} bytes",
+            content.len()
+        );
+        // The user turn is untouched: only results are rebuilt.
+        assert_eq!(replayed[0]["content"], "read the file");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A result whose parent assistant message fell outside the replay window is
+    /// **dropped**, not kept and not renamed.
+    ///
+    /// This is the ordinary case, not an edge: the window is the newest 20
+    /// messages, so it starts mid-turn whenever the last session ended on a tool
+    /// round. Keeping the orphan would make the first request of the session
+    /// invalid on a strict server — `tool` with no matching `tool_calls` is a 400
+    /// on OpenAI, which is the endpoint the shipped config names. Measured
+    /// llama-server accepts it (200 either way), so this only bites the default
+    /// configuration, which is the wrong place for a landmine.
+    #[test]
+    fn a_parentless_tool_result_is_dropped_not_repaired() {
+        let out = rebuild_tool_results(vec![
+            serde_json::json!({
+                "role": "tool", "tool_call_id": "call_9", "content": "orphaned output",
+            }),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ]);
+        assert_eq!(out.len(), 1, "only the user turn survives");
+        assert_eq!(out[0]["content"], "hi");
+        assert!(
+            !out.iter().any(|m| m["role"] == "tool"),
+            "and no orphan is left to invalidate the request"
+        );
+    }
+
+    /// The window is a message *count*, so it can also start mid-round in the
+    /// other direction — and must not, or a `tool` result loses its request.
+    ///
+    /// One paired round in the middle proves the mapping is by id and not by
+    /// position: the rebuild must survive unrelated `tool_calls` elsewhere.
+    #[test]
+    fn a_result_is_matched_to_its_own_call_not_its_position() {
+        let out = rebuild_tool_results(vec![
+            serde_json::json!({
+                "role": "assistant", "content": null,
+                "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "fs.read", "arguments": "{}"}},
+                    {"id": "c2", "type": "function",
+                     "function": {"name": "bash.bash", "arguments": "{}"}},
+                ],
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "c2", "content": "out2"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": "out1"}),
+        ]);
+        let named: Vec<&str> = out
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().expect("a string"))
+            .collect();
+        assert_eq!(named.len(), 2, "both results are kept");
+        assert!(
+            named[0].contains("bash.bash") && named[1].contains("fs.read"),
+            "each names its own tool, by id rather than by order: {named:?}"
+        );
+    }
+
+    /// The byte reduction, on a log that looks like a real turn.
+    ///
+    /// Measured rather than asserted by eye, because "much smaller" is the whole
+    /// claim and it is worth knowing the ratio. It is also the number to watch if
+    /// the replay window is ever changed: this is what the window is spending.
+    #[test]
+    fn rebuilding_shrinks_a_realistic_turn_by_an_order_of_magnitude() {
+        let file = "fn main() {}\n".repeat(2000); // ~30 kB, a source file
+        let raw = vec![
+            serde_json::json!({"role": "user", "content": "read main.rs"}),
+            serde_json::json!({
+                "role": "assistant", "content": null,
+                "tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "fs.read", "arguments": "{\"path\":\"main.rs\"}"}}],
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "c1", "content": file}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "It prints a newline and nothing else.",
+            }),
+        ];
+        let before: usize = raw.iter().map(|m| m.to_string().len()).sum();
+        let after: usize = rebuild_tool_results(raw.clone())
+            .iter()
+            .map(|m| m.to_string().len())
+            .sum();
+        assert!(
+            after * 8 < before,
+            "expected a large reduction, got {before} -> {after}"
+        );
+        // And it is a reduction in the tool result, not a truncation of the answer.
+        let rebuilt = rebuild_tool_results(raw);
+        assert_eq!(
+            rebuilt[3]["content"], "It prints a newline and nothing else.",
+            "the assistant's own words are not the thing being elided"
+        );
+    }
+
     #[test]
     fn replay_history_returns_empty_for_a_missing_or_empty_log() {
         let gone = unique_log("replay-gone");
@@ -1385,6 +2055,163 @@ mod tests {
     /// The dispatch gate: a tool call runs only if this request offered that
     /// name. A mode that swapped the registry, a tool nobody registered, and an
     /// old call replayed out of the history all land here.
+    #[test]
+    /// A failed fetch must not wedge the queue.
+    ///
+    /// This is a regression test, and the bug it pins was in the wiring rather
+    /// than in any logic: the task reported *successes* down the channel and
+    /// logged failures to the status line instead, while the loop's "one at a
+    /// time" flag was cleared only by receiving something. So a single fence naming
+    /// a language that could not be fetched — offline, or a name nobody published —
+    /// left the flag set and every grammar behind it unfetched for the rest of the
+    /// session. Nothing crashed and nothing was logged as an error; highlighting
+    /// just silently stopped improving.
+    fn a_failed_fetch_still_releases_the_queue() {
+        let mut q = GrammarQueue::default();
+        for lang in ["rust", "python"] {
+            assert!(q.request(lang.to_string()));
+        }
+        assert_eq!(q.take_next().as_deref(), Some("rust"), "first goes first");
+
+        // In flight: nothing else starts, however long it takes.
+        assert_eq!(q.take_next(), None, "one at a time");
+
+        // The failure, and the queue is usable again.
+        assert!(!q.finish(false), "reported as a failure");
+        assert_eq!(
+            q.take_next().as_deref(),
+            Some("python"),
+            "so the one behind it is not stranded"
+        );
+    }
+
+    /// A language is fetched at most once per session, however often it is asked
+    /// for and however badly it goes.
+    ///
+    /// The transcript asks again on every re-highlight and a message with forty
+    /// `rust` blocks asks forty times, so the dedup is the difference between one
+    /// fetch and one per block. And on failure it is what stops the loop retrying a
+    /// language the registry does not have, once per frame, until the session ends.
+    /// The loop's grammar pump, end to end, in the shape it actually runs.
+    ///
+    /// The ignored test in `tui` proves the *chain* — notice, acquire, add, apply —
+    /// but it drives those halves by hand. What is left untested is the wiring
+    /// between them: that a request reaches a spawned task, that the task's
+    /// completion reaches the loop, and that the loop then re-enters its own
+    /// catalog and applies the result. That is thirty lines of glue around a
+    /// six-hundred-line loop body, and glue is where the silent failures live.
+    ///
+    /// So this runs the real [`GrammarQueue`], a real spawned [`Catalog`]
+    /// acquisition, the real channel, and the real [`App`] apply — the loop body
+    /// with the terminal and the model taken out. `ignored` because it needs the
+    /// network and a C compiler to obtain a grammar the app does not ship with;
+    /// everything it asserts about *policy* is covered hermetically above.
+    #[tokio::test]
+    #[ignore = "needs the network and a C compiler; run with --ignored"]
+    async fn a_wanted_grammar_is_fetched_in_the_background_and_applied() {
+        use agent::tui::{App, Role};
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!("agent-pump-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut catalog = agent::grammars::Catalog::new().with_cache_dir(&dir);
+        for lang in ["markdown", "markdown_inline", "bash", "json"] {
+            catalog
+                .ensure(lang)
+                .await
+                .unwrap_or_else(|e| panic!("{lang} is required: {e:#}"));
+        }
+        let mut app = App::default();
+        app.set_highlight(agent::tui::MarkdownHighlighter::from_catalog(&catalog));
+        app.push(
+            Role::Assistant,
+            "# Fix\n\n```rust\nfn main() {\n    let x: u32 = 7;\n}\n```\n".to_string(),
+        );
+
+        // The transcript asks, and the queue takes the request.
+        let mut q = GrammarQueue::default();
+        for lang in app.take_wanted_grammars() {
+            q.request(lang);
+        }
+        let lang = q.take_next().expect("rust is wanted and nothing is in flight");
+
+        // A worker, spawned the way the loop spawns it, pointed at the same cache
+        // directory the foreground catalog reads — which is the part that makes the
+        // foreground `ensure` below a cache hit rather than a second download.
+        let (tx, mut rx) = mpsc::unbounded_channel::<GrammarOutcome>();
+        let worker_dir = dir.clone();
+        tokio::spawn(async move {
+            let mut worker = agent::grammars::Catalog::new().with_cache_dir(worker_dir);
+            let outcome = match worker.ensure(&lang).await {
+                Ok(_) => GrammarOutcome::Ready(lang.clone()),
+                Err(e) => GrammarOutcome::Failed(lang.clone(), format!("{e:#}")),
+            };
+            let _ = tx.send(outcome);
+        });
+
+        // Meanwhile the loop carries on: nothing is blocked, and nothing else is
+        // started while that one is in flight.
+        assert_eq!(q.take_next(), None, "one at a time, even while we wait");
+
+        // The loop polls this between frames rather than awaiting it, so the test
+        // drains the channel the same way — a plain `recv` here, because blocking on
+        // it is exactly the difference being tested elsewhere and would hide a
+        // completion that is never sent.
+        let mut lang = None;
+        while lang.is_none() {
+            while let Ok(outcome) = rx.try_recv() {
+                match outcome {
+                    GrammarOutcome::Ready(l) => {
+                        assert!(q.finish(true));
+                        lang = Some(l);
+                    }
+                    GrammarOutcome::Failed(l, why) => {
+                        assert!(!q.finish(false));
+                        panic!("{l} should be obtainable: {why}");
+                    }
+                }
+            }
+            if lang.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let lang = lang.expect("the worker reported back");
+
+        // The foreground catalog now has it as a cache hit — no network here, which
+        // is the property that keeps this off the frame-drawing path.
+        let g = catalog.ensure(&lang).await.expect("a cache hit");
+        let changed = app.add_grammar(&lang, g);
+        assert_eq!(changed, 1, "the one message that was missing it");
+        assert!(
+            app.take_wanted_grammars().is_empty(),
+            "and the gap is closed, so nothing queues for it again"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_grammar_is_asked_for_once_however_many_times_it_turns_up() {
+        let mut q = GrammarQueue::default();
+        for _ in 0..40 {
+            q.request("rust".to_string());
+        }
+        assert_eq!(q.take_next().as_deref(), Some("rust"));
+        assert!(!q.finish(false), "and it never arrived");
+        assert_eq!(
+            q.take_next(),
+            None,
+            "no retry: a language that cannot be fetched is not fetched again"
+        );
+
+        // A different language still gets its turn, which is the property the
+        // dedup has to have without also being a block.
+        q.request("python".to_string());
+        assert_eq!(q.take_next().as_deref(), Some("python"));
+    }
+
     #[test]
     fn only_the_tools_a_request_offered_may_run() {
         let offered: std::collections::HashSet<String> =

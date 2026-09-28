@@ -430,8 +430,16 @@ end
 -- re-triggers itself forever. Stop when the history is short enough, which is
 -- what the automatic handler below does with a `state` flag.
 --
--- Only "turn_completed" fires today; other event names are accepted and never
--- called.
+-- Two events fire today, and they are not the same kind of thing.
+--
+--   "turn_completed"  a notification. The handler is told what happened and its
+--                     return value is ignored. This section's own handler.
+--
+--   "key"             a question. The handler is given a key press and its
+--                     return value *is* the answer — see §8.
+--
+-- Any other name is accepted and never called, so a typo registers a handler
+-- that silently never runs.
 agent._events = agent._events or {}
 
 function agent.on_event(name, fn)
@@ -524,7 +532,158 @@ agent.on_event("turn_completed", function(info)
 end)
 
 -- ===========================================================================
--- 8. WHAT IS NOT IN THIS FILE
+-- 8. KEYS — rebinding what a key press means
+-- ===========================================================================
+--
+-- The "key" event is the whole keybinding mechanism. Rust owns the keys that
+-- exist and the actions they can mean; you own the mapping between them.
+--
+--   agent.on_event("key", function(k) … end)
+--
+-- `k` is:
+--
+--   k.spec    the chord, as a table writes it — "alt+enter", "ctrl+c", "q",
+--             "f5", "up". This is the string to match on.
+--   k.char    the printable character, or nil for a named key.
+--   k.ctrl, k.alt, k.shift    booleans, if you would rather test than match.
+--
+-- Return the name of an action and the agent does it; return nothing and the
+-- key keeps its default meaning. A name is a shorthand, not the limit — see
+-- "a binding can type" below. The actions are:
+--
+--   "send"        submit the input line
+--   "quit"        leave
+--   "conceal"     toggle markup concealment
+--   "scroll_up" / "scroll_down"    scroll the transcript
+--   "top" / "bottom"               jump to the start or end
+--
+-- So the smallest useful binding is a lookup:
+--
+--   local BIND = { ["ctrl+q"] = "quit", ["alt+j"] = "newline" }
+--   agent.on_event("key", function(k) return BIND[k.spec] end)
+--
+-- Three things to know before you write one.
+--
+-- **A bare letter is a character first and a command second.** A letter reaches
+-- the action only when the input line is empty; a chord — anything with a
+-- modifier, or a named key — always does. This is the rule that makes a flat
+-- table safe, and it lives in Rust (`App::key_may_act`) rather than here so that
+-- every table gets it: without it, `BIND["q"] = "quit"` quits the app halfway
+-- through the word "quick". A key the rule refuses is not swallowed — the letter
+-- types instead.
+--
+-- **The keys that answer a permission question are not yours.** While a question
+-- is on screen, `y`/`n`/`a` are verdicts, and the "key" event is not fired at
+-- all. A binding table that could redirect those could answer a permission
+-- question by accident. (`Ctrl+c` is the deliberate exception: it stops the
+-- command that is asking, whose tree is frozen on that very question.)
+--
+-- **A typo is loud, not silent.** An action name that does not exist puts
+-- `key binding: unknown action "conceall"; expected one of …` on the status
+-- bar, and the key still does whatever it did before. Returning a number, or a
+-- table, is the same kind of error. `nil` and `false` are the only "no opinion"
+-- answers.
+--
+-- The bindings this config ships with. Rust keeps two keys for itself and no
+-- more: `Ctrl+c` (stop the running command) and `Ctrl+d` (leave). Everything
+-- below — including `Alt+Enter`, which used to be a Rust default — is yours to
+-- change, delete or extend.
+--
+-- The rule that makes a flat table safe is in Rust, not here: **a bare letter
+-- is a character first and a command second.** A letter only reaches the action
+-- when the input line is empty — so `q` below quits an empty app and types a
+-- `q` into a message — and a chord always does. That is why leaving is on
+-- `Ctrl+d` and `Esc` as well as `q`, and why it would be a bug to add a bare
+-- letter bound to something destructive without thinking about it.
+local BIND = {
+  ["alt+enter"] = "newline",   -- see below: a function, not a name
+  ["enter"]    = "send",
+  ["esc"]      = "quit",
+  ["q"]        = "quit",         -- letters are gated on an empty input
+  ["alt+c"]    = "conceal",
+  ["j"]        = "scroll_down",
+  ["down"]     = "scroll_down",
+  ["k"]        = "scroll_up",
+  ["up"]       = "scroll_up",
+  ["home"]     = "top",
+  ["end"]      = "bottom",
+  ["pageup"]   = "scroll_up",
+  ["pagedown"] = "scroll_down",
+}
+
+agent.on_event("key", function(k)
+  local a = BIND[k.spec]
+  -- "newline" is spelled as a call rather than a name because
+  -- `agent.api.input_insert` can type anything, not just a newline: a chord
+  -- bound to `input_insert("0")` inserts a zero mid-sentence, which is what a
+  -- leader key is for. The named actions stay names because a name is the short
+  -- way to say "quit", and a table of strings is easier to read than a table of
+  -- closures.
+  if a == "newline" then
+    agent.api.input_insert("\n")
+    return nil
+  end
+  return a
+end)
+
+-- ## A binding can type, not just choose
+--
+-- A handler is not restricted to the names above. `agent.api.input_insert(text)`
+-- appends to the input line, and `input_backspace` / `input_clear` are its
+-- mirrors — which is why `alt+enter` below is spelled as a call. A chord bound to
+-- `input_insert("0")` types a zero mid-sentence, and that is the whole of what a
+-- leader key is.
+--
+-- These are ungated, unlike a *binding*: the letter rule below governs which key
+-- may mean a command, and by the time an edit is queued a command has already
+-- been chosen. They return `false` when no loop is attached (headless, the
+-- probe), so a binding can tell that its edit went nowhere rather than looking
+-- like a key that does nothing.
+--
+-- Two things to know before you change the table.
+--
+-- **Rust binds two keys of its own**, whatever this table says: `Ctrl+c` (stop
+-- the running command) and `Ctrl+d` (leave). Those two are about the agent
+-- rather than about taste — `Ctrl+c` is the only way to
+-- stop a tool, and `Ctrl+d` is on a key nothing else claims, so that stopping a
+-- command and throwing away the session stay different gestures. This is why
+-- leaving is `Ctrl+d` and not `Ctrl+c`, and why `Esc` below is a convenience
+-- rather than the way out.
+--
+-- **A typo is loud, not silent.** An action name that does not exist puts
+-- `key binding: unknown action "conceall"; expected one of …` on the status
+-- bar, and the key still does whatever it did before. Returning a number, or a
+-- table, is the same kind of error. `nil` and `false` are the only "no opinion"
+-- answers.
+--
+-- **A key sequence is ten lines of Lua.** The handler is called on *every* key
+-- press and can hold state, so a chord that starts on something untypable works
+-- without any Rust support:
+--
+--   local armed = nil
+--   agent.on_event("key", function(k)
+--     if armed then
+--       local chord = armed .. "+" .. k.spec
+--       armed = nil
+--       return BIND[chord] or BIND[k.spec]   -- degrade; never swallow the key
+--     end
+--     if k.spec == "ctrl+x" then armed = "ctrl+x"; return nil end
+--     return BIND[k.spec]
+--   end)
+--
+-- The `or BIND[k.spec]` is the part that matters: a chord that does not match
+-- falls back to the second key's own meaning, so a sequence can never lose a
+-- keystroke. Without it an armed prefix is a black hole and you would need a
+-- visible pending state and a timeout — neither of which exists yet, so the
+-- armed prefix is invisible. That is the whole of the caveat.
+--
+-- Note also that the hint under the input box is built from the three keys Rust
+-- binds (`KEY_HELP` in `src/tui/mod.rs`), so nothing in `BIND` appears in it.
+-- The agent cannot read this table's shape, and a hint that guessed at it would
+-- be wrong more often than not.
+
+-- ===========================================================================
+-- 9. WHAT IS NOT IN THIS FILE
 -- ===========================================================================
 --
 -- The rest of the Lua surface is library modules under `lua/lib/`, all

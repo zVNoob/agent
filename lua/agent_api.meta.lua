@@ -8,7 +8,7 @@
 -- contents and `lua/api.lua` disagree. So there is nothing for LuaLS to read
 -- from the module itself, and every `agent.api.step(h)` in the tree is an
 -- unknown global to a language server without this file. It is the type view of
--- the same 33 primitives, and it is a *view*: the authority is `lua/api.lua`,
+-- the same 36 primitives, and it is a *view*: the authority is `lua/api.lua`,
 -- which is prose the loader checks against the real bridge at startup.
 --
 -- Loading: `runtime.metaFiles` in `.luarc.json` names this file (and the
@@ -283,6 +283,30 @@ function agent.api.close_stdin(handle) end
 ---@param args string|table|any
 ---@return boolean
 function agent.api.trigger(args) end
+
+---Append text to the input line, the one under the transcript.
+---
+---The route that makes an `agent.on_event("key")` handler able to *type* rather
+---than only pick from a fixed set of actions: a chord bound to
+---`input_insert("0")` inserts a zero mid-sentence, which is what a leader key is
+---for. Ungated on purpose — the "a bare letter is a character first" rule
+---governs which *key* may mean a command, and by the time this is called a
+---command has already been chosen.
+---
+---Returns whether it queued; `false` when no loop is bound to drain it.
+---@param text string What to append.
+---@return boolean
+function agent.api.input_insert(text) end
+
+---Remove the last character from the input line, if there is one. The mirror of
+---`input_insert`; the two together are enough to build anything a key table
+---needs without a primitive for "delete a word".
+---@return boolean
+function agent.api.input_backspace() end
+
+---Empty the input line, as `Ctrl+u` does in readline.
+---@return boolean
+function agent.api.input_clear() end
 
 ---Put a question to the user and block for the answer. `always` is Lua's own
 ---flag and is what decides whether the prompt may offer `[a]lways`.

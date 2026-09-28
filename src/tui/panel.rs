@@ -370,6 +370,14 @@ impl TurnPanel {
         self.highlighter = highlighter;
     }
 
+    /// The highlighter, for a caller that has to change it *and* then re-render
+    /// the messages it affects. A disjoint borrow is not available for that from
+    /// outside the module — `rehighlight` needs `&mut messages` while the
+    /// highlighter is `&mut self` — so the two steps are sequenced here instead.
+    pub fn highlighter_mut(&mut self) -> Option<&mut MarkdownHighlighter> {
+        self.highlighter.as_mut()
+    }
+
     /// Apply one Lua panel op ([`PanelOp`]) to the transcript. Panels render
     /// through exactly the same pipelines as every other message — `boxed`
     /// panels are the click-collapsible bordered boxes, plain panels are
@@ -677,6 +685,41 @@ impl TurnPanel {
         pane.segs = merged_segs(base, &pane.user_segs, pane.text.len());
     }
 
+    /// Re-highlight every message, so a grammar that arrived after they were
+    /// rendered applies to them too.
+    ///
+    /// This is the "hot" half of hot loading, and it is safe to call on a
+    /// transcript the user is looking at: a [`Segment`] carries a resolved
+    /// [`Style`] rather than a capture index, and `wrap_segments` lays text out
+    /// identically to `wrap_lines` for full-coverage segments (pinned by
+    /// `wrap_segments_matches_wrap_lines_layout`). So re-styling changes no row
+    /// count, moves no scroll position, and cannot shift the viewport under the
+    /// pointer — which is the whole reason it can run mid-conversation instead of
+    /// waiting for a restart.
+    ///
+    /// Returns how many messages changed, so a caller can say so rather than
+    /// re-rendering on every frame for a grammar that arrived with nothing to
+    /// improve.
+    pub fn rehighlight_all(&mut self) -> usize {
+        if self.highlighter.is_none() {
+            return 0;
+        }
+        // The viewport is deliberately *not* touched. Follow is re-asserted only
+        // if it was already on: a user who has scrolled up to read something must
+        // not be yanked back to the bottom by a background grammar arriving.
+        let follow = self.follow;
+        let mut changed = 0;
+        for msg in &mut self.messages {
+            let before = (msg.segs.clone(), msg.conceal.clone());
+            Self::rehighlight(&mut self.highlighter, msg);
+            if before.0 != msg.segs || before.1 != msg.conceal {
+                changed += 1;
+            }
+        }
+        self.follow = follow;
+        changed
+    }
+
     fn push_inner(&mut self, role: Role, text: String, boxed: Option<String>, conceal_box: bool) {
         let (segs, conceal) = match &mut self.highlighter {
             Some(hl) => {
@@ -915,38 +958,68 @@ impl TurnPanel {
     }
 
     /// A left click at terminal coordinates `(col, row)` inside the panel's
-    /// `area`: if it lands on any rendered row of a *framed* boxed (tool-call)
-    /// message, toggle that box's collapsed state (`reasoning`/`response`
-    /// blocks are borderless, so they are not clickable). Returns `true` when
-    /// the click was consumed; normal messages are not clickable.
-    pub fn handle_click(&mut self, col: usize, row: usize, area: Rect) -> bool {
+    /// `area`, resolved to whatever it landed on.
+    ///
+    /// Two things are clickable and they are not the same kind of thing. A
+    /// framed boxed message toggles its collapsed state — navigation, so it is
+    /// safe to do by accident. A pending dialog's answers *decide a question*,
+    /// so they come back as the letter inside the brackets and nothing here
+    /// interprets it: the caller routes it through the same rule the keyboard
+    /// uses, and a click therefore cannot mean something a keypress would not.
+    pub fn handle_click(&mut self, col: usize, row: usize, area: Rect) -> Click {
         // Only the transcript body is clickable (not the scrollbar lane at
         // the right edge, or rows above/below the panel).
         let left = area.x as usize;
         let right = (area.x + area.width).saturating_sub(1) as usize;
         if col < left || col >= right || row < area.y as usize {
-            return false;
+            return Click::Nothing;
         }
         // Screen row -> paragraph row, undoing the viewport's scroll offset.
         let content_row = (row - area.y as usize) + self.scroll;
         // Cached row counts (no wrapping on the common path — `ensure_measured`
         // re-measures only stale messages). The panel's body width equals
         // `content_w(area)`.
-        self.ensure_measured(content_w(area));
+        // The *same* width `ensure_measured` used, and not `area.width`: the
+        // row counts it cached were computed at `content_w`, and a body height
+        // measured at a different width wraps differently and puts the answers
+        // on the wrong row.
+        let width = content_w(area);
+        self.ensure_measured(width);
+        let conceal = self.renderer.conceal_enabled();
         let mut acc = 0;
         for msg in &mut self.messages {
             let rows = msg.rows;
             if content_row < acc + rows {
+                // The dialog's answers are checked first: they sit inside a
+                // boxed message, and a click on one that fell through to the
+                // collapse toggle would both answer the question *and* fold
+                // the box it was drawn in.
+                if let Some(overlay) = msg.overlay.as_ref() {
+                    // Row 0 is the box's top border, then the body, then the
+                    // dialog — whose first row is the one carrying the prompt.
+                    let prompt_row = 1 + body_row_count(msg, width, conceal);
+                    if content_row - acc == prompt_row {
+                        // This row belongs to the dialog and does nothing else:
+                        // a click on its border is not a click on the box, and
+                        // letting it through would fold away the very question
+                        // the pointer was aimed at.
+                        let offset = col - left - FRAME_COLS - PROMPT_COL;
+                        return match prompt_hit(&overlay_prompt(overlay.always), offset) {
+                            Some(key) => Click::Answer(key),
+                            None => Click::Nothing,
+                        };
+                    }
+                }
                 if msg.boxed.is_some() && !is_borderless_box(msg) {
                     msg.collapsed = !msg.collapsed;
                     msg.dirty = true; // collapse changes the row count
-                    return true;
+                    return Click::Toggled;
                 }
-                return false;
+                return Click::Nothing;
             }
             acc += rows;
         }
-        false
+        Click::Nothing
     }
 }
 
@@ -954,6 +1027,37 @@ impl TurnPanel {
 /// column is the scrollbar lane, not body).
 fn content_w(area: Rect) -> usize {
     (area.width as usize).saturating_sub(1)
+}
+
+/// How many rows the *body* of a boxed message occupies — everything between
+/// the box's top and bottom borders, excluding the pending dialog.
+///
+/// Extracted because two things need this number and must not compute it
+/// differently: [`message_rows`], which stacks row counts down the transcript,
+/// and [`TurnPanel::handle_click`], which maps a clicked row back to a message.
+/// When the click handler worked the height out its own way, a one-row
+/// disagreement would put the clickable answers a line above or below where they
+/// are drawn — the failure mode of every hit test, and the reason this is a
+/// function rather than an expression written out in two places.
+fn body_row_count(msg: &Message, content_w: usize, conceal: bool) -> usize {
+    let inner = content_w.saturating_sub(4);
+    if msg.panes.is_some() {
+        // Split body heights come from the pane layout, which reflows
+        // side-by-side→stacked with the width ([`split_body_rows`] is the
+        // single measure used here and in [`boxed_lines`]).
+        return split_body_rows(msg, inner).len().max(1);
+    }
+    if conceal && msg.conceal_box {
+        // Mirror `boxed_lines`: the conceal path hides markers, so the height
+        // comes from the display text.
+        let n = if msg.conceal.is_empty() {
+            wrap_lines(&msg.text, inner).len()
+        } else {
+            wrap_concealed(msg, inner).len()
+        };
+        return n.max(1);
+    }
+    wrap_lines(&msg.text, inner).len().max(1)
 }
 
 /// Rows `msg` occupies; an empty message still takes one row (its tag line).
@@ -969,32 +1073,7 @@ fn message_rows(msg: &Message, content_w: usize, conceal: bool) -> usize {
         if msg.collapsed {
             return 2;
         }
-        if msg.panes.is_some() {
-            // Split body heights come from the pane layout, which reflows
-            // side-by-side→stacked with the width ([`split_body_rows`] is the
-            // single measure used here and in [`boxed_lines`]).
-            let inner = content_w.saturating_sub(4);
-            let rows = split_body_rows(msg, inner).len().max(1);
-            let overlay = if msg.overlay.is_some() {
-                overlay_rows(msg, content_w).len()
-            } else {
-                0
-            };
-            return rows + 2 + overlay;
-        }
-        let inner = content_w.saturating_sub(4);
-        let rows = if conceal && msg.conceal_box {
-            // Mirror `boxed_lines`: the conceal path hides markers, so the
-            // height comes from the display text.
-            let n = if msg.conceal.is_empty() {
-                wrap_lines(&msg.text, inner).len()
-            } else {
-                wrap_concealed(msg, inner).len()
-            };
-            n.max(1)
-        } else {
-            wrap_lines(&msg.text, inner).len().max(1)
-        };
+        let rows = body_row_count(msg, content_w, conceal);
         let overlay = if msg.overlay.is_some() {
             overlay_rows(msg, content_w).len()
         } else {
@@ -1157,11 +1236,121 @@ fn boxed_lines(msg: &Message, content_w: usize, conceal: bool) -> Vec<Line<'stat
     out
 }
 
+/// What a click in the transcript landed on.
+///
+/// [`Answer`](Click::Answer) is deliberately just a letter: the panel knows
+/// where the dialog is drawn, and nothing about what an answer *means* — that
+/// is the caller's rule, shared with the keyboard so the two cannot diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Click {
+    /// A framed box toggled open or shut. Navigation, not a decision.
+    Toggled,
+    /// One of the dialog's answers: the letter inside the brackets, already
+    /// lower-cased. The caller maps it with the same rule a key press uses, so
+    /// `a` here means exactly what `a` on the keyboard means.
+    Answer(char),
+    /// Anywhere else: empty input, a borderless block, the scrollbar lane.
+    Nothing,
+}
+
+/// Cells of frame between the panel's left edge and the text inside a box:
+/// the `│` and its trailing space. Every row of a framed message starts with
+/// them, and the click test has to step over them to reach the dialog.
+const FRAME_COLS: usize = 2;
+
+/// Cells of the dialog's own top border before the key prompt begins: `┌`, `─`,
+/// and the space between.
+///
+/// One constant for both the hit test and [`overlay_title`], because the two
+/// are the same fact about the same string and a disagreement between them puts
+/// the clickable answers somewhere other than where they are drawn.
+const PROMPT_COL: usize = 3;
+
+/// The dialog's answers, as `(start, end, key)` columns measured from the start
+/// of the prompt string.
+///
+/// A label is the bracketed letter *and* the word after it — `[y]es`, not just
+/// the `y` — because the brackets say which key does it and the word is what a
+/// pointer is aiming at. It runs to the next `·`, which is also where the visual
+/// gap is, so a click on the gap or the `─` fill is nothing rather than a
+/// lucky guess.
+fn prompt_labels(prompt: &str) -> Vec<(usize, usize, char)> {
+    let chars: Vec<char> = prompt.chars().collect();
+    let mut out = Vec::new();
+    let mut open: Option<usize> = None;
+    for (col, &ch) in chars.iter().enumerate() {
+        match ch {
+            '[' => open = Some(col),
+            ']' => {
+                let Some(start) = open.take() else { continue };
+                // Up to the next `·`, then back off the space in front of it:
+                // the label is the bracketed key and the word after it, and the
+                // gap is a gap. Leaving the space inside made a click *between*
+                // two answers answer the first one, which is the sort of thing
+                // that reads as "the mouse is broken" and is not.
+                let mut end = chars[col + 1..]
+                    .iter()
+                    .position(|c| *c == '\u{00B7}')
+                    .map_or(chars.len(), |d| col + 1 + d);
+                while end > start + 3 && chars[end - 1].is_whitespace() {
+                    end -= 1;
+                }
+                let key = chars.get(start + 1).copied().unwrap_or('?');
+                out.push((start, end, key.to_ascii_lowercase()));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The answer a click at `offset` columns into the prompt lands on, if any.
+fn prompt_hit(prompt: &str, offset: usize) -> Option<char> {
+    prompt_labels(prompt)
+        .into_iter()
+        .find(|(start, end, _)| offset >= *start && offset < *end)
+        .map(|(_, _, key)| key)
+}
+
 /// The key prompt drawn as the dialog's title: the user answers the pending
 /// permission ask with `y` (allow) or `n` (deny) while the sandbox keeps the
 /// asking syscall frozen — and with `a` as well when the question had something
 /// to remember, which is the only case where "always" is an answer the agent
 /// can act on rather than a promise it cannot keep.
+/// The dialog's top border, carrying the key prompt in its title.
+///
+/// The bracketed letters are underlined, because they are clickable as well as
+/// typeable and a target drawn exactly like the text beside it is a target
+/// nobody goes looking for. The fill is measured on the plain string first, so
+/// adding a style cannot quietly change the width — and the labels come from
+/// [`prompt_labels`] and the offset from [`PROMPT_COL`], the same two the click
+/// test uses, so the underline cannot land somewhere the click does not.
+fn overlay_title(prompt: &str, inner: usize, style: Style) -> Line<'static> {
+    let head = format!("┌─ {prompt} ");
+    let fill = inner.saturating_sub(head.chars().count() + 1);
+    let border = format!("{head}{}┐", "─".repeat(fill));
+    let labels = prompt_labels(prompt);
+    let hot = style.add_modifier(Modifier::UNDERLINED);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut lit = false;
+    for (col, ch) in border.chars().enumerate() {
+        let now = labels
+            .iter()
+            .any(|(start, end, _)| col >= PROMPT_COL + start && col < PROMPT_COL + end);
+        if now != lit && !buf.is_empty() {
+            let done = std::mem::take(&mut buf);
+            spans.push(Span::styled(done, if lit { hot } else { style }));
+        }
+        lit = now;
+        buf.push(ch);
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, if lit { hot } else { style }));
+    }
+    frame_spans(spans, style)
+}
+
 fn overlay_prompt(always: bool) -> String {
     if always {
         "[y]es \u{00B7} [n]o \u{00B7} [a]lways".to_string()
@@ -1214,11 +1403,7 @@ fn overlay_rows(msg: &Message, content_w: usize) -> Vec<Line<'static>> {
     // Mini-panel top border, filled with ─ to the full inner width. The key
     // prompt lives in the title, so it stays on one line and never competes
     // with the description for the row budget below.
-    let mut top = format!("┌─ {} ", overlay_prompt(overlay.always));
-    let fill = inner.saturating_sub(top.chars().count() + 1);
-    top.push_str(&"─".repeat(fill));
-    top.push('┐');
-    out.push(frame_row(top, title));
+    out.push(overlay_title(&overlay_prompt(overlay.always), inner, title));
 
     // The dialog's own box is `inner` cells wide, so its body row
     // `│ text │` has to come to `inner` too: four cells of chrome — the two
@@ -1252,8 +1437,13 @@ fn overlay_rows(msg: &Message, content_w: usize) -> Vec<Line<'static>> {
 /// Wrap one `inner`-wide overlay row in the outer box's `│ … │` framing so
 /// the row spans exactly `content_w` cells, matching the boxed body rows.
 fn frame_row(content: String, style: Style) -> Line<'static> {
+    frame_spans(vec![Span::styled(content, style)], style)
+}
+
+/// [`frame_row`] for a row whose middle is already split into spans.
+fn frame_spans(content: Vec<Span<'static>>, style: Style) -> Line<'static> {
     let mut spans = vec![Span::styled("│ ", style)];
-    spans.push(Span::styled(content, style));
+    spans.extend(content);
     spans.push(Span::styled(" │", style));
     Line::from(spans)
 }
@@ -1619,6 +1809,68 @@ mod tests {
         }
     }
 
+    /// Re-styling a message must not move the page — the assumption hot loading
+    /// is built on.
+    ///
+    /// `wrap_segments_matches_wrap_lines_layout` proves it for a *single*
+    /// full-coverage segment. A re-highlight after a grammar arrives produces the
+    /// opposite shape: many segments with real boundaries, and a message that may
+    /// have gone from plain to styled. Both are checked here, because the failure
+    /// is a viewport that jumps under the pointer when a background fetch lands —
+    /// which looks like nothing more than a flicker and is very hard to attribute.
+    #[test]
+    fn restyling_changes_no_row_count() {
+        let text = "Intro paragraph that is reasonably long and will wrap.\n\n\
+                    ```rust\nfn main() {\n    let x: u32 = 7;\n    println!(\"{x}\");\n}\n```\n\n\
+                    A closing line, also long enough to wrap at narrow widths.\n";
+        for width in [20usize, 40, 80] {
+            let plain = wrap_lines(text, width);
+            // Many segments, as a real highlight produces: one per token.
+            let mut segs = Vec::new();
+            let mut at = 0;
+            for (i, _) in text.char_indices() {
+                if i % 7 == 0 && i > at {
+                    segs.push(Segment { start: at, end: i, style: Style::default() });
+                    at = i;
+                }
+            }
+            segs.push(Segment { start: at, end: text.len(), style: Style::default() });
+            let styled = wrap_segments(text, &segs, width);
+            assert_eq!(
+                styled.len(),
+                plain.len(),
+                "width={width}: {} styled rows vs {} plain",
+                styled.len(),
+                plain.len()
+            );
+        }
+    }
+
+    /// `rehighlight_all` leaves the viewport exactly where the user put it.
+    ///
+    /// The failure this guards is specific: a background grammar arriving would
+    /// scroll a transcript the user had deliberately scrolled up to read. Follow is
+    /// re-asserted only if it was already on, so neither reading position nor
+    /// follow-mode is disturbed.
+    #[test]
+    fn rehighlighting_leaves_the_viewport_alone() {
+        let mut panel = TurnPanel::default();
+        for i in 0..12 {
+            panel.push(
+                Role::Assistant,
+                format!("message {i} with enough text to occupy a row or two"),
+            );
+        }
+        panel.scroll = 4;
+        panel.follow = false; // the user has scrolled up
+        let before = (panel.scroll, panel.follow);
+        let changed = panel.rehighlight_all();
+        assert_eq!((panel.scroll, panel.follow), before, "untouched");
+        // With no highlighter there is nothing to change, and it says so rather
+        // than claiming work.
+        assert_eq!(changed, 0, "no highlighter, so no message changed");
+    }
+
     #[test]
     fn wrap_segments_splits_styled_spans_across_row_boundaries() {
         // "xxyy" at width 3 wraps to "xxy" + "y"; the second segment ("yy")
@@ -1908,7 +2160,11 @@ mod tests {
             width: (content_w + 1) as u16,
             height: 30,
         };
-        assert!(panel.handle_click(1, 6, area), "click lands on the box body");
+        assert_eq!(
+            panel.handle_click(1, 6, area),
+            Click::Toggled,
+            "click lands on the box body"
+        );
         assert!(panel.messages[3].collapsed);
         assert_eq!(panel.content_height(content_w), 7, "collapsed box = 2 rows");
         assert!(!panel.messages.iter().any(|m| m.dirty));
@@ -2438,16 +2694,26 @@ mod tests {
         };
         // Paragraph rows: 0 top, 1 content, 2 bottom; user tag row 3. Screen
         // rows shift by area.y (the chat log has no block border).
-        assert!(panel.handle_click(5, 1, area), "content row of the box");
+        assert_eq!(
+            panel.handle_click(5, 1, area),
+            Click::Toggled,
+            "content row of the box"
+        );
         assert!(panel.messages[0].collapsed);
-        assert!(panel.handle_click(5, 1, area), "click again to expand");
+        assert_eq!(
+            panel.handle_click(5, 1, area),
+            Click::Toggled,
+            "click again to expand"
+        );
         assert!(!panel.messages[0].collapsed);
-        assert!(
-            !panel.handle_click(5, 4, area),
+        assert_eq!(
+            panel.handle_click(5, 4, area),
+            Click::Nothing,
             "plain message is not a box"
         );
-        assert!(
+        assert_eq!(
             panel.handle_click(5, 2, area),
+            Click::Toggled,
             "bottom border still hits the box"
         );
         assert!(panel.messages[0].collapsed);
@@ -2463,13 +2729,26 @@ mod tests {
             width: 42,
             height: 10,
         };
-        assert!(!panel.handle_click(41, 1, area), "scrollbar lane (right edge)");
-        assert!(!panel.handle_click(42, 1, area), "past the right edge");
-        assert!(
-            !panel.handle_click(5, 0, area),
+        assert_eq!(
+            panel.handle_click(41, 1, area),
+            Click::Nothing,
+            "scrollbar lane (right edge)"
+        );
+        assert_eq!(
+            panel.handle_click(42, 1, area),
+            Click::Nothing,
+            "past the right edge"
+        );
+        assert_eq!(
+            panel.handle_click(5, 0, area),
+            Click::Nothing,
             "above the body (row < area.y)"
         );
-        assert!(panel.handle_click(5, 1, area), "body rows are clickable");
+        assert_eq!(
+            panel.handle_click(5, 1, area),
+            Click::Toggled,
+            "body rows are clickable"
+        );
         assert!(panel.messages[0].collapsed);
     }
 
@@ -2718,12 +2997,14 @@ mod tests {
             width: 42,
             height: 10,
         };
-        assert!(
-            !panel.handle_click(5, 0, area),
+        assert_eq!(
+            panel.handle_click(5, 0, area),
+            Click::Nothing,
             "a reasoning row is not a collapsible box"
         );
-        assert!(
+        assert_eq!(
             panel.handle_click(5, 1, area),
+            Click::Toggled,
             "the framed tool box still toggles"
         );
         assert!(panel.messages[1].collapsed);
@@ -3078,5 +3359,223 @@ mod tests {
             "the dialog's key prompt is present, and with no `always` offered — \
              nothing about a split panel's status note is worth remembering"
         );
+    }
+
+    /// The dialog's answers are clickable, and clickable exactly where they are
+    /// drawn.
+    ///
+    /// Checked as a round trip: the columns are read out of the *rendered* row
+    /// and handed straight to `handle_click`. The hit test and the renderer
+    /// share no arithmetic, only the prompt string, so testing the arithmetic
+    /// against itself would prove nothing — a one-cell slip puts the target
+    /// beside the label rather than on it, and only a test that reads the real
+    /// output can see that.
+    #[test]
+    fn the_dialogs_answers_are_clickable_wherever_they_are_drawn() {
+        const W: usize = 64;
+        let mut panel = TurnPanel::default();
+        for op in [
+            PanelOp::Create {
+                id: 1,
+                title: "cat /etc/hostname".into(),
+                boxed: true,
+                conceal_box: false,
+            },
+            PanelOp::Append {
+                id: 1,
+                text: "the process wants\n".into(),
+            },
+        ] {
+            panel.apply_op(op);
+        }
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: Some("The process want to read /etc/hostname".into()),
+            always: true,
+        });
+
+        // The same render path the frame uses, so the columns below are the
+        // columns on screen.
+        let rows: Vec<String> = BorderedRenderer::lines(&panel.messages, W, true)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        // `content_w` is the area's width less the scrollbar lane, so a panel
+        // built at `W` is clicked through an area one wider.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: (W + 1) as u16,
+            height: 30,
+        };
+        let (row, title) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.contains("[y]es"))
+            .expect("the dialog is on screen");
+        // Column of a substring in a given row, in cells — `str::find` gives
+        // bytes and `·` is two of them, which is the whole reason this helper
+        // exists.
+        let col_of =
+            |row: &str, needle: &str| row[..row.find(needle).expect("drawn")].chars().count();
+
+        for (label, key) in [("[y]es", 'y'), ("[n]o", 'n'), ("[a]lways", 'a')] {
+            let col = col_of(title, label);
+            // Anywhere along the label, not just its first cell: the whole word
+            // is the target, because that is the thing a pointer is aimed at.
+            for probe in [col, col + label.chars().count() - 1] {
+                assert_eq!(
+                    panel.handle_click(probe, row, area),
+                    Click::Answer(key),
+                    "a click on {label} answers {key}"
+                );
+            }
+        }
+
+        // The gap between two answers is not an answer, and neither is the
+        // border either side of them. Both are on the dialog's own row, and
+        // both must stay inert rather than falling through to the box toggle.
+        let gap = col_of(title, " · ");
+        assert_eq!(
+            panel.handle_click(gap, row, area),
+            Click::Nothing,
+            "the separator is not a verdict"
+        );
+        assert_eq!(
+            panel.handle_click(title.chars().count() - 2, row, area),
+            Click::Nothing,
+            "nor is the border past the last answer"
+        );
+
+        // A row below the prompt is the box's again, and toggles it.
+        let before = panel.messages[0].collapsed;
+        let (body, body_row) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.contains("the process wants"))
+            .expect("the body is drawn");
+        assert_eq!(
+            panel.handle_click(col_of(body_row, "the process wants"), body, area),
+            Click::Toggled
+        );
+        assert_ne!(panel.messages[0].collapsed, before, "and it did toggle");
+    }
+
+    /// Without "always" on offer the dialog draws two answers, and a third
+    /// cannot be clicked into existence: the target list comes from the prompt
+    /// that was drawn, not from a fixed set of keys.
+    #[test]
+    fn a_question_without_always_offers_exactly_two_answers() {
+        const W: usize = 64;
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Create {
+            id: 1,
+            title: "ls".into(),
+            boxed: true,
+            conceal_box: false,
+        });
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: Some("The process want to list /home".into()),
+            always: false,
+        });
+        // The same render path the frame uses, so the columns below are the
+        // columns on screen.
+        let rows: Vec<String> = BorderedRenderer::lines(&panel.messages, W, true)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let (row, title) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.contains("[n]o"))
+            .expect("the dialog is on screen");
+        assert!(!title.contains("[a]lways"), "and no third answer: {title}");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: (W + 1) as u16,
+            height: 30,
+        };
+        let col_of = |needle: &str| title[..title.find(needle).expect("drawn")].chars().count();
+        assert_eq!(
+            panel.handle_click(col_of("[n]o"), row, area),
+            Click::Answer('n')
+        );
+        // Just past the last answer, where `a` would be if it were offered.
+        assert_eq!(
+            panel.handle_click(title.chars().count() - 2, row, area),
+            Click::Nothing,
+            "nothing there to click"
+        );
+    }
+
+    /// The answers are drawn as if they can be clicked, because they can.
+    ///
+    /// An underline on the bracketed letter and its word, and on nothing else:
+    /// the `─` either side and the `·` between are not targets, and marking them
+    /// would be a promise the click test does not keep.
+    #[test]
+    fn only_the_answers_are_underlined_in_the_title() {
+        let mut panel = TurnPanel::default();
+        for op in [
+            PanelOp::Create {
+                id: 1,
+                title: "cat /etc/hostname".into(),
+                boxed: true,
+                conceal_box: false,
+            },
+            PanelOp::Append {
+                id: 1,
+                text: "output\n".into(),
+            },
+            PanelOp::Overlay {
+                id: 1,
+                text: Some("The process want to read /etc/hostname".into()),
+                always: true,
+            },
+        ] {
+            panel.apply_op(op);
+        }
+        let lines = BorderedRenderer::lines(&panel.messages, 64, true);
+        let title = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.as_ref().contains("[y]es")))
+            .expect("the dialog is on screen");
+        let underlined: String = title
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            underlined, "[y]es[n]o[a]lways",
+            "exactly the three answers, and nothing of the border"
+        );
+    }
+
+    /// The key prompt's labels, from the string alone — the one place the hit
+    /// test, the underline and the drawn row all get their shape.
+    #[test]
+    fn prompt_labels_are_the_bracketed_key_and_the_word_after_it() {
+        let labels = prompt_labels("[y]es \u{00B7} [n]o \u{00B7} [a]lways");
+        // `[y]es` is five cells, not four: the brackets are part of the label.
+        assert_eq!(
+            labels,
+            vec![(0, 5, 'y'), (8, 12, 'n'), (15, 23, 'a')],
+            "each label runs from its bracket to just before the next separator"
+        );
+        // Two labels, no third: the last one runs to the end of the string.
+        assert_eq!(
+            prompt_labels("[y]es \u{00B7} [n]o"),
+            vec![(0, 5, 'y'), (8, 12, 'n')]
+        );
+        // Nothing bracketed, nothing clickable.
+        assert!(prompt_labels("yes \u{00B7} no").is_empty());
+        // Every column of a label hits it, and the columns around it do not.
+        for col in 0..5 {
+            assert_eq!(prompt_hit("[y]es", col), Some('y'));
+        }
+        assert_eq!(prompt_hit("[y]es", 5), None, "past the end of the label");
     }
 }

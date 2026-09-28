@@ -101,6 +101,29 @@ return {
     see = "agent.trigger",
   },
 
+  -- ===================== the input line ==============================
+
+  input_insert = {
+    summary = "Append text to the agent's input line, the one under the transcript.",
+    args = {
+      { "text", "string", "what to append" },
+    },
+    returns = "true when queued, false when no loop is attached",
+    see = "agent.on_event(\"key\"): the route that makes a binding able to type",
+  },
+
+  input_backspace = {
+    summary = "Remove the last character from the input line, if there is one.",
+    returns = "true when queued, false when no loop is attached",
+    see = "agent.api.input_insert",
+  },
+
+  input_clear = {
+    summary = "Empty the input line, as Ctrl+u does in readline.",
+    returns = "true when queued, false when no loop is attached",
+    see = "agent.api.input_insert",
+  },
+
   -- ===================== asking the user ==============================
 
   ask_user = {

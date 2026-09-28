@@ -148,6 +148,37 @@ impl PanelSink {
         s.next_id
     }
 
+    /// The id this sink's next [`PanelSink::alloc_id`] will hand out — the
+    /// high-water mark, for a caller that is about to start a *new* sink and
+    /// wants the ids to continue rather than restart.
+    pub fn next_id(&self) -> u64 {
+        self.0.lock().expect("panel sink poisoned").next_id
+    }
+
+    /// A sink whose id sequence continues from `next`.
+    ///
+    /// The scope of a panel id is the id→message map of the
+    /// [`TurnPanel`](crate::tui::TurnPanel) it will be looked up in, which lives
+    /// for the whole session — so a *per-round* counter is the wrong scope, even
+    /// though sharing the sink between the round's Lua and Rust producers makes
+    /// it look right. Only the round boundary reset it, and the damage was
+    /// confined to the boundary and therefore invisible in any test that used one
+    /// sink: round two's first panel was handed id 1, found round one's id-1
+    /// record, and appended itself to *that* message. A write's content landed
+    /// in the read panel above it, its dialog was drawn there rather than on its
+    /// own box — and because a read panel is small and the write came later, the
+    /// dialog usually scrolled off the top, leaving a question the user could
+    /// answer with `y` but not one they could see.
+    ///
+    /// So the counter travels with the transcript it numbers, and the round
+    /// boundary carries the mark rather than clearing it.
+    pub fn continuing_from(next: u64) -> Self {
+        Self(Arc::new(Mutex::new(SinkState {
+            ops: Vec::new(),
+            next_id: next,
+        })))
+    }
+
     /// Record one op, oldest first.
     pub fn push(&self, op: PanelOp) {
         self.0.lock().expect("panel sink poisoned").ops.push(op);

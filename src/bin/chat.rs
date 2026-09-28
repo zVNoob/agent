@@ -16,7 +16,7 @@
 //! tool call, and clicking a tool-call box collapses/expands it.
 
 use agent::grammars::Catalog;
-use agent::tui::{App, MarkdownHighlighter, Role};
+use agent::tui::{App, Effect, MarkdownHighlighter, Role};
 use anyhow::Result;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream,
@@ -97,15 +97,20 @@ async fn run<W: Write>(
         let Some(event) = rx.recv().await else {
             break; // stdin closed / producer task ended
         };
-        let quit = match event {
+        // `chat` is the bare TUI with no agent loop behind it, so it has no tool
+        // to interrupt: `Ctrl+c` arrives as `Effect::Interrupt` and is dropped
+        // rather than treated as a quit, because here there is nothing running
+        // to stop and leaving on the interrupt key would undo the split the two
+        // keys exist to make.
+        let effect = match event {
             CrosstermEvent::Key(key) => app.handle_key(key),
             CrosstermEvent::Mouse(ev) => {
                 app.handle_mouse(ev);
-                false
+                Effect::Continue
             }
-            _ => false, // resize and friends: just redraw below
+            _ => Effect::Continue, // resize and friends: just redraw below
         };
-        if quit {
+        if effect == Effect::Quit {
             break;
         }
         terminal.autoresize()?;

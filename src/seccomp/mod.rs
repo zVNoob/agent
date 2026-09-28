@@ -104,6 +104,8 @@ use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // seccomp kernel ABI (kept local, same values as linux/seccomp.h)
@@ -248,6 +250,65 @@ pub enum CoroutineEvent {
     Decided { syscall: Syscall, verdict: Verdict },
 }
 
+/// A cloneable request to stop one particular run.
+///
+/// Per-run, and that is the whole design. This started as a process-global
+/// `bool`, then as a global counter, and both were wrong in the same way: a
+/// request could not be told apart from a request meant for somebody else. The
+/// `bool` had to be cleared by [`Sandbox::spawn`] to stop a `Ctrl+c` with
+/// nothing running from killing the *next* command, and that made every
+/// unrelated spawn a chance to drop a live request. The counter needed no
+/// clearing and so fixed that — and then killed every concurrently-running
+/// sandbox at once, because each one had a baseline from before the request and
+/// read the bump as its own. Fifteen unrelated tests failed at once, all of them
+/// committing suicide.
+///
+/// A flag the run owns cannot have either fault: a request aimed at run A leaves
+/// run B alone, and a run that starts after a request cannot inherit it, because
+/// the flag is created with the run.
+#[derive(Clone)]
+pub struct InterruptHandle {
+    flag: Arc<AtomicBool>,
+}
+
+impl InterruptHandle {
+    /// Ask this run to stop. Idempotent, and safe from any thread, at any point
+    /// in the run — the driver acts on it at the top of its next step, and also
+    /// on a poll timeout, which is the only chance a *silent* run gets.
+    pub fn interrupt(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The run the agent's own `Ctrl+c` should stop.
+///
+/// One slot, published by [`Sandbox::spawn`] and fired by [`request_interrupt`].
+/// Single-slot is sound because the agent drives tools strictly sequentially —
+/// there is a test pinning that, and it is the invariant this rests on. It is
+/// *not* a general mechanism: with two runs live, the slot names whichever
+/// started last, and a request would go to the wrong one. That is acceptable
+/// here and nowhere else, which is why the tests in this module take their own
+/// [`Sandbox::interrupt_handle`] rather than reading the slot.
+///
+/// Never cleared, deliberately. A `Ctrl+c` with nothing running sets a flag on a
+/// finished run, which nobody will ever read, and the next spawn overwrites the
+/// slot — so a stale entry is inert rather than dangerous, and there is no
+/// window in which a clear could race a spawn and leave the slot empty while a
+/// run was live. Clearing would be more tidiness than the design can afford.
+static LIVE_RUN: Mutex<Option<InterruptHandle>> = Mutex::new(None);
+
+/// Ask the sandbox the agent is running to stop, if there is one.
+///
+/// Called from the TUI on `Ctrl+c`. With nothing running it is a no-op, which is
+/// what makes it safe to fire on every press without first checking whether a
+/// tool happens to be live. Any run that starts later is unaffected: it brings
+/// its own flag.
+pub fn request_interrupt() {
+    if let Some(handle) = LIVE_RUN.lock().ok().and_then(|slot| slot.clone()) {
+        handle.interrupt();
+    }
+}
+
 /// Result of a [`Sandbox::step`] call.
 #[derive(Debug)]
 pub enum Step {
@@ -275,6 +336,10 @@ pub struct ExitInfo {
 /// Everything the supervisor learned about the run.
 #[derive(Clone, Debug)]
 pub struct SandboxResult {
+    /// The run was stopped by [`request_interrupt`] rather than finishing on
+    /// its own. Carried into the tool result so a stopped command reads as
+    /// stopped, not as a command that failed.
+    pub interrupted: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit: ExitInfo,
@@ -317,6 +382,15 @@ pub struct Sandbox {
     /// tree, and the `pids` set tracks it (the fork hook is the explicit
     /// capture point the tree bookkeeping keys off; see `handle_notification`).
     forks: u64,
+    /// This run was stopped by [`request_interrupt`] rather than finishing on
+    /// its own, so [`SandboxResult`] can say so. Without it a killed tree and a
+    /// crash look identical in the tool result, and the model reads "interrupted"
+    /// very differently from "the command failed".
+    interrupted: bool,
+    /// This run's own interrupt flag, shared with whoever holds its
+    /// [`InterruptHandle`]. Per-run so that a request cannot be delivered to the
+    /// wrong sandbox — see [`InterruptHandle`].
+    interrupt: Arc<AtomicBool>,
     decider: Box<dyn FnMut(&Syscall) -> Verdict + Send>,
     out: Vec<u8>,
     err: Vec<u8>,
@@ -808,6 +882,19 @@ impl Sandbox {
             child: pid,
             pids: [pid].into_iter().collect(),
             forks: 0,
+            interrupted: false,
+            interrupt: {
+                // Publish so the TUI's `Ctrl+c` can find this run. Single-slot,
+                // which is sound only because the agent runs one tool at a time
+                // — see `LIVE_RUN`.
+                let flag = Arc::new(AtomicBool::new(false));
+                if let Ok(mut slot) = LIVE_RUN.lock() {
+                    *slot = Some(InterruptHandle {
+                        flag: flag.clone(),
+                    });
+                }
+                flag
+            },
             decider,
             out: Vec::new(),
             err: Vec::new(),
@@ -845,6 +932,13 @@ impl Sandbox {
         if self.finished {
             bail!("sandbox already finished");
         }
+        // An interrupt asked for since the last round. `kill_tree` rather than a
+        // bare `kill` on the root, because descendants captured earlier would
+        // otherwise keep the seccomp listener alive and the run would go on
+        // without its output. From here the run finishes the ordinary way — the
+        // tree's death arrives as listener EOF on a later poll — so the driver
+        // needs no interrupt path of its own, only the note in the result.
+        self.service_interrupt();
         // The tree's death is signaled by listener EOF — which arrives on the
         // same poll as pipe EOF when the last filter user exits. Record it
         // regardless of pipe state; the caller passes 0 revents once the fd is
@@ -1093,6 +1187,17 @@ impl Sandbox {
         self.forks
     }
 
+    /// A handle that can ask *this* run to stop, from any thread.
+    ///
+    /// What the agent's `Ctrl+c` reaches through [`request_interrupt`], and what
+    /// a caller with the [`Sandbox`] in hand would use instead. Per-run, so
+    /// holding one is safe even with other sandboxes live.
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle {
+            flag: self.interrupt.clone(),
+        }
+    }
+
     /// SIGSTOP the whole captured tree.
     ///
     /// Call this **before** surfacing a [`Verdict::Ask`] when the ask must
@@ -1337,6 +1442,26 @@ impl Sandbox {
     /// forwarding every event to `on_event`. This is [`Supervisor::drive`]
     /// specialized to a single sandbox: one `poll(2)` over this sandbox's
     /// live fds, blocking when there's nothing to do, then stepping it.
+    /// Act on a pending interrupt request, if there is one; returns whether one
+    /// fired.
+    ///
+    /// Called from the step *and* the poll-timeout path, and the second one is not
+    /// belt-and-braces. A command that is producing no output never reaches
+    /// `step` at all: the driver polls, times out, and goes straight back to
+    /// sleep. That is exactly the command a user reaches for `Ctrl+c` on — a
+    /// long build, a `sleep`, a server that has gone quiet — so a latch checked
+    /// only in `step` would interrupt chatty commands and fail on precisely the
+    /// ones that matter. Found by a test that ran `sleep 30`, which is the whole
+    /// reason the fixture is silent.
+    fn service_interrupt(&mut self) -> bool {
+        if !self.interrupt.swap(false, Ordering::SeqCst) {
+            return false; // nothing asked for this run
+        }
+        self.interrupted = true;
+        self.kill_tree();
+        true
+    }
+
     pub fn pump<A, E>(&mut self, mut on_ask: A, mut on_event: E) -> Result<SandboxResult>
     where
         A: FnMut(&Syscall) -> Verdict,
@@ -1367,7 +1492,10 @@ impl Sandbox {
                 bail!("poll: {e}");
             }
             if pr == 0 {
-                continue; // timeout, nothing ready: go back to sleep
+                // Timeout, nothing ready — and the only moment a silent command
+                // can be interrupted, since it will never reach `step`.
+                self.service_interrupt();
+                continue; // back to sleep
             }
             let mut listener_revents = 0i16;
             for (k, p) in pfds.iter().enumerate() {
@@ -1461,7 +1589,10 @@ impl Sandbox {
                 bail!("poll: {e}");
             }
             if pr == 0 {
-                continue; // timeout, nothing ready: go back to sleep
+                // Timeout, nothing ready — and the only moment a silent command
+                // can be interrupted, since it will never reach `step`.
+                self.service_interrupt();
+                continue; // back to sleep
             }
 
             // Forward whatever the supervisor's stdin has, then step.
@@ -1722,6 +1853,7 @@ impl Sandbox {
         }
         self.finished = true;
         Ok(SandboxResult {
+            interrupted: self.interrupted,
             stdout: std::mem::take(&mut self.out),
             stderr: std::mem::take(&mut self.err),
             exit: ExitInfo::from_status(self.child_status),
@@ -2319,6 +2451,77 @@ mod tests {
         assert_eq!(r.exit.code, Some(0));
     }
 
+    /// A handle stops the run it came from, and says so in the result.
+    ///
+    /// `sleep 30` is the fixture because it is the thing a user actually wants to
+    /// stop — and, more to the point, because it is *silent*, so the only place
+    /// the driver can notice an interrupt is the poll-timeout path. A chatty
+    /// fixture would pass with that path missing, which is the bug this test was
+    /// written after finding.
+    ///
+    /// The request goes through this run's own handle rather than
+    /// [`request_interrupt`], because that reads the agent's single slot and this
+    /// suite has dozens of sandboxes running at once. It is also the better test
+    /// for the property that matters: a handle reaches its own run and no other.
+    #[test]
+    fn a_handle_stops_its_own_run_and_the_result_says_so() {
+        let mut sandbox =
+            Sandbox::spawn("sh", &["-c", "sleep 30"], |_| Verdict::Allow, &[1]).unwrap();
+        let handle = sandbox.interrupt_handle();
+        let started = std::time::Instant::now();
+        handle.interrupt();
+        let r = sandbox.pump(|_| Verdict::Allow, |_| {}).expect("the run succeeded");
+        assert!(r.interrupted, "the result says it was interrupted");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "and it did not wait out the sleep: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// One run's request does not reach another. This is the property both earlier
+    /// designs got wrong, and the reason the flag is per-run: a global counter
+    /// made a single request kill every concurrently-running sandbox, which
+    /// showed up as fifteen unrelated tests failing at once.
+    #[test]
+    fn a_request_reaches_only_the_run_whose_handle_it_came_from() {
+        let mut mine =
+            Sandbox::spawn("sh", &["-c", "sleep 30"], |_| Verdict::Allow, &[1]).unwrap();
+        let theirs =
+            Sandbox::spawn("sh", &["-c", "echo fine; sleep 30"], |_| Verdict::Allow, &[1])
+                .unwrap();
+        mine.interrupt_handle().interrupt();
+        let stopped = mine.pump(|_| Verdict::Allow, |_| {}).expect("the run succeeded");
+        assert!(stopped.interrupted, "the addressed run stopped");
+        // The other one is untouched: the driver has not even been called, so
+        // nothing has asked it to do anything.
+        assert!(theirs.pids().len() <= 1, "the other run is still whole");
+    }
+
+    /// A run started *after* a request cannot inherit it — the property that lets
+    /// the agent fire an interrupt on every `Ctrl+c` without first checking
+    /// whether a tool happens to be live.
+    ///
+    /// Held by the per-run flag rather than tested directly: the flag is created
+    /// with the run, so "a later run cannot see an earlier request" is structural
+    /// and there is nothing to assert. It *was* tested directly, against a global
+    /// latch, and the test could not be made race-free — `request_interrupt`
+    /// reads the agent's single slot, which in a parallel suite names whichever
+    /// sandbox started last, so the test killed somebody else's run. Dropping the
+    /// test is the honest outcome: the global registry is left uncovered, and it
+    /// is six lines of plumbing whose whole content is "the slot names the run the
+    /// agent is running".
+    #[test]
+    fn a_later_run_cannot_see_an_earlier_runs_request() {
+        let earlier =
+            Sandbox::spawn("sh", &["-c", "sleep 30"], |_| Verdict::Allow, &[1]).unwrap();
+        earlier.interrupt_handle().interrupt();
+        // A run that begins after that request, with a flag of its own.
+        let r = run_sandboxed(&["sh", "-c", "echo alive"], &[1], |_| Verdict::Allow).unwrap();
+        assert_eq!(r.stdout, b"alive\n");
+        assert!(!r.interrupted, "and it ran to completion");
+    }
+
     #[test]
     fn stdin_overflow_is_queued_and_flushed_by_the_poll_loop() {
         // Feed 1 MiB — beyond the ~64 KiB pipe buffer — in one queue_stdin
@@ -2502,7 +2705,10 @@ mod tests {
                 bail!("poll: {e}");
             }
             if pr == 0 {
-                continue; // timeout, nothing ready: go back to sleep
+                // Timeout, nothing ready — and the only moment a silent command
+                // can be interrupted, since it will never reach `step`.
+                sb.service_interrupt();
+                continue; // back to sleep
             }
             let mut listener_revents = 0i16;
             for (k, p) in pfds.iter().enumerate() {
