@@ -120,10 +120,8 @@ impl Default for App {
 /// The hint is built from this table, so it describes what Rust does and nothing
 /// else. A Lua binding table is invisible here, and saying so is more honest than
 /// a hint that guesses.
-const KEY_HELP: &[(&str, &str, &str)] = &[
-    ("Ctrl+d", "quit", "quit"),
-    ("Ctrl+c", "interrupt", "stop"),
-];
+const KEY_HELP: &[(&str, &str, &str)] =
+    &[("Ctrl+d", "quit", "quit"), ("Ctrl+c", "interrupt", "stop")];
 
 /// The placeholder in an empty input box: [`KEY_HELP`] as one line.
 ///
@@ -518,11 +516,7 @@ impl App {
     ///
     /// Returns how many messages that actually changed, so a caller does not
     /// redraw a whole screen for a grammar that had nothing to say.
-    pub fn add_grammar(
-        &mut self,
-        lang: &str,
-        grammar: &crate::grammars::LoadedGrammar,
-    ) -> usize {
+    pub fn add_grammar(&mut self, lang: &str, grammar: &crate::grammars::LoadedGrammar) -> usize {
         let Some(hl) = self.panel.highlighter_mut() else {
             return 0;
         };
@@ -792,10 +786,10 @@ fn cursor_position(text: &str, width: usize, index: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use crate::testutil::unique_path;
     use super::*;
     use crate::lua::InputOp;
     use crate::panels::{ALWAYS_LABEL, PanelOp};
+    use crate::testutil::unique_path;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -956,16 +950,25 @@ mod tests {
         let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
 
         // Empty input: a letter may act.
-        assert!(app.key_may_act(&letter), "an empty line has nothing to protect");
+        assert!(
+            app.key_may_act(&letter),
+            "an empty line has nothing to protect"
+        );
         assert!(app.key_may_act(&esc));
 
         // Mid-word: the letter is text, and refusing is safe because the loop
         // falls through to `handle_key`, which types it.
         app.input.push_str("quick brown qu");
-        assert!(!app.key_may_act(&letter), "a letter mid-word is a character");
+        assert!(
+            !app.key_may_act(&letter),
+            "a letter mid-word is a character"
+        );
         // A chord can never be a character, so it always acts — which is why
         // leaving is `Ctrl+d` and not a letter.
-        assert!(app.key_may_act(&esc), "Esc is not a character in any message");
+        assert!(
+            app.key_may_act(&esc),
+            "Esc is not a character in any message"
+        );
         assert!(app.key_may_act(&ctrl_q));
 
         // And the refusal really does type rather than swallow.
@@ -1183,12 +1186,19 @@ mod tests {
             (KeyCode::Char('A'), KeyModifiers::SHIFT),
             (KeyCode::Char('a'), KeyModifiers::SHIFT),
         ] {
-            assert_eq!(key_spec(&KeyEvent::new(code, mods)), "a", "{code:?} {mods:?}");
+            assert_eq!(
+                key_spec(&KeyEvent::new(code, mods)),
+                "a",
+                "{code:?} {mods:?}"
+            );
         }
         // Modifiers compose in a fixed order, so `ctrl+alt+x` is one string and
         // not two depending on which terminal sent it.
         assert_eq!(
-            spec(KeyCode::Char('x'), KeyModifiers::CONTROL | KeyModifiers::ALT),
+            spec(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ),
             "ctrl+alt+x"
         );
     }
@@ -1205,7 +1215,10 @@ mod tests {
             );
         }
         let err = Action::parse("conceall").expect_err("a typo is not an action");
-        assert!(err.contains("conceall"), "it quotes what was asked for: {err}");
+        assert!(
+            err.contains("conceall"),
+            "it quotes what was asked for: {err}"
+        );
         for action in Action::ALL {
             assert!(err.contains(action.name()), "and lists {action:?}: {err}");
         }
@@ -1359,7 +1372,8 @@ mod tests {
         // A heading as well as a block, so there is something the *markdown*
         // layer captures: plain prose has no capture and comes out unstyled, which
         // would make "the highlighter is working" untestable here.
-        let text = "# Fix\n\nHere is the change:\n\n```rust\nfn main() {\n    let x: u32 = 7;\n}\n```\n";
+        let text =
+            "# Fix\n\nHere is the change:\n\n```rust\nfn main() {\n    let x: u32 = 7;\n}\n```\n";
         let mut app = App::default();
         app.set_highlight(hl);
         // Named fns rather than closures: they borrow `app` immutably and are
@@ -1387,10 +1401,7 @@ mod tests {
             let to = text.rfind('}').expect("and its closing brace");
             let mut seen: Vec<Style> = Vec::new();
             for seg in &app.panel.messages[0].segs {
-                if seg.end > from
-                    && seg.start < to + 1
-                    && !seen.contains(&seg.style)
-                {
+                if seg.end > from && seg.start < to + 1 && !seen.contains(&seg.style) {
                     seen.push(seg.style);
                 }
             }

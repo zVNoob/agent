@@ -117,9 +117,9 @@ async fn main() -> Result<()> {
         ConfigOrigin::Existing => {
             println!("config: ~/.config/agent/init.lua (user config loaded)")
         }
-        ConfigOrigin::Tree => println!(
-            "config: no writable ~/.config/agent — using the built-in defaults"
-        ),
+        ConfigOrigin::Tree => {
+            println!("config: no writable ~/.config/agent — using the built-in defaults")
+        }
     }
     let llm = agent::lua::llm_config(&config_vm).map_err(anyhow::Error::msg)?;
     let config = agent::api::ChatConfig {
@@ -561,10 +561,7 @@ fn start_next_tool<'lua>(
         agent::lua::install_sink(vm, s).map_err(|e| format!("panel sink: {e}"))?;
     }
     match agent::lua::ToolRun::start(vm, &name, &arguments) {
-        Ok(Some((run, step))) => Ok((
-            Some(ToolFlight { id, run, step }),
-            None,
-        )),
+        Ok(Some((run, step))) => Ok((Some(ToolFlight { id, run, step }), None)),
         // The registry holds no such tool. It is the only place a tool can come
         // from, so there is nothing to fall back to.
         Ok(None) => Ok(refused(format!(
@@ -765,7 +762,9 @@ fn may_run(name: &str, offered: &std::collections::HashSet<String>) -> Result<()
     if offered.contains(name) {
         Ok(())
     } else {
-        Err(format!("`{name}` is not one of the tools offered for this request"))
+        Err(format!(
+            "`{name}` is not one of the tools offered for this request"
+        ))
     }
 }
 
@@ -784,7 +783,11 @@ fn offered_tools(chat: &Chat) -> std::collections::HashSet<String> {
 /// request is what keeps a config edit immediate; the swap is the minimal step
 /// that surfaces the change to the frozen [`Chat`], which fixes its tools at
 /// connect time).
-fn refresh_chat_tools(chat: &mut Chat, config: &agent::api::ChatConfig, vm: &mlua::Lua) -> Result<()> {
+fn refresh_chat_tools(
+    chat: &mut Chat,
+    config: &agent::api::ChatConfig,
+    vm: &mlua::Lua,
+) -> Result<()> {
     let tools = tool_defs(vm)?;
     if serde_json::to_string(&tools)? != serde_json::to_string(chat.tools())? {
         *chat = Chat::connect(config, tools);
@@ -946,8 +949,7 @@ fn rebuild_tool_results(mut msgs: Vec<Value>) -> Vec<Value> {
             continue;
         }
         for call in msg["tool_calls"].as_array().into_iter().flatten() {
-            if let (Some(id), Some(name)) =
-                (call["id"].as_str(), call["function"]["name"].as_str())
+            if let (Some(id), Some(name)) = (call["id"].as_str(), call["function"]["name"].as_str())
             {
                 names.insert(id.to_string(), name.to_string());
             }
@@ -1258,9 +1260,7 @@ async fn run<W: Write>(
                         // letter gate, or `BIND["q"] = "quit"` quits the app
                         // mid-word. Refusing falls through to the text path, so
                         // the letter types rather than vanishing.
-                        Some(Ok(_)) if !app.key_may_act(&key) => {
-                            default_key(app, key, busy)
-                        }
+                        Some(Ok(_)) if !app.key_may_act(&key) => default_key(app, key, busy),
                         Some(Ok(action)) => app.perform(action),
                         Some(Err(why)) => {
                             // Loud, and not fatal: the key still does whatever it
@@ -1717,8 +1717,8 @@ async fn run<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use agent::testutil::unique_path;
     use super::*;
+    use agent::testutil::unique_path;
 
     /// The `key` event end to end, from a `KeyEvent` to the action the loop will
     /// perform: the spec the table matches on, the parsing, and the two ways it
@@ -1815,7 +1815,11 @@ mod tests {
             "unbound in Lua, so Rust's default stands"
         );
         let mut app = App::default();
-        assert_eq!(app.handle_key(ctrl_d), Effect::Quit, "and Rust's default is to leave");
+        assert_eq!(
+            app.handle_key(ctrl_d),
+            Effect::Quit,
+            "and Rust's default is to leave"
+        );
 
         // Bind it in Lua and the same key now means something else entirely.
         vm.load(
@@ -1904,9 +1908,7 @@ mod tests {
             for m in [
                 r#"{"role":"user","content":"read the file"}"#,
                 r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs.read","arguments":"{\"path\":\"a.rs\"}"}}]}"#,
-                &format!(
-                    r#"{{"role":"tool","tool_call_id":"call_1","content":"{bulky}"}}"#
-                ),
+                &format!(r#"{{"role":"tool","tool_call_id":"call_1","content":"{bulky}"}}"#),
             ] {
                 mem.append(m).unwrap();
             }
@@ -2132,7 +2134,9 @@ mod tests {
         for lang in app.take_wanted_grammars() {
             q.request(lang);
         }
-        let lang = q.take_next().expect("rust is wanted and nothing is in flight");
+        let lang = q
+            .take_next()
+            .expect("rust is wanted and nothing is in flight");
 
         // A worker, spawned the way the loop spawns it, pointed at the same cache
         // directory the foreground catalog reads — which is the part that makes the
@@ -2213,7 +2217,9 @@ mod tests {
     #[test]
     fn only_the_tools_a_request_offered_may_run() {
         let offered: std::collections::HashSet<String> =
-            ["bash.bash".to_string(), "fs.read".to_string()].into_iter().collect();
+            ["bash.bash".to_string(), "fs.read".to_string()]
+                .into_iter()
+                .collect();
         // Names are qualified by their connection, so the gate is checked
         // against the names a request actually carries.
         assert!(may_run("bash.bash", &offered).is_ok());
@@ -2244,8 +2250,14 @@ mod tests {
         // Offered: all three. What the third one is *called* is the panel's
         // business, so a run-scoped `lways this run` answers exactly as a plain
         // `lways` does.
-        assert_eq!(ask_choice(KeyCode::Char('y'), &offered), Some(AskChoice::Yes));
-        assert_eq!(ask_choice(KeyCode::Char('n'), &offered), Some(AskChoice::No));
+        assert_eq!(
+            ask_choice(KeyCode::Char('y'), &offered),
+            Some(AskChoice::Yes)
+        );
+        assert_eq!(
+            ask_choice(KeyCode::Char('n'), &offered),
+            Some(AskChoice::No)
+        );
         assert_eq!(
             ask_choice(KeyCode::Char('a'), &offered),
             Some(AskChoice::Always)
@@ -2256,7 +2268,10 @@ mod tests {
             "a narrower grant is still a grant"
         );
         // Uppercase too — the answer is not case-sensitive.
-        assert_eq!(ask_choice(KeyCode::Char('A'), &offered), Some(AskChoice::Always));
+        assert_eq!(
+            ask_choice(KeyCode::Char('A'), &offered),
+            Some(AskChoice::Always)
+        );
         assert_eq!(ask_choice(KeyCode::Char('Y'), &None), Some(AskChoice::Yes));
         // Not offered: `a` answers nothing, and neither does anything else —
         // a question on screen must not eat the user's typing.
@@ -2269,7 +2284,11 @@ mod tests {
             KeyCode::Up,
             KeyCode::Char('c'),
         ] {
-            assert_eq!(ask_choice(code, &offered), None, "{code:?} is not an answer");
+            assert_eq!(
+                ask_choice(code, &offered),
+                None,
+                "{code:?} is not an answer"
+            );
         }
     }
     /// A tool call is invisible in the transcript: not its arguments, not its
@@ -2287,20 +2306,18 @@ mod tests {
     #[test]
     fn a_tool_call_leaves_nothing_in_the_transcript_but_still_reaches_the_model() {
         let render = |app: &mut App| {
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 12))
-                    .expect("terminal");
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 12))
+                .expect("terminal");
             terminal.draw(|frame| app.render(frame)).expect("draw");
             let buf = terminal.backend().buffer();
             (0..12)
                 .flat_map(|y| {
-                    (0..60)
-                        .map(move |x| {
-                            buf.cell((x, y))
-                                .map(|c| c.symbol())
-                                .unwrap_or(" ")
-                                .to_string()
-                        })
+                    (0..60).map(move |x| {
+                        buf.cell((x, y))
+                            .map(|c| c.symbol())
+                            .unwrap_or(" ")
+                            .to_string()
+                    })
                 })
                 .collect::<String>()
         };
@@ -2383,6 +2400,4 @@ mod tests {
             "and the user is told nothing by the loop:\n{screen}"
         );
     }
-
-
 }

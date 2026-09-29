@@ -64,7 +64,10 @@ pub(super) fn lua_dir() -> PathBuf {
 /// way to get this wrong is an incomplete install, and "lua lib: lua/lib: No
 /// such file or directory (os error 2)" says nothing about which of four
 /// directories was meant.
-pub(super) fn lua_dir_candidates(explicit: Option<PathBuf>, exe: Option<PathBuf>) -> Vec<(&'static str, PathBuf)> {
+pub(super) fn lua_dir_candidates(
+    explicit: Option<PathBuf>,
+    exe: Option<PathBuf>,
+) -> Vec<(&'static str, PathBuf)> {
     let mut out: Vec<(&'static str, PathBuf)> = Vec::new();
     if let Some(dir) = &explicit {
         out.push(("$AGENT_LUA_DIR", dir.clone()));
@@ -174,7 +177,6 @@ pub(super) fn install_require(lua: &Lua, dir: &Path) -> mlua::Result<()> {
     Ok(())
 }
 
-
 /// Require every module under `lua/lib/`, recursively, in sorted order (so the
 /// load order never follows directory order). Each lands in `package.loaded`, so
 /// a module that requires a sibling sees it already loaded, and a later
@@ -189,9 +191,9 @@ pub(super) fn load_lib_modules(lua: &Lua, dir: &Path) -> mlua::Result<()> {
         .get("require")
         .map_err(|e| mlua::Error::RuntimeError(format!("lua lib: no require: {e}")))?;
     for name in &names {
-        require.call::<mlua::Value>(name.as_str()).map_err(|e| {
-            mlua::Error::RuntimeError(format!("lua lib: require(\"{name}\"): {e}"))
-        })?;
+        require
+            .call::<mlua::Value>(name.as_str())
+            .map_err(|e| mlua::Error::RuntimeError(format!("lua lib: require(\"{name}\"): {e}")))?;
     }
     Ok(())
 }
@@ -230,11 +232,9 @@ pub(super) fn load_init(lua: &Lua, dir: &Path) -> mlua::Result<()> {
 }
 
 pub(super) fn load_init_at(lua: &Lua, path: &Path) -> mlua::Result<()> {
-    let source = std::fs::read_to_string(path).map_err(|e| {
-        mlua::Error::RuntimeError(format!("lua config: {}: {e}", path.display()))
-    })?;
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| mlua::Error::RuntimeError(format!("lua config: {}: {e}", path.display())))?;
     lua.load(&source)
         .set_name(path.display().to_string())
         .exec()
 }
-

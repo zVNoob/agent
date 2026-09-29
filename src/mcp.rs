@@ -596,7 +596,12 @@ fn lua_http_req(
 /// arrived. Popping a terminal event unregisters the handle.
 fn lua_http_step(lua: &Lua, handle: i64) -> mlua::Result<Option<Table>> {
     let t = http_transport();
-    let queue = t.posts.lock().unwrap().get(&handle).map(|s| s.queue.clone());
+    let queue = t
+        .posts
+        .lock()
+        .unwrap()
+        .get(&handle)
+        .map(|s| s.queue.clone());
     let Some(queue) = queue else {
         return Ok(None);
     };
@@ -719,7 +724,6 @@ fn lua_sse_step(lua: &Lua, handle: i64) -> mlua::Result<Option<Table>> {
     }
 }
 
-
 /// `agent.api.sse_close(handle) -> bool` — abort the stream and drop its queue.
 fn lua_sse_close(_: &Lua, handle: i64) -> mlua::Result<bool> {
     close_session(&http_transport().sses, handle)
@@ -760,7 +764,7 @@ pub fn install_bridge(lua: &Lua, api: &Table) -> mlua::Result<()> {
 }
 
 fn lua_json_encode(_: &Lua, value: Value) -> mlua::Result<String> {
-    let json = lua_to_json( &value)?;
+    let json = lua_to_json(&value)?;
     serde_json::to_string(&json)
         .map_err(|e| mlua::Error::RuntimeError(format!("agent.api.json_encode: {e}")))
 }
@@ -824,7 +828,8 @@ pub fn lua_to_json(v: &Value) -> mlua::Result<Json> {
             }
             if saw_int && saw_str {
                 return Err(mlua::Error::RuntimeError(
-                    "agent.api.json_encode: mixed integer/string keys are not JSON-able".to_string(),
+                    "agent.api.json_encode: mixed integer/string keys are not JSON-able"
+                        .to_string(),
                 ));
             }
             if saw_int {

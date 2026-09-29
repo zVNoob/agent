@@ -3,61 +3,63 @@
 use super::*;
 
 use crate::testutil::unique_path;
-    /// `print` goes to the status bar once a screen is attached, and to stdout
-    /// when there is not one — because a TUI owns the terminal, and because a
-    /// headless run still has to be debuggable.
-    ///
-    /// The two branches are mutually exclusive on a process-global, so the
-    /// whole test is serialized against the others that touch it.
-    #[test]
-    fn print_follows_the_screen() {
-        let _guard = crate::status::exclusive();
-        crate::status::reset();
-        let lua = vm();
+/// `print` goes to the status bar once a screen is attached, and to stdout
+/// when there is not one — because a TUI owns the terminal, and because a
+/// headless run still has to be debuggable.
+///
+/// The two branches are mutually exclusive on a process-global, so the
+/// whole test is serialized against the others that touch it.
+#[test]
+fn print_follows_the_screen() {
+    let _guard = crate::status::exclusive();
+    crate::status::reset();
+    let lua = vm();
 
-        // Detached: nothing lands on the status line.
-        lua.load(r#"print("to stdout")"#).exec().expect("print");
-        assert!(
-            crate::status::status_line().get().is_none(),
-            "with no screen, print must not become a status"
-        );
+    // Detached: nothing lands on the status line.
+    lua.load(r#"print("to stdout")"#).exec().expect("print");
+    assert!(
+        crate::status::status_line().get().is_none(),
+        "with no screen, print must not become a status"
+    );
 
-        // Attached: it becomes the status line, tab-joined like Lua's own.
-        crate::status::attach();
-        lua.load(r#"print("hello", 42, "world")"#).exec().expect("print");
-        assert_eq!(
-            crate::status::status_line().get().unwrap().text,
-            "hello\t42\tworld",
-            "Lua's print semantics: any number of args, joined with tabs"
-        );
+    // Attached: it becomes the status line, tab-joined like Lua's own.
+    crate::status::attach();
+    lua.load(r#"print("hello", 42, "world")"#)
+        .exec()
+        .expect("print");
+    assert_eq!(
+        crate::status::status_line().get().unwrap().text,
+        "hello\t42\tworld",
+        "Lua's print semantics: any number of args, joined with tabs"
+    );
 
-        // A `__tostring` metamethod is honoured, as `print` requires.
-        lua.load(
-            r#"
+    // A `__tostring` metamethod is honoured, as `print` requires.
+    lua.load(
+        r#"
             local t = setmetatable({}, { __tostring = function() return "POINT" end })
             print(t)
         "#,
-        )
-        .exec()
-        .expect("print a table");
-        assert_eq!(crate::status::status_line().get().unwrap().text, "POINT");
+    )
+    .exec()
+    .expect("print a table");
+    assert_eq!(crate::status::status_line().get().unwrap().text, "POINT");
 
-        // Multi-line print keeps one row: the rest would land on the input box.
-        lua.load(r#"print("one\ntwo")"#).exec().expect("print");
-        assert_eq!(crate::status::status_line().get().unwrap().text, "one");
+    // Multi-line print keeps one row: the rest would land on the input box.
+    lua.load(r#"print("one\ntwo")"#).exec().expect("print");
+    assert_eq!(crate::status::status_line().get().unwrap().text, "one");
 
-        crate::status::reset();
-    }
+    crate::status::reset();
+}
 
-    /// Every `lua/lib/**.lua` is required at VM setup, and a lib module
-    /// publishes itself as `agent.<name>`: no require at the use site, and
-    /// `package.loaded` holds the same table.
-    #[test]
-    fn lib_modules_are_loaded_registered_and_cached() {
-        let lua = vm();
-        let problem: Option<String> = lua
-            .load(
-                r#"
+/// Every `lua/lib/**.lua` is required at VM setup, and a lib module
+/// publishes itself as `agent.<name>`: no require at the use site, and
+/// `package.loaded` holds the same table.
+#[test]
+fn lib_modules_are_loaded_registered_and_cached() {
+    let lua = vm();
+    let problem: Option<String> = lua
+        .load(
+            r#"
             for _, name in ipairs({ "utils", "seccomp", "ask", "mode" }) do
               local m = package.loaded[name]
               if type(m) ~= "table" then return name .. " not in package.loaded" end
@@ -70,26 +72,26 @@ use crate::testutil::unique_path;
             if agent.utils.string.trim("  x  ") ~= "x" then return "trim" end
             return nil
         "#,
-            )
-            .eval()
-            .expect("loader eval");
-        assert!(
-            problem.is_none(),
-            "lua/lib: {}",
-            problem.unwrap_or_default()
-        );
-    }
+        )
+        .eval()
+        .expect("loader eval");
+    assert!(
+        problem.is_none(),
+        "lua/lib: {}",
+        problem.unwrap_or_default()
+    );
+}
 
-    /// The lib's answers must match the hand-rolled arithmetic the shipped
-    /// policy does today (`flags % 4 ~= 0`, and the `%`-chain that decodes
-    /// O_CREAT/O_TRUNC/O_APPEND) over the whole flag range — otherwise
-    /// switching `lua/policy.lua` over would silently change what is asked.
-    #[test]
-    fn seccomp_lib_agrees_with_the_hand_rolled_openat_rule() {
-        let lua = vm();
-        let problem: Option<String> = lua
-            .load(
-                r#"
+/// The lib's answers must match the hand-rolled arithmetic the shipped
+/// policy does today (`flags % 4 ~= 0`, and the `%`-chain that decodes
+/// O_CREAT/O_TRUNC/O_APPEND) over the whole flag range — otherwise
+/// switching `lua/policy.lua` over would silently change what is asked.
+#[test]
+fn seccomp_lib_agrees_with_the_hand_rolled_openat_rule() {
+    let lua = vm();
+    let problem: Option<String> = lua
+        .load(
+            r#"
             local sc = agent.seccomp
             -- 1. The ask/allow decision, over every flag value in range.
             for flags = 0, 4096, 7 do
@@ -131,23 +133,23 @@ use crate::testutil::unique_path;
             end
             return nil
         "#,
-            )
-            .eval()
-            .expect("equivalence eval");
-        assert!(
-            problem.is_none(),
-            "agent.seccomp vs policy: {}",
-            problem.unwrap_or_default()
-        );
-    }
+        )
+        .eval()
+        .expect("equivalence eval");
+    assert!(
+        problem.is_none(),
+        "agent.seccomp vs policy: {}",
+        problem.unwrap_or_default()
+    );
+}
 
-    /// The bridge is one locked, annotated namespace: `agent.api.<name>` for
-    /// every primitive, no `_`-prefixed leftovers on `agent`, reads work, and
-    /// every write path is refused.
-    #[test]
-    fn api_namespace_is_locked_and_annotated() {
-        let lua = vm();
-        let problem: Option<String> = lua
+/// The bridge is one locked, annotated namespace: `agent.api.<name>` for
+/// every primitive, no `_`-prefixed leftovers on `agent`, reads work, and
+/// every write path is refused.
+#[test]
+fn api_namespace_is_locked_and_annotated() {
+    let lua = vm();
+    let problem: Option<String> = lua
             .load(
                 r#"
             -- Reads work, and the friendly layer is untouched.
@@ -178,22 +180,22 @@ use crate::testutil::unique_path;
             )
             .eval()
             .expect("api lock eval");
-        assert!(
-            problem.is_none(),
-            "agent.api: {}",
-            problem.unwrap_or_default()
-        );
-    }
+    assert!(
+        problem.is_none(),
+        "agent.api: {}",
+        problem.unwrap_or_default()
+    );
+}
 
-    /// `agent.api_docs` documents the whole bridge: one entry per primitive,
-    /// each with a summary — which the loader already enforces at startup, so
-    /// this pins the *shape* a consumer (or `agent.help`) can rely on.
-    #[test]
-    fn api_docs_cover_the_bridge() {
-        let lua = vm();
-        let (count, problems): (usize, String) = lua
-            .load(
-                r#"
+/// `agent.api_docs` documents the whole bridge: one entry per primitive,
+/// each with a summary — which the loader already enforces at startup, so
+/// this pins the *shape* a consumer (or `agent.help`) can rely on.
+#[test]
+fn api_docs_cover_the_bridge() {
+    let lua = vm();
+    let (count, problems): (usize, String) = lua
+        .load(
+            r#"
             local bad, n = {}, 0
             for name, entry in pairs(agent.api_docs) do
               n = n + 1
@@ -210,41 +212,44 @@ use crate::testutil::unique_path;
             end
             return n, table.concat(bad, ",")
         "#,
-            )
-            .eval()
-            .expect("api_docs eval");
-        // Every primitive is documented: the VM would not have built otherwise,
-        // so the count is the bridge's size.
-        assert_eq!(count, 36, "lua/api.lua should annotate all 36 primitives");
-        assert!(problems.is_empty(), "malformed annotation entries: {problems}");
-    }
+        )
+        .eval()
+        .expect("api_docs eval");
+    // Every primitive is documented: the VM would not have built otherwise,
+    // so the count is the bridge's size.
+    assert_eq!(count, 36, "lua/api.lua should annotate all 36 primitives");
+    assert!(
+        problems.is_empty(),
+        "malformed annotation entries: {problems}"
+    );
+}
 
-    /// A bridge primitive still works through the namespace (the JSON boundary
-    /// is the cheapest one to exercise end to end).
-    #[test]
-    fn api_bridge_functions_still_work() {
-        let lua = vm();
-        let round: String = lua
-            .load(
-                r#"
+/// A bridge primitive still works through the namespace (the JSON boundary
+/// is the cheapest one to exercise end to end).
+#[test]
+fn api_bridge_functions_still_work() {
+    let lua = vm();
+    let round: String = lua
+        .load(
+            r#"
             local text = agent.api.json_encode({ ok = true, items = { 1, 2 } })
             local back = agent.api.json_decode(text)
             return text .. "|" .. tostring(back.ok) .. "|" .. tostring(#back.items)
         "#,
-            )
-            .eval()
-            .expect("json bridge");
-        assert_eq!(round, r#"{"items":[1,2],"ok":true}|true|2"#);
-    }
+        )
+        .eval()
+        .expect("json bridge");
+    assert_eq!(round, r#"{"items":[1,2],"ok":true}|true|2"#);
+}
 
-    /// The shipped config registers the filesystem connection by name, from the
-    /// module: `agent.mcps.fs = require("fs")` is the whole registration.
-    #[test]
-    fn shipped_config_registers_the_fs_connection_from_the_module() {
-        let lua = shipped_vm();
-        let problem: Option<String> = lua
-            .load(
-                r#"
+/// The shipped config registers the filesystem connection by name, from the
+/// module: `agent.mcps.fs = require("fs")` is the whole registration.
+#[test]
+fn shipped_config_registers_the_fs_connection_from_the_module() {
+    let lua = shipped_vm();
+    let problem: Option<String> = lua
+        .load(
+            r#"
             local conn = agent.mcps.fs
             if type(conn) ~= "table" then return "agent.mcps.fs" end
             if conn.name ~= "fs" then return "connection name: " .. tostring(conn.name) end
@@ -273,38 +278,38 @@ use crate::testutil::unique_path;
             if #agent.fs.patch.split("a\nb\n") ~= 3 then return "patch.split" end
             return nil
         "#,
-            )
-            .eval()
-            .expect("fs registration eval");
-        assert!(
-            problem.is_none(),
-            "agent.mcps.fs: {}",
-            problem.unwrap_or_default()
-        );
-    }
+        )
+        .eval()
+        .expect("fs registration eval");
+    assert!(
+        problem.is_none(),
+        "agent.mcps.fs: {}",
+        problem.unwrap_or_default()
+    );
+}
 
-    /// The auto-route: a *request* whose response is an event stream. The POST
-    /// goes out over the request transport; the `text/event-stream` content-type
-    /// then upgrades the body into parsed events on `on_event` — the MCP
-    /// streamable-HTTP case, where one endpoint answers with JSON *or* a stream
-    /// and the client cannot know in advance. Raw bytes still reach `on_chunk`.
-    #[tokio::test]
-    async fn http_upgrades_a_request_response_into_events() {
-        let fake = FakeHttpServer::start(|_req: FakeRequest| {
-            FakeServerReply::StreamEvents(vec![
-                // Deliberately split mid-frame: the parser must hold the partial
-                // event until the rest arrives.
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":".to_string(),
-                "1,\"result\":{\"ok\":true}}\n\n".to_string(),
-                "data: bare\n\n".to_string(),
-                ": a comment\n\n".to_string(),
-            ])
-        });
-        let lua = vm();
-        let problem: Option<String> = eval_reactor(
-            &lua,
-            &format!(
-                r##"
+/// The auto-route: a *request* whose response is an event stream. The POST
+/// goes out over the request transport; the `text/event-stream` content-type
+/// then upgrades the body into parsed events on `on_event` — the MCP
+/// streamable-HTTP case, where one endpoint answers with JSON *or* a stream
+/// and the client cannot know in advance. Raw bytes still reach `on_chunk`.
+#[tokio::test]
+async fn http_upgrades_a_request_response_into_events() {
+    let fake = FakeHttpServer::start(|_req: FakeRequest| {
+        FakeServerReply::StreamEvents(vec![
+            // Deliberately split mid-frame: the parser must hold the partial
+            // event until the rest arrives.
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":".to_string(),
+            "1,\"result\":{\"ok\":true}}\n\n".to_string(),
+            "data: bare\n\n".to_string(),
+            ": a comment\n\n".to_string(),
+        ])
+    });
+    let lua = vm();
+    let problem: Option<String> = eval_reactor(
+        &lua,
+        &format!(
+            r##"
             local events, chunks, done = {{}}, {{}}, nil
             local s = agent.http("POST", "{url}", {{
               body = '{{"jsonrpc":"2.0","id":1,"method":"initialize"}}',
@@ -333,29 +338,29 @@ use crate::testutil::unique_path;
             end
             return nil
         "##,
-                url = fake.url("/mcp")
-            ),
-        )
-        .await
-        .expect("upgrade eval");
-        assert!(
-            problem.is_none(),
-            "event-stream upgrade: {}",
-            problem.unwrap_or_default()
-        );
-    }
+            url = fake.url("/mcp")
+        ),
+    )
+    .await
+    .expect("upgrade eval");
+    assert!(
+        problem.is_none(),
+        "event-stream upgrade: {}",
+        problem.unwrap_or_default()
+    );
+}
 
-    /// The runtime is lib modules now: bash (+ verdicts), the panels, the
-    /// HTTP transport and the MCP client each live in `lua/lib/<name>.lua`,
-    /// are auto-required, and publish themselves on `agent` — the same table
-    /// `require` hands back. The embedded driver is down to the cooperative
-    /// wait it never gave up.
-    #[test]
-    fn lib_modules_publish_themselves_on_agent() {
-        let lua = vm();
-        let problem: Option<String> = lua
-            .load(
-                r#"
+/// The runtime is lib modules now: bash (+ verdicts), the panels, the
+/// HTTP transport and the MCP client each live in `lua/lib/<name>.lua`,
+/// are auto-required, and publish themselves on `agent` — the same table
+/// `require` hands back. The embedded driver is down to the cooperative
+/// wait it never gave up.
+#[test]
+fn lib_modules_publish_themselves_on_agent() {
+    let lua = vm();
+    let problem: Option<String> = lua
+        .load(
+            r#"
             -- A module with one entry point returns the function itself.
             if agent.mcp ~= require("mcp") then return "agent.mcp" end
             -- A module that publishes several fields returns a table of them.
@@ -378,29 +383,29 @@ use crate::testutil::unique_path;
             if type(agent.on_timeout) ~= "function" then return "agent.on_timeout" end
             return nil
         "#,
-            )
-            .eval()
-            .expect("module layout eval");
-        assert!(
-            problem.is_none(),
-            "runtime layout: {}",
-            problem.unwrap_or_default()
-        );
-    }
+        )
+        .eval()
+        .expect("module layout eval");
+    assert!(
+        problem.is_none(),
+        "runtime layout: {}",
+        problem.unwrap_or_default()
+    );
+}
 
-    /// A mode switch overwrites both halves, and both reaches the runtime the
-    /// way it reads them: `system_prompt()` is re-read per request and
-    /// `mcps_tool_defs` reindexes `agent.mcps` per request — so a switch is
-    /// live without a restart. Connections are shared by reference (the mode
-    /// and the registry name the same table); the registry itself is a fresh
-    /// copy, so a stray runtime write cannot push back into the mode's spec.
-    #[test]
-    fn a_mode_switch_overwrites_the_prompt_and_the_tool_registry() {
-        let lua = neutral_vm();
-        let before = system_prompt(&lua).expect("baseline prompt");
-        let problem: Option<String> = lua
-            .load(
-                r#"
+/// A mode switch overwrites both halves, and both reaches the runtime the
+/// way it reads them: `system_prompt()` is re-read per request and
+/// `mcps_tool_defs` reindexes `agent.mcps` per request — so a switch is
+/// live without a restart. Connections are shared by reference (the mode
+/// and the registry name the same table); the registry itself is a fresh
+/// copy, so a stray runtime write cannot push back into the mode's spec.
+#[test]
+fn a_mode_switch_overwrites_the_prompt_and_the_tool_registry() {
+    let lua = neutral_vm();
+    let before = system_prompt(&lua).expect("baseline prompt");
+    let problem: Option<String> = lua
+        .load(
+            r#"
             -- Two connections, one of them the real fs module.
             local fs = require("fs")
             local other = { name = "other", tools = {} }
@@ -445,74 +450,79 @@ use crate::testutil::unique_path;
             if pcall(agent.mode.set, "nope") then return "unknown mode accepted" end
             return nil
         "#,
-            )
-            .eval()
-            .expect("mode switch eval");
-        assert!(
-            problem.is_none(),
-            "agent.mode: {}",
-            problem.unwrap_or_default()
-        );
-        // And the prompt half as *Rust* reads it: per request, no restart.
-        assert_eq!(
-            system_prompt(&lua).expect("prompt after reset"),
-            before,
-            "the baseline prompt is what Rust sends"
-        );
-        let defs = mcps_tool_defs(&lua).expect("reindex after reset");
-        assert!(
-            defs.is_empty(),
-            "the baseline registry is what Rust advertises: {:?}",
-            defs.iter().map(|d| &d.name).collect::<Vec<_>>()
-        );
-    }
+        )
+        .eval()
+        .expect("mode switch eval");
+    assert!(
+        problem.is_none(),
+        "agent.mode: {}",
+        problem.unwrap_or_default()
+    );
+    // And the prompt half as *Rust* reads it: per request, no restart.
+    assert_eq!(
+        system_prompt(&lua).expect("prompt after reset"),
+        before,
+        "the baseline prompt is what Rust sends"
+    );
+    let defs = mcps_tool_defs(&lua).expect("reindex after reset");
+    assert!(
+        defs.is_empty(),
+        "the baseline registry is what Rust advertises: {:?}",
+        defs.iter().map(|d| &d.name).collect::<Vec<_>>()
+    );
+}
 
-    /// The switch as the runtime sees it mid-session: register, switch, and the
-    /// very next request's tool list *and* system prompt are the mode's.
-    #[test]
-    fn a_mode_is_live_for_the_next_request() {
-        let lua = neutral_vm();
-        lua.load(
-            r#"
+/// The switch as the runtime sees it mid-session: register, switch, and the
+/// very next request's tool list *and* system prompt are the mode's.
+#[test]
+fn a_mode_is_live_for_the_next_request() {
+    let lua = neutral_vm();
+    lua.load(
+        r#"
             agent.mode.new("scoped", {
               system_prompt = "SCOPED PROMPT",
               mcps = { fs = require("fs") },
             })
         "#,
-        )
+    )
+    .exec()
+    .expect("register");
+    // Still the baseline: nothing switched, so nothing changed.
+    assert_ne!(system_prompt(&lua).expect("prompt"), "SCOPED PROMPT");
+    assert!(
+        mcps_tool_defs(&lua).expect("reindex").is_empty(),
+        "registering a mode does not activate it"
+    );
+
+    lua.load(r#"agent.mode.set("scoped")"#)
         .exec()
-        .expect("register");
-        // Still the baseline: nothing switched, so nothing changed.
-        assert_ne!(system_prompt(&lua).expect("prompt"), "SCOPED PROMPT");
-        assert!(
-            mcps_tool_defs(&lua).expect("reindex").is_empty(),
-            "registering a mode does not activate it"
-        );
+        .expect("switch");
+    assert_eq!(system_prompt(&lua).expect("prompt"), "SCOPED PROMPT");
+    let defs = mcps_tool_defs(&lua).expect("reindex");
+    let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "fs.apply_patch",
+            "fs.hand_to_user",
+            "fs.read",
+            "fs.write_file"
+        ],
+        "the mode's tools are what the next request advertises"
+    );
+}
 
-        lua.load(r#"agent.mode.set("scoped")"#)
-            .exec()
-            .expect("switch");
-        assert_eq!(system_prompt(&lua).expect("prompt"), "SCOPED PROMPT");
-        let defs = mcps_tool_defs(&lua).expect("reindex");
-        let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        names.sort_unstable();
-        assert_eq!(
-            names,
-            ["fs.apply_patch", "fs.hand_to_user", "fs.read", "fs.write_file"],
-            "the mode's tools are what the next request advertises"
-        );
-    }
-
-    /// Ask once, remember afterwards: the trust table answers the second
-    /// question about a path without putting it to the user, and only for what
-    /// was trusted.
-    ///
-    /// Driven through a real sandboxed run, so the trusted path is one the
-    /// *engine* resolved (`agent.seccomp.path`) — the trust table matches on that,
-    /// not on anything a policy made up.
-    #[test]
-    fn ask_and_remember_trusts_a_path_for_the_rest_of_the_run() {
-        const POLICY: &str = r#"
+/// Ask once, remember afterwards: the trust table answers the second
+/// question about a path without putting it to the user, and only for what
+/// was trusted.
+///
+/// Driven through a real sandboxed run, so the trusted path is one the
+/// *engine* resolved (`agent.seccomp.path`) — the trust table matches on that,
+/// not on anything a policy made up.
+#[test]
+fn ask_and_remember_trusts_a_path_for_the_rest_of_the_run() {
+    const POLICY: &str = r#"
         local sc, ask = require("seccomp"), require("ask")
         local p = setmetatable({}, { __index = function() return function() return true end end })
         p.openat = function(sys)
@@ -525,64 +535,64 @@ use crate::testutil::unique_path;
         end
         return p
         "#;
-        let path = unique_path("ask-trust");
-        let _ = std::fs::remove_file(&path);
-        // The same file, opened twice: two questions if nothing is remembered.
-        let cmdline = format!("echo one > {0}; echo two > {0}", path.display());
-        let watched = path.to_string_lossy().to_string();
+    let path = unique_path("ask-trust");
+    let _ = std::fs::remove_file(&path);
+    // The same file, opened twice: two questions if nothing is remembered.
+    let cmdline = format!("echo one > {0}; echo two > {0}", path.display());
+    let watched = path.to_string_lossy().to_string();
 
-        // Headless: an ask auto-denies, so the first open fails and nothing is
-        // trusted — the run cannot get past the first redirect.
-        let out = run_bash(&cmdline, POLICY, None, None).expect("bash ran");
-        assert!(out.denied >= 1, "no handler, so the ask denies: {out:?}");
-        assert!(!path.exists(), "and nothing was written");
+    // Headless: an ask auto-denies, so the first open fails and nothing is
+    // trusted — the run cannot get past the first redirect.
+    let out = run_bash(&cmdline, POLICY, None, None).expect("bash ran");
+    assert!(out.denied >= 1, "no handler, so the ask denies: {out:?}");
+    assert!(!path.exists(), "and nothing was written");
 
-        // The same run, with a handler that answers "always allow this": the flag
-        // rides with the verdict and `ask` — the side that knows the path —
-        // records it. Two opens, one question.
-        let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let seen = asked.clone();
-        let out = run_bash(
-            &cmdline,
-            POLICY,
-            None,
-            Some(Rc::new(move |text: &str, _always: bool| {
-                seen.borrow_mut().push(text.to_string());
-                AskAnswer::AllowAndTrust
-            })),
-        )
-        .expect("bash ran");
-        let questions = asked.borrow().clone();
-        assert!(
-            !questions.is_empty(),
-            "the first open is a question: {questions:?}"
-        );
-        assert!(
-            questions[0].contains(&watched),
-            "and it names the path that was trusted: {:?}",
-            questions[0]
-        );
-        assert_eq!(
-            questions.len(),
-            1,
-            "the second open of the trusted path is silent: {questions:?}"
-        );
-        assert_eq!(out.denied, 0, "nothing was denied: {out:?}");
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("written"),
-            "two\n",
-            "the whole command ran"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
+    // The same run, with a handler that answers "always allow this": the flag
+    // rides with the verdict and `ask` — the side that knows the path —
+    // records it. Two opens, one question.
+    let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let seen = asked.clone();
+    let out = run_bash(
+        &cmdline,
+        POLICY,
+        None,
+        Some(Rc::new(move |text: &str, _always: bool| {
+            seen.borrow_mut().push(text.to_string());
+            AskAnswer::AllowAndTrust
+        })),
+    )
+    .expect("bash ran");
+    let questions = asked.borrow().clone();
+    assert!(
+        !questions.is_empty(),
+        "the first open is a question: {questions:?}"
+    );
+    assert!(
+        questions[0].contains(&watched),
+        "and it names the path that was trusted: {:?}",
+        questions[0]
+    );
+    assert_eq!(
+        questions.len(),
+        1,
+        "the second open of the trusted path is silent: {questions:?}"
+    );
+    assert_eq!(out.denied, 0, "nothing was denied: {out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("written"),
+        "two\n",
+        "the whole command ran"
+    );
+    let _ = std::fs::remove_file(&path);
+}
 
-    /// `ask_trust_write` is the whole decision in one call: trusted already,
-    /// asked once if not, and remembered **only** on "always". Two opens of the
-    /// same file in one command make the difference visible — a plain yes is for
-    /// this time, so it is asked again; an "always" is remembered, so it is not.
-    #[test]
-    fn ask_trust_write_remembers_only_on_always() {
-        const POLICY: &str = r#"
+/// `ask_trust_write` is the whole decision in one call: trusted already,
+/// asked once if not, and remembered **only** on "always". Two opens of the
+/// same file in one command make the difference visible — a plain yes is for
+/// this time, so it is asked again; an "always" is remembered, so it is not.
+#[test]
+fn ask_trust_write_remembers_only_on_always() {
+    const POLICY: &str = r#"
         local sc, ask = require("seccomp"), require("ask")
         local p = setmetatable({}, { __index = function() return function() return true end end })
         p.openat = function(sys)
@@ -596,95 +606,95 @@ use crate::testutil::unique_path;
         end
         return p
         "#;
-        let path = unique_path("ask-trust-w");
+    let path = unique_path("ask-trust-w");
 
-        // A plain yes: both opens are allowed, and neither is remembered, so the
-        // second open asks again.
-        let _ = std::fs::remove_file(&path);
-        let cmdline = format!("echo one > {0}; echo two > {0}", path.display());
-        let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let seen = asked.clone();
-        let out = run_bash(
-            &cmdline,
-            POLICY,
-            None,
-            Some(Rc::new(move |text: &str, _always: bool| {
-                seen.borrow_mut().push(text.to_string());
-                AskAnswer::Allow
-            })),
-        )
-        .expect("bash ran");
-        assert_eq!(out.denied, 0, "a yes allows both opens: {out:?}");
-        assert_eq!(
-            asked.borrow().len(),
-            2,
-            "a plain yes is for this time, so the second open asks too: {:?}",
-            asked.borrow()
-        );
-        assert_eq!(std::fs::read_to_string(&path).expect("written"), "two\n");
-        let _ = std::fs::remove_file(&path);
+    // A plain yes: both opens are allowed, and neither is remembered, so the
+    // second open asks again.
+    let _ = std::fs::remove_file(&path);
+    let cmdline = format!("echo one > {0}; echo two > {0}", path.display());
+    let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let seen = asked.clone();
+    let out = run_bash(
+        &cmdline,
+        POLICY,
+        None,
+        Some(Rc::new(move |text: &str, _always: bool| {
+            seen.borrow_mut().push(text.to_string());
+            AskAnswer::Allow
+        })),
+    )
+    .expect("bash ran");
+    assert_eq!(out.denied, 0, "a yes allows both opens: {out:?}");
+    assert_eq!(
+        asked.borrow().len(),
+        2,
+        "a plain yes is for this time, so the second open asks too: {:?}",
+        asked.borrow()
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("written"), "two\n");
+    let _ = std::fs::remove_file(&path);
 
-        // "Always": remembered, so the second open is silent.
-        let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let seen = asked.clone();
-        let out = run_bash(
-            &cmdline,
-            POLICY,
-            None,
-            Some(Rc::new(move |text: &str, _always: bool| {
-                seen.borrow_mut().push(text.to_string());
-                AskAnswer::AllowAndTrust
-            })),
-        )
-        .expect("bash ran");
-        assert_eq!(out.denied, 0, "an always allows both opens: {out:?}");
-        assert_eq!(
-            asked.borrow().len(),
-            1,
-            "an always is remembered, so the second open is silent: {:?}",
-            asked.borrow()
-        );
-        assert_eq!(std::fs::read_to_string(&path).expect("written"), "two\n");
-        let _ = std::fs::remove_file(&path);
+    // "Always": remembered, so the second open is silent.
+    let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let seen = asked.clone();
+    let out = run_bash(
+        &cmdline,
+        POLICY,
+        None,
+        Some(Rc::new(move |text: &str, _always: bool| {
+            seen.borrow_mut().push(text.to_string());
+            AskAnswer::AllowAndTrust
+        })),
+    )
+    .expect("bash ran");
+    assert_eq!(out.denied, 0, "an always allows both opens: {out:?}");
+    assert_eq!(
+        asked.borrow().len(),
+        1,
+        "an always is remembered, so the second open is silent: {:?}",
+        asked.borrow()
+    );
+    assert_eq!(std::fs::read_to_string(&path).expect("written"), "two\n");
+    let _ = std::fs::remove_file(&path);
 
-        // A refusal ends the run at the first ask — the engine kills the tracee,
-        // so there is no second open to observe. (That a denial is not
-        // remembered is pinned at the Lua level, in ask's own self-test: it
-        // needs a coroutine, not a dying process.)
-        let _ = std::fs::remove_file(&path);
-        let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let seen = asked.clone();
-        let out = run_bash(
-            &cmdline,
-            POLICY,
-            None,
-            Some(Rc::new(move |text: &str, _always: bool| {
-                seen.borrow_mut().push(text.to_string());
-                AskAnswer::Deny(None)
-            })),
-        )
-        .expect("bash ran");
-        assert!(out.denied >= 1, "the refusal stopped the run: {out:?}");
-        assert_eq!(
-            asked.borrow().len(),
-            1,
-            "asked once, then the refusal killed the tracee: {:?}",
-            asked.borrow()
-        );
-        assert!(!path.exists(), "and nothing was written");
-    }
+    // A refusal ends the run at the first ask — the engine kills the tracee,
+    // so there is no second open to observe. (That a denial is not
+    // remembered is pinned at the Lua level, in ask's own self-test: it
+    // needs a coroutine, not a dying process.)
+    let _ = std::fs::remove_file(&path);
+    let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let seen = asked.clone();
+    let out = run_bash(
+        &cmdline,
+        POLICY,
+        None,
+        Some(Rc::new(move |text: &str, _always: bool| {
+            seen.borrow_mut().push(text.to_string());
+            AskAnswer::Deny(None)
+        })),
+    )
+    .expect("bash ran");
+    assert!(out.denied >= 1, "the refusal stopped the run: {out:?}");
+    assert_eq!(
+        asked.borrow().len(),
+        1,
+        "asked once, then the refusal killed the tracee: {:?}",
+        asked.borrow()
+    );
+    assert!(!path.exists(), "and nothing was written");
+}
 
-    /// A file inside a trusted *folder* is trusted — that is the containment
-    /// rule the whole directory trust rests on, and it has to hold in both
-    /// tables and stop at a real boundary. (The `dir` flag is what makes it
-    /// work: trusting a directory trusts its subtree, trusting a *file* trusts
-    /// only itself.)
-    #[test]
-    fn a_file_inside_a_trusted_folder_is_trusted() {
-        let lua = vm();
-        let problem: Option<String> = lua
-            .load(
-                r#"
+/// A file inside a trusted *folder* is trusted — that is the containment
+/// rule the whole directory trust rests on, and it has to hold in both
+/// tables and stop at a real boundary. (The `dir` flag is what makes it
+/// work: trusting a directory trusts its subtree, trusting a *file* trusts
+/// only itself.)
+#[test]
+fn a_file_inside_a_trusted_folder_is_trusted() {
+    let lua = vm();
+    let problem: Option<String> = lua
+        .load(
+            r#"
             local ask = agent.ask
             ask.forget_all()
 
@@ -720,25 +730,25 @@ use crate::testutil::unique_path;
             if elsewhere then return "a folder nobody named" end
             return nil
         "#,
-            )
-            .eval()
-            .expect("containment walk");
-        assert!(
-            problem.is_none(),
-            "containment: {}",
-            problem.unwrap_or_default()
-        );
-    }
+        )
+        .eval()
+        .expect("containment walk");
+    assert!(
+        problem.is_none(),
+        "containment: {}",
+        problem.unwrap_or_default()
+    );
+}
 
-    /// A trusted *directory* covers its subtree, and the boundary is respected:
-    /// `/tmp` trusted does not trust `/tmpfoo`. Also the resolution forms — `~`,
-    /// a relative path, `.`/`..` tidied — and that the table is left clean.
-    #[test]
-    fn a_trusted_directory_covers_its_subtree_only() {
-        let lua = vm();
-        let problem: Option<String> = lua
-            .load(
-                r#"
+/// A trusted *directory* covers its subtree, and the boundary is respected:
+/// `/tmp` trusted does not trust `/tmpfoo`. Also the resolution forms — `~`,
+/// a relative path, `.`/`..` tidied — and that the table is left clean.
+#[test]
+fn a_trusted_directory_covers_its_subtree_only() {
+    let lua = vm();
+    let problem: Option<String> = lua
+        .load(
+            r#"
             local ask = agent.ask
             ask.forget_all()
             ask.trust("/tmp")
@@ -797,18 +807,18 @@ use crate::testutil::unique_path;
             if left ~= 0 then return "forget_all left " .. left end
             return nil
         "#,
-            )
-            .eval()
-            .expect("trust walk");
-        assert!(problem.is_none(), "trust: {}", problem.unwrap_or_default());
-    }
+        )
+        .eval()
+        .expect("trust walk");
+    assert!(problem.is_none(), "trust: {}", problem.unwrap_or_default());
+}
 
-    /// The flag-checking lib, exercised the way a policy uses it: the syscall
-    /// table carries flags, and the answer comes from the name.
-    #[test]
-    fn seccomp_lib_decodes_flags_by_name() {
-        let lua = vm();
-        let problem: Option<String> = lua
+/// The flag-checking lib, exercised the way a policy uses it: the syscall
+/// table carries flags, and the answer comes from the name.
+#[test]
+fn seccomp_lib_decodes_flags_by_name() {
+    let lua = vm();
+    let problem: Option<String> = lua
             .load(
                 r#"
             local sc = agent.seccomp
@@ -833,24 +843,24 @@ use crate::testutil::unique_path;
             )
             .eval()
             .expect("seccomp eval");
-        assert!(
-            problem.is_none(),
-            "agent.seccomp: {}",
-            problem.unwrap_or_default()
-        );
-    }
+    assert!(
+        problem.is_none(),
+        "agent.seccomp: {}",
+        problem.unwrap_or_default()
+    );
+}
 
-    /// `lua/init.lua` is the one top-level script the loader runs, and it runs
-    /// on every VM: the config surface is there without anyone calling a config
-    /// helper first. Two halves of it — the settings table `agent.llm` (the entry
-    /// script's) and the read-only `agent.llm.usage` counters (the bridge's) — plus
-    /// the two names that must *not* come back: `agent.config`, which the
-    /// settings table replaced, and `agent.policy`, which never existed as a
-    /// namespace.
-    #[test]
-    fn entry_script_defines_the_config_surface_on_every_vm() {
-        let lua = vm();
-        let missing: Option<String> = lua
+/// `lua/init.lua` is the one top-level script the loader runs, and it runs
+/// on every VM: the config surface is there without anyone calling a config
+/// helper first. Two halves of it — the settings table `agent.llm` (the entry
+/// script's) and the read-only `agent.llm.usage` counters (the bridge's) — plus
+/// the two names that must *not* come back: `agent.config`, which the
+/// settings table replaced, and `agent.policy`, which never existed as a
+/// namespace.
+#[test]
+fn entry_script_defines_the_config_surface_on_every_vm() {
+    let lua = vm();
+    let missing: Option<String> = lua
             .load(
                 r#"
             local absent = {}
@@ -898,23 +908,23 @@ use crate::testutil::unique_path;
             )
             .eval()
             .expect("entry script eval");
-        assert!(
-            missing.is_none(),
-            "lua/init.lua did not define: {}",
-            missing.unwrap_or_default()
-        );
-    }
+    assert!(
+        missing.is_none(),
+        "lua/init.lua did not define: {}",
+        missing.unwrap_or_default()
+    );
+}
 
-    /// The loader's promise about the standard library, asserted so a mlua bump
-    /// that narrows the safe subset cannot quietly take it away: the modules the
-    /// shipped tree and the docs rely on are there, and the two withheld ones
-    /// are the two we expect to be withheld (see [`STDLIB`]).
-    #[test]
-    fn stdlib_is_available_to_config_policies_and_tools() {
-        let lua = vm();
-        let report: String = lua
-            .load(
-                r#"
+/// The loader's promise about the standard library, asserted so a mlua bump
+/// that narrows the safe subset cannot quietly take it away: the modules the
+/// shipped tree and the docs rely on are there, and the two withheld ones
+/// are the two we expect to be withheld (see [`STDLIB`]).
+#[test]
+fn stdlib_is_available_to_config_policies_and_tools() {
+    let lua = vm();
+    let report: String = lua
+        .load(
+            r#"
             local out = {}
             for _, name in ipairs({ "os", "io", "package", "coroutine", "string",
                                     "table", "math" }) do
@@ -930,41 +940,41 @@ use crate::testutil::unique_path;
             out[#out + 1] = "ffi=" .. type(ffi)
             return table.concat(out, " ")
         "#,
-            )
-            .eval()
-            .expect("stdlib probe");
-        for module in [
-            "os=table",
-            "io=table",
-            "package=table",
-            "coroutine=table",
-            "string=table",
-            "table=table",
-            "math=table",
-            "os.getenv=function",
-            "os.rename=function",
-            "io.open=function",
-            "debug=nil",
-            "ffi=nil",
-        ] {
-            assert!(
-                report.split(' ').any(|pair| pair == module),
-                "stdlib: {module} missing from {report}"
-            );
-        }
+        )
+        .eval()
+        .expect("stdlib probe");
+    for module in [
+        "os=table",
+        "io=table",
+        "package=table",
+        "coroutine=table",
+        "string=table",
+        "table=table",
+        "math=table",
+        "os.getenv=function",
+        "os.rename=function",
+        "io.open=function",
+        "debug=nil",
+        "ffi=nil",
+    ] {
+        assert!(
+            report.split(' ').any(|pair| pair == module),
+            "stdlib: {module} missing from {report}"
+        );
     }
+}
 
-    /// The whole agent namespace now comes from `lua/lib/`, and every module
-    /// also resolves by name through the search path — `require("bash")`,
-    /// `require("on_timeout")` and friends are the same values `agent.*`
-    /// publishes. There is no `driver` module and no `package.preload` entry
-    /// left: the tree is the only source.
-    #[test]
-    fn the_agent_namespace_comes_from_the_lib_tree() {
-        let lua = vm();
-        let problem: Option<String> = lua
-            .load(
-                r#"
+/// The whole agent namespace now comes from `lua/lib/`, and every module
+/// also resolves by name through the search path — `require("bash")`,
+/// `require("on_timeout")` and friends are the same values `agent.*`
+/// publishes. There is no `driver` module and no `package.preload` entry
+/// left: the tree is the only source.
+#[test]
+fn the_agent_namespace_comes_from_the_lib_tree() {
+    let lua = vm();
+    let problem: Option<String> = lua
+        .load(
+            r#"
             -- Nothing of *ours* is preloaded any more: the loader only sets
             -- package.path. (LuaJIT's own stdlib preloads — string.buffer,
             -- jit.util — are still there; we do not touch those.)
@@ -986,32 +996,32 @@ use crate::testutil::unique_path;
             end
             return nil
         "#,
-            )
-            .eval()
-            .expect("namespace eval");
-        assert!(
-            problem.is_none(),
-            "agent namespace: {}",
-            problem.unwrap_or_default()
-        );
-    }
+        )
+        .eval()
+        .expect("namespace eval");
+    assert!(
+        problem.is_none(),
+        "agent namespace: {}",
+        problem.unwrap_or_default()
+    );
+}
 
-    /// `forget_all` still empties **every** path table, and `blocked` is the one
-    /// that matters most: it is the negative the other three compose with, so a
-    /// `forget_all` that emptied only the grants would leave a block standing on
-    /// its own — the one entry that can refuse a path the user has since
-    /// forgotten trusting.
-    ///
-    /// This is here because `forget_all` changed: it no longer clears a
-    /// capability table, because a capability now lives in the policy's own
-    /// closure and dies with the run. Narrowing what a function reaches is
-    /// exactly the kind of edit that quietly loses a line of the old behaviour,
-    /// so the old coverage — which counted only `trusted_paths()` — is widened
-    /// here to all four.
-    #[test]
-    fn forget_all_empties_all_four_path_tables_and_not_only_the_first() {
-        let lua = vm();
-        let problem: Option<String> = lua
+/// `forget_all` still empties **every** path table, and `blocked` is the one
+/// that matters most: it is the negative the other three compose with, so a
+/// `forget_all` that emptied only the grants would leave a block standing on
+/// its own — the one entry that can refuse a path the user has since
+/// forgotten trusting.
+///
+/// This is here because `forget_all` changed: it no longer clears a
+/// capability table, because a capability now lives in the policy's own
+/// closure and dies with the run. Narrowing what a function reaches is
+/// exactly the kind of edit that quietly loses a line of the old behaviour,
+/// so the old coverage — which counted only `trusted_paths()` — is widened
+/// here to all four.
+#[test]
+fn forget_all_empties_all_four_path_tables_and_not_only_the_first() {
+    let lua = vm();
+    let problem: Option<String> = lua
             .load(
                 r#"
             local ask = require("ask")
@@ -1048,21 +1058,25 @@ use crate::testutil::unique_path;
             )
             .eval()
             .expect("forget_all walk");
-        assert!(problem.is_none(), "forget_all: {}", problem.unwrap_or_default());
-    }
+    assert!(
+        problem.is_none(),
+        "forget_all: {}",
+        problem.unwrap_or_default()
+    );
+}
 
-    /// The server tables are a different structure from the path ones and are
-    /// emptied by a *different* function — `forget_all_servers`, not
-    /// `forget_all` — so "the path tables survived" says nothing about them.
-    /// Checked here for the same reason: `M.ask` changed, and the split between
-    /// what is remembered for a path and what for a peer is the split that change
-    /// was reasoning about.
-    #[test]
-    fn the_server_table_is_emptied_by_its_own_function_and_nothing_else() {
-        let lua = vm();
-        let problem: Option<String> = lua
-            .load(
-                r#"
+/// The server tables are a different structure from the path ones and are
+/// emptied by a *different* function — `forget_all_servers`, not
+/// `forget_all` — so "the path tables survived" says nothing about them.
+/// Checked here for the same reason: `M.ask` changed, and the split between
+/// what is remembered for a path and what for a peer is the split that change
+/// was reasoning about.
+#[test]
+fn the_server_table_is_emptied_by_its_own_function_and_nothing_else() {
+    let lua = vm();
+    let problem: Option<String> = lua
+        .load(
+            r#"
             local ask = require("ask")
             ask.trust_server("example.com")
             ask.trust_server("127.0.0.1", 8080)
@@ -1084,9 +1098,12 @@ use crate::testutil::unique_path;
             end
             return nil
         "#,
-            )
-            .eval()
-            .expect("server forget walk");
-        assert!(problem.is_none(), "servers: {}", problem.unwrap_or_default());
-    }
-
+        )
+        .eval()
+        .expect("server forget walk");
+    assert!(
+        problem.is_none(),
+        "servers: {}",
+        problem.unwrap_or_default()
+    );
+}

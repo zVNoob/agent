@@ -34,7 +34,10 @@ impl SyscallTable {
         by_name.sort_unstable_by_key(|&(name, _)| name);
         for w in by_name.windows(2) {
             if w[0].0 == w[1].0 {
-                panic!("seccomp: duplicate syscall name '{}' in the arch table", w[0].0);
+                panic!(
+                    "seccomp: duplicate syscall name '{}' in the arch table",
+                    w[0].0
+                );
             }
         }
         let mut by_number: Vec<(i32, &'static str)> =
@@ -99,8 +102,12 @@ mod tests {
     #[test]
     fn table_round_trips_and_indexes_agree() {
         let t = table();
-        for &name in &["read", "write", "openat", "execve", "clone", "fork", "seccomp"] {
-            let nr = t.number_of(name).unwrap_or_else(|| panic!("{name} missing"));
+        for &name in &[
+            "read", "write", "openat", "execve", "clone", "fork", "seccomp",
+        ] {
+            let nr = t
+                .number_of(name)
+                .unwrap_or_else(|| panic!("{name} missing"));
             assert_eq!(t.name_of(nr), Some(name), "{name} -> {nr} round-trips");
         }
         assert_eq!(t.number_of("no_such_syscall"), None);

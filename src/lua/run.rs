@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::panels::{Remember, remember_label};
 
-use super::config::{split_qualified};
+use super::config::split_qualified;
 use super::vm::{AskAnswer, AskHandler};
 
 // ---------------------------------------------------------------------------
@@ -141,10 +141,10 @@ impl<'lua> ToolRun<'lua> {
             // Dead: the values are the callback's returns, and a tool returns
             // the one result value the MCP shape defines.
             _ => {
-                let json = crate::mcp::lua_to_json( &res)
+                let json = crate::mcp::lua_to_json(&res)
                     .map_err(|e| format!("config: {}: result encode: {e}", self.name))?;
-                let text =
-                    serde_json::to_string(&json).map_err(|e| format!("config: {}: {e}", self.name))?;
+                let text = serde_json::to_string(&json)
+                    .map_err(|e| format!("config: {}: {e}", self.name))?;
                 Ok(ToolStep::Returned(text))
             }
         }
@@ -272,7 +272,6 @@ pub(super) fn decode_await(yielded: mlua::Value) -> Result<EventStep, String> {
     }
 }
 
-
 /// `agent.trigger(...) -> boolean` — force the agent loop to run a new
 /// inference. With no argument: a continuation of the current conversation.
 /// With a string: the text behaves like a submitted user message. With an
@@ -318,7 +317,7 @@ pub(super) fn lua_trigger(_: &Lua, args: mlua::MultiValue) -> mlua::Result<bool>
             user: Some(s.to_str()?.to_string()),
         },
         Some(mlua::Value::Table(t)) => {
-            let json = crate::mcp::lua_to_json( &mlua::Value::Table(t)).map_err(|e| {
+            let json = crate::mcp::lua_to_json(&mlua::Value::Table(t)).map_err(|e| {
                 mlua::Error::RuntimeError(format!("agent.trigger: history decode: {e}"))
             })?;
             match json {
@@ -469,8 +468,7 @@ pub enum InputOp {
 /// about it. A `OnceLock` has no `clear`, and writing through its address is
 /// undefined behaviour; the write lock is what serialises the reset against the
 /// senders, which take the read side and are ordinary safe code.
-static TRIGGER_TX: RwLock<Option<mpsc::UnboundedSender<AgentCommand>>> =
-    RwLock::new(None);
+static TRIGGER_TX: RwLock<Option<mpsc::UnboundedSender<AgentCommand>>> = RwLock::new(None);
 
 /// Bind the trigger channel the agent loop drains (see [`AgentCommand`]).
 /// Returns `None` when already bound — the TUI binds once at startup.
@@ -527,7 +525,10 @@ pub(crate) fn release_trigger_channel() -> TriggerChannelGuard {
     *slot = None;
     drop(slot);
     let (_tx, rx) = mpsc::unbounded_channel::<AgentCommand>();
-    TriggerChannelGuard { _serialised, rx: RefCell::new(rx) }
+    TriggerChannelGuard {
+        _serialised,
+        rx: RefCell::new(rx),
+    }
 }
 
 /// Claim the trigger channel for one test: unbind whatever is there, bind a
@@ -544,7 +545,10 @@ pub(crate) fn claim_trigger_channel() -> TriggerChannelGuard {
         let mut slot = TRIGGER_TX.write().expect("the trigger channel lock");
         *slot = Some(tx);
     }
-    TriggerChannelGuard { _serialised: serialised, rx: RefCell::new(rx) }
+    TriggerChannelGuard {
+        _serialised: serialised,
+        rx: RefCell::new(rx),
+    }
 }
 
 /// Send one command to the loop, or report that there is no loop.
@@ -560,7 +564,9 @@ fn send_to_loop(cmd: AgentCommand) -> mlua::Result<bool> {
     match slot.as_ref() {
         Some(tx) => tx
             .send(cmd)
-            .map_err(|_| mlua::Error::RuntimeError("agent.api.input_*: the agent loop is gone".into()))
+            .map_err(|_| {
+                mlua::Error::RuntimeError("agent.api.input_*: the agent loop is gone".into())
+            })
             .map(|_| true),
         None => Ok(false),
     }
@@ -623,7 +629,11 @@ pub fn fire_event_returning(
 ///
 /// Returns whether a handler was registered and ran (events are opt-in, so
 /// `false` is normal), and the handler's own error otherwise.
-pub fn fire_event_on_vm(lua: &Lua, name: &str, payload: &serde_json::Value) -> Result<bool, String> {
+pub fn fire_event_on_vm(
+    lua: &Lua,
+    name: &str,
+    payload: &serde_json::Value,
+) -> Result<bool, String> {
     let agent: Table = lua
         .globals()
         .get("agent")

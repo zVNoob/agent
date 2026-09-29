@@ -115,7 +115,9 @@ fn run_bash(
             .map(|s| String::from_utf8_lossy(s.as_bytes().as_ref()).to_string())
             .unwrap_or_default()
     };
-    let exit: Table = r.get("exit").map_err(|e| format!("lua bash: no exit: {e}"))?;
+    let exit: Table = r
+        .get("exit")
+        .map_err(|e| format!("lua bash: no exit: {e}"))?;
     Ok(Run {
         stdout: text("stdout"),
         stderr: text("stderr"),
@@ -232,7 +234,7 @@ const COLLECT: &str = r#"
 /// keys — so it is vestigial here; tests that want a syscall decided
 /// explicitly assign a key, e.g. `allowall.execve = ...`.)
 const ALLOW_ALL: &str =
-        r#"setmetatable({}, { __index = function() return function() return true end end })"#;
+    r#"setmetatable({}, { __index = function() return function() return true end end })"#;
 
 /// A VM with the built-in configuration taken back off: no connections, no
 /// mode in force, no prompt — a neutral `agent` for the tests that need one.
@@ -287,10 +289,7 @@ fn drive_on_vm(
     for _ in 0..1000 {
         match step {
             ToolStep::Returned(body) => {
-                return (
-                    serde_json::from_str(&body).expect("tool json"),
-                    asked,
-                )
+                return (serde_json::from_str(&body).expect("tool json"), asked);
             }
             ToolStep::Ask { text, remember } => {
                 asked.push(text.clone());
@@ -396,9 +395,10 @@ fn allow_all() -> Option<AskHandler> {
 /// config VM, with the round's panel sink and the call's ask handler.
 /// Returns the tool's JSON body.
 fn call_bash(args: &str, sink: &PanelSink, on_ask: Option<AskHandler>) -> serde_json::Value {
-    let (body, _) = invoke_mcp_tool_with_asks("bash.bash", args, Some(sink), on_ask, &ConfigSource::Tree)
-        .expect("invoke bash")
-        .expect("the shipped config registers agent.mcps.bash");
+    let (body, _) =
+        invoke_mcp_tool_with_asks("bash.bash", args, Some(sink), on_ask, &ConfigSource::Tree)
+            .expect("invoke bash")
+            .expect("the shipped config registers agent.mcps.bash");
     serde_json::from_str(&body).expect("tool json")
 }
 
@@ -572,41 +572,42 @@ use crate::panels::{ALWAYS_LABEL, PaneInit, PanelOp, PanelSink, Remember};
 use crate::seccomp::{self, FdSlot, Step, Verdict};
 
 use super::config::{
-    apply_config_source, ensure_config, invoke_mcp_tool_with_asks, invoke_tool,
-    invoke_tool_asking, llm_config, mcps_tool_defs, system_prompt, verdict_to_lua,
-    ConfigOrigin, ConfigSource,
+    ConfigOrigin, ConfigSource, apply_config_source, ensure_config, invoke_mcp_tool_with_asks,
+    invoke_tool, invoke_tool_asking, llm_config, mcps_tool_defs, system_prompt, verdict_to_lua,
 };
 use super::memory::{
     bind_memory, memory_append_many, memory_config, memory_is_bound, memory_latest,
 };
 use super::run::{
-    AgentCommand, EventRun, EventStep, InputOp, ToolRun, ToolStep,
-    fire_event_on_vm, fire_event_returning, claim_trigger_channel, release_trigger_channel,
+    AgentCommand, EventRun, EventStep, InputOp, ToolRun, ToolStep, claim_trigger_channel,
+    fire_event_on_vm, fire_event_returning, release_trigger_channel,
 };
 use super::sandbox::{
-    cstring_positions, cwd_resolution_ok, dirfd_slot_for, proc_cmdline, read_cstr, resolve_path,
-    CSTRING_CAP,
+    CSTRING_CAP, cstring_positions, cwd_resolution_ok, dirfd_slot_for, proc_cmdline, read_cstr,
+    resolve_path,
 };
 use super::tree::{load_init, lua_dir_candidates, lua_dir_in, missing_tree_message};
 use super::usage::{Usage, record_usage, usage_guard};
-use super::vm::{AskAnswer, AskHandler, STDLIB, eval_reactor, install_sink, new_vm,
-    new_vm_with_ask, new_vm_with_sink, setup_tree};
+use super::vm::{
+    AskAnswer, AskHandler, STDLIB, eval_reactor, install_sink, new_vm, new_vm_with_ask,
+    new_vm_with_sink, setup_tree,
+};
 
-mod namespace;
-mod tree;
-mod modes;
-mod tools;
-mod registry;
-mod loader;
-mod sandbox;
-mod mcp;
-mod http;
-mod panels;
 mod config;
-mod policy;
-mod syscalls;
-mod trust;
-mod fs;
 mod events;
-mod memory;
+mod fs;
+mod http;
 mod keys;
+mod loader;
+mod mcp;
+mod memory;
+mod modes;
+mod namespace;
+mod panels;
+mod policy;
+mod registry;
+mod sandbox;
+mod syscalls;
+mod tools;
+mod tree;
+mod trust;

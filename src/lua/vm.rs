@@ -106,8 +106,8 @@ pub(super) fn new_vm_with_ask_from(
         ConfigSource::Tree => ConfigOrigin::Tree,
         ConfigSource::UserHome(home) => ensure_config(&tree, home.as_deref()).1,
     };
-    let lua = Lua::new_with(STDLIB, mlua::LuaOptions::default())
-        .map_err(|e| format!("lua: {e}"))?;
+    let lua =
+        Lua::new_with(STDLIB, mlua::LuaOptions::default()).map_err(|e| format!("lua: {e}"))?;
     setup_tree(&lua, sink, on_ask, &tree, config).map_err(|e| e.to_string())?;
     Ok((lua, origin))
 }
@@ -122,10 +122,7 @@ pub fn new_vm_with_sink(sink: Option<&PanelSink>) -> mlua::Result<Lua> {
 /// `agent.mcps` entry, run as a coroutine on this VM by
 /// [`invoke_mcp_tool_with_asks`]) able to put a question to the user. Without
 /// one the primitive auto-denies, so an asking policy always terminates.
-pub fn new_vm_with_ask(
-    sink: Option<&PanelSink>,
-    on_ask: Option<AskHandler>,
-) -> mlua::Result<Lua> {
+pub fn new_vm_with_ask(sink: Option<&PanelSink>, on_ask: Option<AskHandler>) -> mlua::Result<Lua> {
     let lua = Lua::new_with(STDLIB, mlua::LuaOptions::default())
         .map_err(|e| mlua::Error::external(format!("lua VM: {e}")))?;
     setup_inner(&lua, sink, on_ask)?;
@@ -144,10 +141,7 @@ pub fn new_vm_with_ask(
 /// stream this way is therefore testing the shipped path, not a threaded
 /// approximation of it.
 #[cfg(test)]
-pub(crate) async fn eval_reactor<T: mlua::FromLuaMulti>(
-    lua: &Lua,
-    chunk: &str,
-) -> mlua::Result<T> {
+pub(crate) async fn eval_reactor<T: mlua::FromLuaMulti>(lua: &Lua, chunk: &str) -> mlua::Result<T> {
     let agent: Table = lua.globals().get("agent")?;
     agent.set("__on_reactor", true)?;
     let thread = lua.load(chunk).into_function()?;
@@ -226,7 +220,6 @@ pub enum AskAnswer {
 /// the tool, so it never crosses a thread and need not be `Send`.
 pub type AskHandler = std::rc::Rc<dyn Fn(&str, bool) -> AskAnswer + 'static>;
 
-
 /// Install the `agent` namespace into `lua` (globals table `agent` plus the
 /// Lua driver primitives), then load the shipped `lua/` tree: every
 /// `lua/lib/**.lua` module and the `lua/init.lua` entry script. No panel sink:
@@ -237,7 +230,11 @@ pub fn setup(lua: &Lua) -> mlua::Result<()> {
 
 /// [`setup`] with an optional panel sink, so `agent.api.panel_*` emissions from
 /// policy/tool Lua are buffered for the TUI to apply (headless: `None`).
-fn setup_inner(lua: &Lua, sink: Option<&PanelSink>, on_ask: Option<AskHandler>) -> mlua::Result<()> {
+fn setup_inner(
+    lua: &Lua,
+    sink: Option<&PanelSink>,
+    on_ask: Option<AskHandler>,
+) -> mlua::Result<()> {
     setup_tree(lua, sink, on_ask, &lua_dir(), &ConfigSource::default())
 }
 

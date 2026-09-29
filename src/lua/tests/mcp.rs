@@ -3,19 +3,19 @@
 //! the panels a call draws for itself.
 use super::*;
 
-    #[test]
-    fn mcp_fake_handshake_registers_tools_and_calls_them() {
-        // The full agent.mcp flow against an in-process fake transport func:
-        // handshake (initialize -> initialized notification -> tools/list),
-        // tool objects registered on the connection with their fields, and
-        // request/response tool calls correlated by id — all through
-        // func(request_json, on_streaming_response_json). No process: the
-        // transport is injected and the protocol lives in Lua.
-        let lua = vm();
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+#[test]
+fn mcp_fake_handshake_registers_tools_and_calls_them() {
+    // The full agent.mcp flow against an in-process fake transport func:
+    // handshake (initialize -> initialized notification -> tools/list),
+    // tool objects registered on the connection with their fields, and
+    // request/response tool calls correlated by id — all through
+    // func(request_json, on_streaming_response_json). No process: the
+    // transport is injected and the protocol lives in Lua.
+    let lua = vm();
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             local func = fake_mcp_func(handlers)
             agent.mcps.fake = agent.mcp("fake", func)
             local conn = agent.mcps.fake
@@ -45,22 +45,22 @@ use super::*;
             assert(agent.mcps.fake == nil, "close unregisters the connection")
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "mcp handshake/tool-call flow failed");
-    }
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "mcp handshake/tool-call flow failed");
+}
 
-    #[test]
-    fn mcp_tool_policy_denies_without_touching_the_wire() {
-        // Tool-level approval is a plain Lua allow-list (no Ask machinery):
-        // a `false` verdict denies the call locally — the transport func is
-        // never invoked — and the connection is unaffected for other tools.
-        let lua = vm();
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+#[test]
+fn mcp_tool_policy_denies_without_touching_the_wire() {
+    // Tool-level approval is a plain Lua allow-list (no Ask machinery):
+    // a `false` verdict denies the call locally — the transport func is
+    // never invoked — and the connection is unaffected for other tools.
+    let lua = vm();
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             local calls = 0
             local base = fake_mcp_func(handlers)
             local conn = agent.mcp("fake", function(request_json, on_streaming_response_json)
@@ -80,21 +80,21 @@ use super::*;
             conn:close()
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "mcp tool policy flow failed");
-    }
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "mcp tool policy flow failed");
+}
 
-    #[test]
-    fn mcp_tool_callback_overrides_the_rpc() {
-        // tool.callback short-circuits the RPC: any return is the tool result
-        // verbatim; a `false` return denies (used for stubs / dry-runs).
-        let lua = vm();
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+#[test]
+fn mcp_tool_callback_overrides_the_rpc() {
+    // tool.callback short-circuits the RPC: any return is the tool result
+    // verbatim; a `false` return denies (used for stubs / dry-runs).
+    let lua = vm();
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             local conn = agent.mcp("fake", fake_mcp_func(handlers))
             conn.probe.callback = function(args) return "dry-run:" .. args.text end
             local r = conn.probe({ text = "x" })
@@ -105,22 +105,22 @@ use super::*;
             conn:close()
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "mcp tool callback flow failed");
-    }
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "mcp tool callback flow failed");
+}
 
-    #[test]
-    fn mcp_close_marks_dead_and_invokes_on_close() {
-        // close() marks the connection dead (later tool calls fail fast with
-        // a result error, not a raise), unregisters from agent.mcps, and lets
-        // the transport release its resources via opts.on_close.
-        let lua = vm();
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+#[test]
+fn mcp_close_marks_dead_and_invokes_on_close() {
+    // close() marks the connection dead (later tool calls fail fast with
+    // a result error, not a raise), unregisters from agent.mcps, and lets
+    // the transport release its resources via opts.on_close.
+    let lua = vm();
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             local closed = false
             local conn = agent.mcp("tmp", fake_mcp_func(handlers),
                                    { on_close = function() closed = true end })
@@ -135,19 +135,19 @@ use super::*;
             assert(okd == nil and derr ~= nil, "request fails fast on a dead connection")
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "mcp close flow failed");
-    }
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "mcp close flow failed");
+}
 
-    #[test]
-    fn mcp_validation_and_handshake_failures() {
-        // Argument validation happens before any transport contact; handshake
-        // failures (transport raise, absent response, RPC error) raise out of
-        // agent.mcp, so a connection is only ever handed back ready to go.
-        let lua = vm();
-        let ok: bool = lua
+#[test]
+fn mcp_validation_and_handshake_failures() {
+    // Argument validation happens before any transport contact; handshake
+    // failures (transport raise, absent response, RPC error) raise out of
+    // agent.mcp, so a connection is only ever handed back ready to go.
+    let lua = vm();
+    let ok: bool = lua
             .load(format!(
                 "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
                 body = r#"
@@ -177,17 +177,17 @@ use super::*;
             ))
             .eval()
             .expect("eval");
-        assert!(ok, "mcp validation/handshake-failure flow failed");
-    }
+    assert!(ok, "mcp validation/handshake-failure flow failed");
+}
 
-    #[test]
-    fn mcp_streams_notifications_before_the_response() {
-        // The callback is a *stream*: a single func round may deliver id-less
-        // notifications first and the response last; the driver routes each —
-        // notifications into opts.on_message, the matching response to the
-        // pending request.
-        let lua = vm();
-        let ok: bool = lua
+#[test]
+fn mcp_streams_notifications_before_the_response() {
+    // The callback is a *stream*: a single func round may deliver id-less
+    // notifications first and the response last; the driver routes each —
+    // notifications into opts.on_message, the matching response to the
+    // pending request.
+    let lua = vm();
+    let ok: bool = lua
             .load(format!(
                 "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
                 body = r#"
@@ -212,19 +212,19 @@ use super::*;
             ))
             .eval()
             .expect("eval");
-        assert!(ok, "mcp streaming-notification flow failed");
-    }
+    assert!(ok, "mcp streaming-notification flow failed");
+}
 
-    #[test]
-    fn mcp_tool_call_transport_errors_surface_as_results() {
-        // A func that raises mid-round, or that returns without streaming the
-        // response, surfaces as { ok = false, error } — never a raise out of
-        // the tool call. Non-JSON streamed text goes to on_badline.
-        let lua = vm();
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+#[test]
+fn mcp_tool_call_transport_errors_surface_as_results() {
+    // A func that raises mid-round, or that returns without streaming the
+    // response, surfaces as { ok = false, error } — never a raise out of
+    // the tool call. Non-JSON streamed text goes to on_badline.
+    let lua = vm();
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             local conn = agent.mcp("s", fake_mcp_func(handlers))
             -- func raises: transport error
             conn.func = function() error("boom") end
@@ -254,22 +254,22 @@ use super::*;
             conn2:close()
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "mcp transport-error flow failed");
-    }
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "mcp transport-error flow failed");
+}
 
-    #[test]
-    fn mcp_notify_sends_without_expecting_a_response() {
-        // conn:notify is fire-and-forget: func carries the notification over
-        // the wire, but nothing streamed back is awaited (id-less messages
-        // still dispatch into on_message).
-        let lua = vm();
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+#[test]
+fn mcp_notify_sends_without_expecting_a_response() {
+    // conn:notify is fire-and-forget: func carries the notification over
+    // the wire, but nothing streamed back is awaited (id-less messages
+    // still dispatch into on_message).
+    let lua = vm();
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             local calls = 0
             local base = fake_mcp_func(handlers)
             local conn = agent.mcp("s", function(request_json, on_streaming_response_json)
@@ -283,21 +283,21 @@ use super::*;
             conn:close()
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "mcp notify flow failed");
-    }
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "mcp notify flow failed");
+}
 
-    #[test]
-    fn mcp_per_call_streaming_routes_progress_and_messages_then_settles() {
-        // Phase-A streaming: conn:invoke(name, args, { on_progress, on_message })
-        // — a round carrying on_progress injects `_meta.progressToken` into the
-        // request params (shallow-copied, never mutating the caller's table),
-        // notifications streamed back during the round route to the per-call
-        // callbacks in order, and the result still settles atomically.
-        let lua = vm();
-        let ok: bool = lua
+#[test]
+fn mcp_per_call_streaming_routes_progress_and_messages_then_settles() {
+    // Phase-A streaming: conn:invoke(name, args, { on_progress, on_message })
+    // — a round carrying on_progress injects `_meta.progressToken` into the
+    // request params (shallow-copied, never mutating the caller's table),
+    // notifications streamed back during the round route to the per-call
+    // callbacks in order, and the result still settles atomically.
+    let lua = vm();
+    let ok: bool = lua
             .load(format!(
                 "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
                 body = r#"
@@ -341,25 +341,25 @@ use super::*;
             ))
             .eval()
             .expect("eval");
-        assert!(ok, "mcp per-call streaming failed");
-    }
+    assert!(ok, "mcp per-call streaming failed");
+}
 
-    #[test]
-    fn mcp_progress_without_on_progress_falls_back_to_global() {
-        // Streaming is opt-in: without on_progress no `_meta.progressToken` is
-        // injected and progress notifications fall through to the global
-        // opts.on_message, exactly like any other inbound notification.
-        //
-        // This is now the `draw = false` case, and that scoping is the point:
-        // a connection that draws sets `on_progress` on the caller's behalf, so
-        // the opt-out is the only way to get the old wire behaviour — which is
-        // why it forwards the callopts *untouched* rather than merely skipping
-        // the panel. The default path is `mcp_a_wire_call_draws_its_own_panel`.
-        let lua = vm();
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+#[test]
+fn mcp_progress_without_on_progress_falls_back_to_global() {
+    // Streaming is opt-in: without on_progress no `_meta.progressToken` is
+    // injected and progress notifications fall through to the global
+    // opts.on_message, exactly like any other inbound notification.
+    //
+    // This is now the `draw = false` case, and that scoping is the point:
+    // a connection that draws sets `on_progress` on the caller's behalf, so
+    // the opt-out is the only way to get the old wire behaviour — which is
+    // why it forwards the callopts *untouched* rather than merely skipping
+    // the panel. The default path is `mcp_a_wire_call_draws_its_own_panel`.
+    let lua = vm();
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             local base_call = handlers["tools/call"]
             local seen_request_meta
             handlers["tools/call"] = function(req)
@@ -382,74 +382,74 @@ use super::*;
             conn:close()
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "mcp opt-in progress fallback failed");
-    }
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "mcp opt-in progress fallback failed");
+}
 
-    /// An MCP tool cannot report itself — its code is across the wire — so the
-    /// connection draws the panel on its behalf. This is that, end to end
-    /// through the real protocol against the in-process fake.
-    ///
-    /// The assertions are the ones that make it the *same* behaviour a local
-    /// tool gets rather than a different one: a titled panel, opened before the
-    /// request, holding the result's **text** rather than its JSON envelope.
-    #[test]
-    fn mcp_a_wire_call_draws_its_own_panel() {
-        let sink = crate::panels::PanelSink::default();
-        let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+/// An MCP tool cannot report itself — its code is across the wire — so the
+/// connection draws the panel on its behalf. This is that, end to end
+/// through the real protocol against the in-process fake.
+///
+/// The assertions are the ones that make it the *same* behaviour a local
+/// tool gets rather than a different one: a titled panel, opened before the
+/// request, holding the result's **text** rather than its JSON envelope.
+#[test]
+fn mcp_a_wire_call_draws_its_own_panel() {
+    let sink = crate::panels::PanelSink::default();
+    let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             local conn = agent.mcp("wiki", fake_mcp_func(handlers))
             local r = conn.probe({ text = "hi there" })
             assert(r.ok == true, "the call still returns its result")
             conn:close()
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "mcp drawing path failed");
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "mcp drawing path failed");
 
-        // Opened *before* the result arrived, so a slow call is visibly in
-        // flight rather than appearing all at once when it finishes. The order
-        // of the ops is the evidence.
-        let ops = sink.ops();
-        assert!(
-            matches!(ops.first(), Some(PanelOp::Create { .. })),
-            "the panel is created first, then filled: {ops:?}"
-        );
+    // Opened *before* the result arrived, so a slow call is visibly in
+    // flight rather than appearing all at once when it finishes. The order
+    // of the ops is the evidence.
+    let ops = sink.ops();
+    assert!(
+        matches!(ops.first(), Some(PanelOp::Create { .. })),
+        "the panel is created first, then filled: {ops:?}"
+    );
 
-        let panel = drawn(&sink);
-        // Titled the way tools are named everywhere else.
-        assert!(
-            panel.contains("┌─ wiki.probe"),
-            "a panel titled {{connection}}.{{tool}}: {panel:?}"
-        );
-        // The result's text, not the envelope around it.
-        assert!(
-            panel.contains("hi there"),
-            "the text block is shown: {panel:?}"
-        );
-        assert!(
-            !panel.contains("\"content\"") && !panel.contains("\"type\":\"text\""),
-            "and not the JSON envelope it arrived in: {panel:?}"
-        );
-    }
+    let panel = drawn(&sink);
+    // Titled the way tools are named everywhere else.
+    assert!(
+        panel.contains("┌─ wiki.probe"),
+        "a panel titled {{connection}}.{{tool}}: {panel:?}"
+    );
+    // The result's text, not the envelope around it.
+    assert!(
+        panel.contains("hi there"),
+        "the text block is shown: {panel:?}"
+    );
+    assert!(
+        !panel.contains("\"content\"") && !panel.contains("\"type\":\"text\""),
+        "and not the JSON envelope it arrived in: {panel:?}"
+    );
+}
 
-    /// `draw = false` is the escape hatch, and it has to be exact: no panel ops
-    /// at all, and the request on the wire byte for byte what it always was.
-    #[test]
-    fn mcp_draw_false_keeps_the_call_silent_and_the_wire_unchanged() {
-        let sink = crate::panels::PanelSink::default();
-        let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+/// `draw = false` is the escape hatch, and it has to be exact: no panel ops
+/// at all, and the request on the wire byte for byte what it always was.
+#[test]
+fn mcp_draw_false_keeps_the_call_silent_and_the_wire_unchanged() {
+    let sink = crate::panels::PanelSink::default();
+    let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             local base_call = handlers["tools/call"]
             handlers["tools/call"] = function(req)
               __seen_meta = req.params._meta
@@ -462,27 +462,27 @@ use super::*;
             conn:close()
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "the draw=false path failed");
-        assert!(
-            sink.ops().is_empty(),
-            "and an opted-out connection draws nothing: {:?}",
-            sink.ops()
-        );
-    }
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "the draw=false path failed");
+    assert!(
+        sink.ops().is_empty(),
+        "and an opted-out connection draws nothing: {:?}",
+        sink.ops()
+    );
+}
 
-    /// The two shapes that are not a plain text result, and one failure. All
-    /// three used to be a wall of JSON or nothing at all.
-    #[test]
-    fn mcp_panels_show_text_json_and_failure() {
-        let sink = crate::panels::PanelSink::default();
-        let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+/// The two shapes that are not a plain text result, and one failure. All
+/// three used to be a wall of JSON or nothing at all.
+#[test]
+fn mcp_panels_show_text_json_and_failure() {
+    let sink = crate::panels::PanelSink::default();
+    let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             -- A result with no text block at all: shown as indented JSON, so a
             -- structured result is never reduced to nothing.
             handlers["tools/call"] = function(req)
@@ -525,41 +525,41 @@ use super::*;
             conn:close()
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "mcp result shapes failed");
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "mcp result shapes failed");
 
-        let panel = drawn(&sink);
-        // Indented, and it kept the structure rather than printing it flat.
-        assert!(
-            panel.contains("\"rows\": 2") && panel.contains("\"ok\": true"),
-            "a textless result is shown as indented JSON: {panel:?}"
-        );
-        assert!(
-            panel.contains("the server said no"),
-            "and a JSON-RPC failure is reported in the call's own panel: {panel:?}"
-        );
-        // A tool that failed while the call succeeded: `isError` with a generic
-        // sentence, which is what a real MCP server sends. Unmarked it would be
-        // indistinguishable from a result.
-        assert!(
-            panel.contains("error: Error executing tool iserr"),
-            "an isError result is marked as the failure it is: {panel:?}"
-        );
-    }
+    let panel = drawn(&sink);
+    // Indented, and it kept the structure rather than printing it flat.
+    assert!(
+        panel.contains("\"rows\": 2") && panel.contains("\"ok\": true"),
+        "a textless result is shown as indented JSON: {panel:?}"
+    );
+    assert!(
+        panel.contains("the server said no"),
+        "and a JSON-RPC failure is reported in the call's own panel: {panel:?}"
+    );
+    // A tool that failed while the call succeeded: `isError` with a generic
+    // sentence, which is what a real MCP server sends. Unmarked it would be
+    // indistinguishable from a result.
+    assert!(
+        panel.contains("error: Error executing tool iserr"),
+        "an isError result is marked as the failure it is: {panel:?}"
+    );
+}
 
-    /// A tool with a Lua `callback` is running on this VM, so it can ask for
-    /// its own panel. Drawing for it too would be the double output the whole
-    /// arrangement exists to prevent — so this path is left alone.
-    #[test]
-    fn mcp_a_callback_tool_is_left_to_draw_itself() {
-        let sink = crate::panels::PanelSink::default();
-        let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+/// A tool with a Lua `callback` is running on this VM, so it can ask for
+/// its own panel. Drawing for it too would be the double output the whole
+/// arrangement exists to prevent — so this path is left alone.
+#[test]
+fn mcp_a_callback_tool_is_left_to_draw_itself() {
+    let sink = crate::panels::PanelSink::default();
+    let lua = new_vm_with_sink(Some(&sink)).expect("agent VM");
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             local conn = agent.mcp("wiki", fake_mcp_func(handlers))
             -- The override: same connection, but this tool answers in Lua.
             -- The same override shape `mcp_tool_callback_overrides_the_rpc`
@@ -572,24 +572,24 @@ use super::*;
             conn:close()
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "the callback-tool path failed");
-        assert!(
-            sink.ops().is_empty(),
-            "a tool that can draw for itself is not drawn for: {:?}",
-            sink.ops()
-        );
-    }
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "the callback-tool path failed");
+    assert!(
+        sink.ops().is_empty(),
+        "a tool that can draw for itself is not drawn for: {:?}",
+        sink.ops()
+    );
+}
 
-    #[test]
-    fn mcp_invoke_rejects_bad_callopts_and_unknown_tool() {
-        // conn:invoke validates callopts up front (a programming error raises,
-        // it must never half-over-the-wire) and reports unknown tools as a
-        // result error, matching the tool-object shape.
-        let lua = vm();
-        let ok: bool = lua
+#[test]
+fn mcp_invoke_rejects_bad_callopts_and_unknown_tool() {
+    // conn:invoke validates callopts up front (a programming error raises,
+    // it must never half-over-the-wire) and reports unknown tools as a
+    // result error, matching the tool-object shape.
+    let lua = vm();
+    let ok: bool = lua
             .load(format!(
                 "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
                 body = r#"
@@ -611,21 +611,21 @@ use super::*;
             ))
             .eval()
             .expect("eval");
-        assert!(ok, "mcp invoke validation failed");
-    }
+    assert!(ok, "mcp invoke validation failed");
+}
 
-    #[test]
-    fn mcp_tool_call_round_is_coroutine_wrappable() {
-        // Wrapping an MCP round in a coroutine works: the request/dispatch
-        // chain from the coroutine to the streaming callbacks is pure Lua, so
-        // on_progress may yield progress events to the pump and the final
-        // result arrives on the next resume. Phase-B async is up to users; this
-        // is the guarantee they build on.
-        let lua = vm();
-        let ok: bool = lua
-            .load(format!(
-                "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
-                body = r#"
+#[test]
+fn mcp_tool_call_round_is_coroutine_wrappable() {
+    // Wrapping an MCP round in a coroutine works: the request/dispatch
+    // chain from the coroutine to the streaming callbacks is pure Lua, so
+    // on_progress may yield progress events to the pump and the final
+    // result arrives on the next resume. Phase-B async is up to users; this
+    // is the guarantee they build on.
+    let lua = vm();
+    let ok: bool = lua
+        .load(format!(
+            "{FAKE_MCP_FUNC}\n{FAKE_MCP_HANDLERS}\n{body}",
+            body = r#"
             local base_call = handlers["tools/call"]
             handlers["tools/call"] = function(req)
               local msgs = base_call(req)
@@ -663,18 +663,18 @@ use super::*;
             conn:close()
             return true
             "#
-            ))
-            .eval()
-            .expect("eval");
-        assert!(ok, "mcp coroutine wrapper failed");
-    }
+        ))
+        .eval()
+        .expect("eval");
+    assert!(ok, "mcp coroutine wrapper failed");
+}
 
-    #[test]
-    fn mcp_json_bridge_is_wired_into_the_agent_vm() {
-        // The JSON text boundary (src/mcp.rs) is installed on the real agent
-        // namespace, not only on bare VMs.
-        let lua = vm();
-        let ok: bool = lua
+#[test]
+fn mcp_json_bridge_is_wired_into_the_agent_vm() {
+    // The JSON text boundary (src/mcp.rs) is installed on the real agent
+    // namespace, not only on bare VMs.
+    let lua = vm();
+    let ok: bool = lua
             .load(
                 r#"
             local enc = agent.api.json_encode({ jsonrpc = "2.0", id = 7, method = "tools/call",
@@ -686,9 +686,9 @@ use super::*;
             )
             .eval()
             .expect("eval");
-        assert!(ok, "json bridge must work inside the agent VM");
-    }
+    assert!(ok, "json bridge must work inside the agent VM");
+}
 
-    // ---------------------------------------------------------------------
-    // HTTP(S) transport: `agent.http` (both routes) against the fake server.
-    // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// HTTP(S) transport: `agent.http` (both routes) against the fake server.
+// ---------------------------------------------------------------------

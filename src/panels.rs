@@ -533,15 +533,20 @@ mod tests {
 
         // Full width: at 60 cells the content fits on one row with no divider
         // and no second column, which is what a one-pane split must look like.
-        let rows: Vec<String> =
-            crate::tui::BorderedRenderer::lines(&panel.messages, 60, true)
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect();
+        let rows: Vec<String> = crate::tui::BorderedRenderer::lines(&panel.messages, 60, true)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
         let text = rows.join("\n");
-        assert!(text.contains("write_file: /tmp/shown.json"), "titled: {text}");
+        assert!(
+            text.contains("write_file: /tmp/shown.json"),
+            "titled: {text}"
+        );
         assert!(text.contains("1 line, 14 bytes"), "captioned: {text}");
-        assert!(text.contains("{\"ok\": true}"), "the content is on one row: {text}");
+        assert!(
+            text.contains("{\"ok\": true}"),
+            "the content is on one row: {text}"
+        );
         // No pane divider: every row carries exactly the box's own two bars, so
         // a one-pane split has nothing between the columns to draw.
         for row in rows.iter().filter(|r| r.starts_with('\u{2502}')) {

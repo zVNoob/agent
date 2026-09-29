@@ -155,9 +155,7 @@ pub fn ensure_config(
     if path.is_file() {
         return (path, ConfigOrigin::Existing);
     }
-    if let Err(why) = std::fs::create_dir_all(&dir)
-        .and_then(|()| std::fs::copy(&shipped, &path))
-    {
+    if let Err(why) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::copy(&shipped, &path)) {
         eprintln!(
             "[agent] could not write {} ({why}); using the built-in defaults",
             path.display()
@@ -237,7 +235,9 @@ pub fn system_prompt(lua: &Lua) -> Result<String, String> {
         .globals()
         .get("agent")
         .map_err(|e| format!("config: agent table: {e}"))?;
-    let config: Table = agent.get("llm").map_err(|e| format!("config: agent.llm: {e}"))?;
+    let config: Table = agent
+        .get("llm")
+        .map_err(|e| format!("config: agent.llm: {e}"))?;
     Ok(config.get("system_prompt").unwrap_or_default())
 }
 
@@ -296,7 +296,7 @@ pub fn mcps_tool_defs(lua: &Lua) -> Result<Vec<McpToolDef>, String> {
             let name = qualified_name(&conn_name, &tool_name);
             let description: String = tool.get("description").unwrap_or_default();
             let signature: mlua::Value = tool.get("signature").unwrap_or(mlua::Value::Nil);
-            let parameters = crate::mcp::lua_to_json( &signature)
+            let parameters = crate::mcp::lua_to_json(&signature)
                 .map_err(|e| format!("mcps: {name} signature: {e}"))?;
             defs.push(McpToolDef {
                 name,
@@ -400,9 +400,7 @@ fn drive_blocking(
                     .map_err(|e| format!("config: {name}: {e}"))?;
             }
             ToolStep::Waiting { .. } => {
-                step = run
-                    .wait()
-                    .map_err(|e| format!("config: {name}: {e}"))?;
+                step = run.wait().map_err(|e| format!("config: {name}: {e}"))?;
             }
         }
     }

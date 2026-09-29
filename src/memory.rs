@@ -434,8 +434,8 @@ fn gzip_decompress(bytes: &[u8]) -> io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::testutil::unique_path;
     use super::*;
+    use crate::testutil::unique_path;
     use std::time::Instant;
 
     fn temp_path(tag: &str) -> PathBuf {
@@ -677,7 +677,9 @@ mod tests {
         assert!(e.to_string().contains("not valid JSON"));
         // The counter is unchanged, so the rejected message took no sequence
         // number: the log's `seq` values stay contiguous.
-        let ok = m.append(r#"{"role":"user","content":"next"}"#).expect("the next append");
+        let ok = m
+            .append(r#"{"role":"user","content":"next"}"#)
+            .expect("the next append");
         assert_eq!(ok, 1, "so the rejected one did not consume number 1");
         m.close().expect("close");
         std::fs::remove_file(&p).ok();

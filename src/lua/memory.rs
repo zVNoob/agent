@@ -167,7 +167,7 @@ pub(super) fn lua_memory_append(_: &Lua, msg: mlua::Value) -> mlua::Result<u64> 
     let text = match msg {
         mlua::Value::String(s) => s.to_str()?.to_string(),
         other => {
-            let json = crate::mcp::lua_to_json( &other).map_err(|e| {
+            let json = crate::mcp::lua_to_json(&other).map_err(|e| {
                 mlua::Error::RuntimeError(format!("agent.memory.append: encode: {e}"))
             })?;
             serde_json::to_string(&json).map_err(|e| {

@@ -103,7 +103,9 @@ pub(super) fn lua_step(lua: &Lua, handle: AnyUserData) -> mlua::Result<Table> {
         if e.raw_os_error() == Some(libc::EINTR) {
             return idle_table(lua);
         }
-        return Err(mlua::Error::RuntimeError(format!("agent.api.step: poll: {e}")));
+        return Err(mlua::Error::RuntimeError(format!(
+            "agent.api.step: poll: {e}"
+        )));
     }
     if pr == 0 {
         return idle_table(lua);
@@ -188,7 +190,10 @@ pub(super) fn lua_kill(_: &Lua, handle: AnyUserData) -> mlua::Result<()> {
 /// Non-blocking: what the pipe can take is written immediately, the rest is
 /// queued and flushed by the engine once it reports `POLLOUT`; input after
 /// EOF is dropped (see `Sandbox::queue_stdin`).
-pub(super) fn lua_write_stdin(_: &Lua, (handle, data): (AnyUserData, mlua::LuaString)) -> mlua::Result<()> {
+pub(super) fn lua_write_stdin(
+    _: &Lua,
+    (handle, data): (AnyUserData, mlua::LuaString),
+) -> mlua::Result<()> {
     let h = handle.borrow::<SandboxHandle>()?;
     let bytes = data.as_bytes();
     h.0.borrow_mut().queue_stdin(&bytes).map_err(err_to_mlua)
@@ -349,11 +354,8 @@ pub(super) const CSTRING_ARGS: &[(&str, &[usize])] = &[
 /// The `sys.addr` positions for a syscall name: the `struct sockaddr *` each one
 /// takes, 0-based, mirroring [`CSTRING_ARGS`].
 ///
-pub(super) const SOCKADDR_ARGS: &[(&str, &[usize])] = &[
-    ("connect", &[1]),
-    ("bind", &[1]),
-    ("sendto", &[1]),
-];
+pub(super) const SOCKADDR_ARGS: &[(&str, &[usize])] =
+    &[("connect", &[1]), ("bind", &[1]), ("sendto", &[1])];
 
 pub(super) fn sockaddr_positions(name: &str) -> Option<&'static [usize]> {
     SOCKADDR_ARGS
@@ -400,10 +402,7 @@ pub(super) fn read_sockaddr(pid: i32, addr: u64, len: u64) -> Option<Endpoint> {
         // AF_INET: sa_data[0..2] is sin_port (big-endian), [2..6] is sin_addr.
         2 if buf.len() >= 8 => Some(Endpoint {
             family: "inet",
-            ip: Some(format!(
-                "{}.{}.{}.{}",
-                buf[4], buf[5], buf[6], buf[7]
-            )),
+            ip: Some(format!("{}.{}.{}.{}", buf[4], buf[5], buf[6], buf[7])),
             port: Some(u16::from_be_bytes([buf[2], buf[3]])),
             path: None,
         }),
@@ -454,7 +453,12 @@ pub(super) fn render_ipv6(octets: &[u8; 16], scope: u32) -> String {
     out
 }
 
-pub(super) fn endpoint_into_lua(lua: &Lua, pid: i32, ptr: u64, len: u64) -> mlua::Result<Option<Table>> {
+pub(super) fn endpoint_into_lua(
+    lua: &Lua,
+    pid: i32,
+    ptr: u64,
+    len: u64,
+) -> mlua::Result<Option<Table>> {
     let Some(e) = read_sockaddr(pid, ptr, len) else {
         return Ok(None);
     };

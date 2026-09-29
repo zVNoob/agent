@@ -14,10 +14,8 @@ use mlua::{Lua, Table};
 use crate::panels::{PaneInit, PanelOp, PanelSink, remember_label};
 
 use super::memory::{lua_memory_append, lua_memory_flush, lua_memory_latest, lua_memory_path};
-use super::run::{lua_ask_user, lua_input_op, lua_trigger, InputOp};
-use super::sandbox::{
-    lua_close_stdin, lua_decide, lua_kill, lua_spawn, lua_step, lua_write_stdin,
-};
+use super::run::{InputOp, lua_ask_user, lua_input_op, lua_trigger};
+use super::sandbox::{lua_close_stdin, lua_decide, lua_kill, lua_spawn, lua_step, lua_write_stdin};
 use super::vm::{AskHandler, SinkSlot};
 
 // ---------------------------------------------------------------------------
@@ -55,7 +53,8 @@ pub(super) fn install_api(
     // given the current round's sink (or none) between tool calls instead of
     // being built per call to get one. See `install_sink`.
     let sink_slot = Rc::new(RefCell::new(sink.cloned()));
-    lua.globals().set("__agent_sink", SinkSlot(sink_slot.clone()))?;
+    lua.globals()
+        .set("__agent_sink", SinkSlot(sink_slot.clone()))?;
     let api = lua.create_table()?;
     api.set("spawn", lua.create_function(lua_spawn)?)?;
     api.set("step", lua.create_function(lua_step)?)?;
@@ -153,9 +152,9 @@ pub(super) fn lock_table(lua: &Lua, real: Table, name: &str) -> mlua::Result<Tab
 
 pub(super) fn load_api_docs(lua: &Lua) -> mlua::Result<()> {
     let require: mlua::Function = lua.globals().get("require")?;
-    let docs: mlua::Value = require.call("api").map_err(|e| {
-        mlua::Error::RuntimeError(format!("agent.api: require(\"api\"): {e}"))
-    })?;
+    let docs: mlua::Value = require
+        .call("api")
+        .map_err(|e| mlua::Error::RuntimeError(format!("agent.api: require(\"api\"): {e}")))?;
     let agent: Table = lua.globals().get("agent")?;
     agent.set("api_docs", docs)
 }
@@ -163,9 +162,7 @@ pub(super) fn load_api_docs(lua: &Lua) -> mlua::Result<()> {
 pub(super) fn verify_api_annotations(lua: &Lua, api: &Table) -> mlua::Result<()> {
     let agent: Table = lua.globals().get("agent")?;
     let docs: Table = agent.get("api_docs").map_err(|_| {
-        mlua::Error::RuntimeError(
-            "agent.api: no api_docs — lua/api.lua did not load".to_string(),
-        )
+        mlua::Error::RuntimeError("agent.api: no api_docs — lua/api.lua did not load".to_string())
     })?;
     let mut undocumented: Vec<String> = Vec::new();
     for pair in api.pairs::<String, mlua::Value>() {

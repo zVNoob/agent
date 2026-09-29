@@ -2,6 +2,43 @@
 name = "agent"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"   # edition 2024
+license = "MIT"
+readme = "README.md"
+description = "A coding agent in your terminal: a TUI over any OpenAI-compatible endpoint, with a seccomp sandbox that asks before every file and every endpoint, and every layer above the API written in Lua."
+keywords = ["agent", "llm", "sandbox", "seccomp", "tui", "lua"]
+categories = ["command-line-utilities"]
+# `cargo install` cannot install this and is not meant to: the Lua tree ships as
+# loose files (the sandbox policy is meant to be readable), so `make install` is
+# the packaging path. `exclude` keeps a published crate from carrying the tree it
+# would not use anyway.
+exclude = ["/lua", "/scripts", "/target"]
+
+# The binaries. `agent` is the one you want; the rest are for narrower jobs and
+# are each named in the README's Development section.
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "agent_probe"
+path = "src/bin/agent_probe.rs"
+
+[[bin]]
+name = "chat"
+path = "src/bin/chat.rs"
+
+[[bin]]
+name = "grammar_probe"
+path = "src/bin/grammar_probe.rs"
+
+[[bin]]
+name = "mcp_fake"
+path = "src/bin/mcp_fake.rs"
+
+[[bin]]
+name = "sandbox"
+path = "src/bin/sandbox.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }

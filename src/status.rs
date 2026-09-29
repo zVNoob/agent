@@ -108,7 +108,10 @@ impl StatusLine {
     /// same state.
     pub fn set_if_changed(&self, text: &str, kind: StatusKind) {
         let mut s = self.0.lock().expect("status line poisoned");
-        if s.current.as_ref().is_some_and(|c| c.text == text && c.kind == kind) {
+        if s.current
+            .as_ref()
+            .is_some_and(|c| c.text == text && c.kind == kind)
+        {
             return;
         }
         s.current = Some(Status {
@@ -146,7 +149,11 @@ pub fn status_line() -> &'static StatusLine {
 /// Declare that a screen is drawing [`status_line`], so `print` routes there instead of
 /// to stdout. Idempotent, and never undone — a TUI is entered once.
 pub fn attach() {
-    status_line().0.lock().expect("status line poisoned").attached = true;
+    status_line()
+        .0
+        .lock()
+        .expect("status line poisoned")
+        .attached = true;
 }
 
 /// Whether a screen has attached (see [`attach`]).
@@ -261,7 +268,10 @@ mod tests {
         assert!(!is_attached(), "detached until a screen says otherwise");
         attach();
         assert!(is_attached());
-        assert!(status_line().attached(), "the same answer, read off the line");
+        assert!(
+            status_line().attached(),
+            "the same answer, read off the line"
+        );
         reset();
         assert!(!is_attached(), "reset takes the screen back off");
     }

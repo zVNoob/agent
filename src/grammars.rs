@@ -639,10 +639,7 @@ mod tests {
 
         // `rust` is not in the app's own list, so this is genuinely cold: not
         // fetched, not compiled, not cached anywhere this test can see.
-        let loaded = catalog
-            .ensure("rust")
-            .await
-            .expect("rust grammar acquires");
+        let loaded = catalog.ensure("rust").await.expect("rust grammar acquires");
         assert_eq!(loaded.name, "rust");
         assert!(
             loaded.highlights.is_some(),
@@ -651,7 +648,10 @@ mod tests {
 
         // It really was built here: the artefacts are on disk under the temp dir.
         let built = dir.join("rust");
-        assert!(built.join("parser.so").is_file(), "a shared object was built");
+        assert!(
+            built.join("parser.so").is_file(),
+            "a shared object was built"
+        );
         assert!(
             built.join("stamp.json").is_file(),
             "and stamped, or the next run would rebuild it"

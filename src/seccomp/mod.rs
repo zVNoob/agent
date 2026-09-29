@@ -432,7 +432,10 @@ fn table() -> &'static arch::SyscallTable {
 /// The canonical name for a syscall number on this arch, or a synthetic
 /// `syscall_<n>` for numbers the table does not name.
 pub fn syscall_name(nr: i32) -> String {
-    table().name_of(nr).map(str::to_string).unwrap_or_else(|| format!("syscall_{nr}"))
+    table()
+        .name_of(nr)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("syscall_{nr}"))
 }
 
 /// Resolve a syscall *name* (as used for policy-table keys, e.g. `"openat"`)
@@ -889,9 +892,7 @@ impl Sandbox {
                 // — see `LIVE_RUN`.
                 let flag = Arc::new(AtomicBool::new(false));
                 if let Ok(mut slot) = LIVE_RUN.lock() {
-                    *slot = Some(InterruptHandle {
-                        flag: flag.clone(),
-                    });
+                    *slot = Some(InterruptHandle { flag: flag.clone() });
                 }
                 flag
             },
@@ -2416,7 +2417,9 @@ mod tests {
         let handle = sandbox.interrupt_handle();
         let started = std::time::Instant::now();
         handle.interrupt();
-        let r = sandbox.pump(|_| Verdict::Allow, |_| {}).expect("the run succeeded");
+        let r = sandbox
+            .pump(|_| Verdict::Allow, |_| {})
+            .expect("the run succeeded");
         assert!(r.interrupted, "the result says it was interrupted");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(20),
@@ -2431,13 +2434,18 @@ mod tests {
     /// showed up as fifteen unrelated tests failing at once.
     #[test]
     fn a_request_reaches_only_the_run_whose_handle_it_came_from() {
-        let mut mine =
-            Sandbox::spawn("sh", &["-c", "sleep 30"], |_| Verdict::Allow, &[1]).unwrap();
-        let theirs =
-            Sandbox::spawn("sh", &["-c", "echo fine; sleep 30"], |_| Verdict::Allow, &[1])
-                .unwrap();
+        let mut mine = Sandbox::spawn("sh", &["-c", "sleep 30"], |_| Verdict::Allow, &[1]).unwrap();
+        let theirs = Sandbox::spawn(
+            "sh",
+            &["-c", "echo fine; sleep 30"],
+            |_| Verdict::Allow,
+            &[1],
+        )
+        .unwrap();
         mine.interrupt_handle().interrupt();
-        let stopped = mine.pump(|_| Verdict::Allow, |_| {}).expect("the run succeeded");
+        let stopped = mine
+            .pump(|_| Verdict::Allow, |_| {})
+            .expect("the run succeeded");
         assert!(stopped.interrupted, "the addressed run stopped");
         // The other one is untouched: the driver has not even been called, so
         // nothing has asked it to do anything.
@@ -2459,8 +2467,7 @@ mod tests {
     /// agent is running".
     #[test]
     fn a_later_run_cannot_see_an_earlier_runs_request() {
-        let earlier =
-            Sandbox::spawn("sh", &["-c", "sleep 30"], |_| Verdict::Allow, &[1]).unwrap();
+        let earlier = Sandbox::spawn("sh", &["-c", "sleep 30"], |_| Verdict::Allow, &[1]).unwrap();
         earlier.interrupt_handle().interrupt();
         // A run that begins after that request, with a flag of its own.
         let r = run_sandboxed(&["sh", "-c", "echo alive"], &[1], |_| Verdict::Allow).unwrap();

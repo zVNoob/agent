@@ -449,7 +449,9 @@ mod tests {
         let mut seen = Vec::new();
         for event in acc_sse(r#"{"choices":[{"delta":{"reasoning_content":"think "}}]}"#)
             .into_iter()
-            .chain(acc_sse(r#"{"choices":[{"delta":{"reasoning_content":"hard"}}]}"#))
+            .chain(acc_sse(
+                r#"{"choices":[{"delta":{"reasoning_content":"hard"}}]}"#,
+            ))
         {
             if let TurnEvent::Reasoning(d) = &event {
                 seen.push(d.clone());
@@ -518,9 +520,15 @@ mod tests {
     #[test]
     fn unparseable_and_sentinel_lines_yield_nothing() {
         assert!(acc_sse("not json at all").is_empty());
-        assert!(sse_payload("data: [DONE]").is_none(), "the sentinel is not a payload");
+        assert!(
+            sse_payload("data: [DONE]").is_none(),
+            "the sentinel is not a payload"
+        );
         assert!(sse_payload("data: ").is_none(), "nor is an empty one");
-        assert!(sse_payload("event: ping").is_none(), "nor another SSE field");
+        assert!(
+            sse_payload("event: ping").is_none(),
+            "nor another SSE field"
+        );
         assert_eq!(sse_payload("data: {}"), Some("{}"));
     }
 

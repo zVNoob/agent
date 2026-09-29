@@ -540,11 +540,7 @@ impl TurnPanel {
                 Self::rehighlight_pane(&mut self.highlighter, p);
                 self.messages[idx].dirty = true;
             }
-            PanelOp::Overlay {
-                id,
-                text,
-                remember,
-            } => {
+            PanelOp::Overlay { id, text, remember } => {
                 let Some(idx) = self.ensure_panel(id) else {
                     return;
                 };
@@ -1621,7 +1617,11 @@ fn display_text(msg: &Message) -> std::borrow::Cow<'_, str> {
 /// concealing one maps the range through the conceal map first. Keeping the loop
 /// in one place is what makes "row text is byte-identical to [`wrap_lines`]"
 /// true by construction rather than by three copies agreeing.
-fn wrap_rows(text: &str, width: usize, clip: impl Fn(usize, usize) -> Vec<Span<'static>>) -> Vec<Vec<Span<'static>>> {
+fn wrap_rows(
+    text: &str,
+    width: usize,
+    clip: impl Fn(usize, usize) -> Vec<Span<'static>>,
+) -> Vec<Vec<Span<'static>>> {
     if width == 0 {
         return vec![vec![]];
     }
@@ -1644,7 +1644,10 @@ fn wrap_rows(text: &str, width: usize, clip: impl Fn(usize, usize) -> Vec<Span<'
         let mut rest = 0;
         while rest < para_chars {
             let take = width.min(para_chars - rest);
-            rows.push(clip(byte_at[para_start + rest], byte_at[para_start + rest + take]));
+            rows.push(clip(
+                byte_at[para_start + rest],
+                byte_at[para_start + rest + take],
+            ));
             rest += take;
         }
         para_start += para_chars + 1;
@@ -1821,11 +1824,19 @@ mod tests {
             let mut at = 0;
             for (i, _) in text.char_indices() {
                 if i % 7 == 0 && i > at {
-                    segs.push(Segment { start: at, end: i, style: Style::default() });
+                    segs.push(Segment {
+                        start: at,
+                        end: i,
+                        style: Style::default(),
+                    });
                     at = i;
                 }
             }
-            segs.push(Segment { start: at, end: text.len(), style: Style::default() });
+            segs.push(Segment {
+                start: at,
+                end: text.len(),
+                style: Style::default(),
+            });
             let styled = wrap_segments(text, &segs, width);
             assert_eq!(
                 styled.len(),
@@ -2139,8 +2150,14 @@ mod tests {
         assert_eq!(panel.content_height(content_w), 5);
         assert_eq!(panel.messages[2].text, " three four");
         assert_eq!(panel.messages[2].rows, 3);
-        assert_eq!(panel.messages[0].rows, 1, "other messages are not re-wrapped");
-        assert!(!panel.messages.iter().any(|m| m.dirty), "dirty cleared by measure");
+        assert_eq!(
+            panel.messages[0].rows, 1,
+            "other messages are not re-wrapped"
+        );
+        assert!(
+            !panel.messages.iter().any(|m| m.dirty),
+            "dirty cleared by measure"
+        );
 
         // Collapsing a framed box shrinks it to title + bottom border rows.
         panel.push_boxed(Role::Assistant, "boxed body here".into(), "tool".into());
@@ -2216,7 +2233,12 @@ mod tests {
         let show = |p: &TurnPanel| {
             BorderedRenderer::lines(&p.messages, 56, true)
                 .iter()
-                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
                 .collect::<Vec<String>>()
         };
         let dialog_for = |rows: &[String], path: &str| {
@@ -2231,7 +2253,10 @@ mod tests {
             remember: Some(ALWAYS_LABEL.into()),
         });
         let rows = show(&panel);
-        assert!(dialog_for(&rows, "/etc/hostname"), "panel 1's own: {rows:?}");
+        assert!(
+            dialog_for(&rows, "/etc/hostname"),
+            "panel 1's own: {rows:?}"
+        );
         assert!(
             !dialog_for(&rows, "/etc/hosts"),
             "and not on the other panel: {rows:?}"
@@ -2257,11 +2282,12 @@ mod tests {
             !dialog_for(&rows, "/etc/hostname"),
             "the first dialog is gone: {rows:?}"
         );
-        assert!(dialog_for(&rows, "/etc/hosts"), "the second is on panel 2: {rows:?}");
+        assert!(
+            dialog_for(&rows, "/etc/hosts"),
+            "the second is on panel 2: {rows:?}"
+        );
         assert_eq!(
-            rows.iter()
-                .filter(|l| l.contains("┌─ [y]es"))
-                .count(),
+            rows.iter().filter(|l| l.contains("┌─ [y]es")).count(),
             1,
             "exactly one dialog on screen at a time: {rows:?}"
         );
@@ -2318,7 +2344,12 @@ mod tests {
         let render = |p: &TurnPanel| {
             BorderedRenderer::lines(&p.messages, content_w, true)
                 .iter()
-                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
                 .collect::<Vec<String>>()
         };
         let shown = render(&panel);
@@ -2345,8 +2376,7 @@ mod tests {
             "offered, because a path can be remembered: {:?}",
             shown[dlg_top]
         );
-        let question = shown[dlg_top + 1]
-            .contains("The process want to read /etc/hostname");
+        let question = shown[dlg_top + 1].contains("The process want to read /etc/hostname");
         assert!(
             question,
             "and the question is its body: {:?}",
@@ -2356,7 +2386,11 @@ mod tests {
         // At the bottom: after the streamed output, before the box's own border.
         let last_body = shown.len() - 2;
         assert!(
-            dialog > shown.iter().position(|l| l.contains("more output")).unwrap(),
+            dialog
+                > shown
+                    .iter()
+                    .position(|l| l.contains("more output"))
+                    .unwrap(),
             "below the output: {shown:?}"
         );
         assert!(
@@ -2395,7 +2429,10 @@ mod tests {
             !shown.iter().any(|l| l.contains("want to read")),
             "the dialog is gone: {shown:?}"
         );
-        assert!(shown.iter().any(|l| l.contains("more output")), "output kept");
+        assert!(
+            shown.iter().any(|l| l.contains("more output")),
+            "output kept"
+        );
         assert!(
             !shown.iter().any(|l| l.contains("want to read")),
             "and clearing again changes nothing"
@@ -2615,7 +2652,11 @@ mod tests {
         );
 
         // Clearing the overlay returns the box to its plain rows.
-        panel.apply_op(PanelOp::Overlay { id: 1, text: None, remember: None });
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: None,
+            remember: None,
+        });
         let m = &panel.messages[0];
         assert!(m.overlay.is_none());
         let inner = content_w.saturating_sub(4);
@@ -2919,7 +2960,10 @@ mod tests {
         fb.text = "**abcdefghij**".into();
         let off = BorderedRenderer::lines(std::slice::from_ref(&fb), 14, false);
         let on = BorderedRenderer::lines(std::slice::from_ref(&fb), 14, true);
-        assert!(on.len() < off.len(), "the concealed display text wraps less");
+        assert!(
+            on.len() < off.len(),
+            "the concealed display text wraps less"
+        );
         assert_eq!(message_rows(&fb, 14, true), on.len());
         assert_eq!(message_rows(&fb, 14, false), off.len());
 
@@ -2963,14 +3007,24 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert!(!joined[0].contains('┌'), "reasoning has no frame: {joined:?}");
-        assert!(!joined[1].contains('┌'), "response has no frame: {joined:?}");
-        assert!(joined[2].contains('┌'), "the tool box keeps its frame: {joined:?}");
+        assert!(
+            !joined[0].contains('┌'),
+            "reasoning has no frame: {joined:?}"
+        );
+        assert!(
+            !joined[1].contains('┌'),
+            "response has no frame: {joined:?}"
+        );
+        assert!(
+            joined[2].contains('┌'),
+            "the tool box keeps its frame: {joined:?}"
+        );
 
-        let all_dim = |line: &Line<'static>| line
-            .spans
-            .iter()
-            .all(|s| s.style.add_modifier.contains(Modifier::DIM));
+        let all_dim = |line: &Line<'static>| {
+            line.spans
+                .iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::DIM))
+        };
         assert!(all_dim(&lines[0]), "reasoning (tag + body) is all dimmed");
         assert!(
             !all_dim(&lines[1]),
@@ -3637,7 +3691,11 @@ mod tests {
         // answers nothing — which reads as a broken mouse rather than as a
         // narrower-than-expected target.
         assert_eq!(
-            panel.handle_click(col_of("[a]lways") + "lways this run".chars().count() - 1, row, area),
+            panel.handle_click(
+                col_of("[a]lways") + "lways this run".chars().count() - 1,
+                row,
+                area
+            ),
             Click::Answer('a'),
             "the target covers the label it drew, not just the bracketed letter"
         );
@@ -3679,5 +3737,4 @@ mod tests {
             }
         }
     }
-
 }
