@@ -22,5 +22,6 @@ pub mod memory;
 pub mod panels;
 pub mod seccomp;
 pub mod status;
+pub mod testutil;
 pub mod tools;
 pub mod tui;

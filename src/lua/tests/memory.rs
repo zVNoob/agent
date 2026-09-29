@@ -2,6 +2,7 @@
 //! path.
 use super::*;
 
+use crate::testutil::{scratch_dir, unique_path};
     #[test]
     fn memory_primitives_append_read_flush_path() {
         // One test owns the process-wide log (OnceLock), like the trigger
@@ -30,7 +31,7 @@ use super::*;
             .expect("unbound path is nil");
         assert!(path_nil, "informational path() is nil when unbound");
 
-        let dir = std::env::temp_dir().join(format!("agent-memory-{}", std::process::id()));
+        let dir = unique_path("agent-memory");
         let file = dir.join("history.amem");
         let _ = std::fs::remove_dir_all(&dir); // stale from a crashed earlier run
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -199,9 +200,7 @@ fn the_key_event_hands_back_the_action_the_handler_named() {
         fn a_write_being_decided_shows_its_content_and_the_dialog_together() {
             use crate::panels::{PanelOp, PanelSink};
 
-            let dir = std::env::temp_dir().join(format!("agent-writeframe-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let dir = scratch_dir("agent-writeframe");
             let target = dir.join("consent.rs");
             let path = target.to_string_lossy().to_string();
             let content = "fn main() {\n    let secret = 7;\n}\n";

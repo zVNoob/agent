@@ -4,6 +4,7 @@
 //! keep.
 use super::*;
 
+use crate::testutil::unique_path;
     /// The lib loader requires modules in **alphabetical** order, so a module
     /// that captures a sibling's `agent.<name>` at load time gets `nil` when the
     /// sibling sorts later. `require("<name>")` is the order-independent way:
@@ -99,7 +100,7 @@ use super::*;
 
         // The shipped policy asks about every open with a path in the question,
         // so the third answer is on offer for each of them.
-        let p = std::env::temp_dir().join(format!("ask-flag-{}.txt", std::process::id()));
+        let p = unique_path("ask-flag");
         // Seeded, so the write is an *overwrite* and therefore still a question.
         // Creating a name nothing holds is deliberately silent (see
         // `creating_a_new_name_is_not_a_question`), and `echo >` on a fresh path

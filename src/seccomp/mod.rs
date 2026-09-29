@@ -1039,60 +1039,6 @@ impl Sandbox {
         v
     }
 
-    /// Diagnostic: where each tree process is parked right now (kernel wait
-    /// channel + the syscall it is executing + blocked/pending signals, from
-    /// /proc). Read-only; never blocks on the tracees. Nothing in the agent
-    /// calls this at runtime any more — it backed the `agent.api.diag` bridge
-    /// primitive, which no Lua code used — but it is the only way to see *why*
-    /// a drive loop stopped making progress, so it stays as public API.
-    pub fn probe(&self) -> Vec<(i32, String)> {
-        let mut out = Vec::new();
-        for &pid in self.pids.iter() {
-            let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
-            let syscall =
-                std::fs::read_to_string(format!("/proc/{pid}/syscall")).unwrap_or_default();
-            let mut sigblk = String::new();
-            let mut sigpnd = String::new();
-            if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
-                for line in status.lines() {
-                    if let Some(v) = line.strip_prefix("SigBlk:") {
-                        sigblk = v.trim().to_string();
-                    } else if let Some(v) = line.strip_prefix("SigPnd:") {
-                        sigpnd = v.trim().to_string();
-                    }
-                }
-            }
-            let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-            let st = state.split_whitespace().nth(2).unwrap_or("?");
-            out.push((
-                pid,
-                format!(
-                    "state={st} wchan={} syscall={} blk={sigblk} pnd={sigpnd}",
-                    wchan.trim(),
-                    syscall.trim()
-                ),
-            ));
-        }
-        out
-    }
-
-    /// Diagnostic: one-line summary of the engine's own state (see [`Sandbox::probe`]).
-    pub fn state_desc(&self) -> String {
-        format!(
-            "tree_done={} pending={} out_eof={} err_eof={} stdin_closed={} stdin_q={} forks={} syscalls={} denied={} pids={}",
-            self.tree_done,
-            self.pending.is_some(),
-            self.out_eof,
-            self.err_eof,
-            self.stdin_closed,
-            self.input.len(),
-            self.forks,
-            self.syscalls,
-            self.denied,
-            self.pids.len()
-        )
-    }
-
     /// Thaw a frozen syscall ([`Step::Blocked`]) with the final verdict. A
     /// `Deny` kills the whole tree *before* replaying the errno (the denied
     /// thread is still parked in its notification wait, so the SIGKILL cannot

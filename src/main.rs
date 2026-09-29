@@ -1707,6 +1707,7 @@ async fn run<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    use agent::testutil::unique_path;
     use super::*;
 
     /// The `key` event end to end, from a `KeyEvent` to the action the loop will
@@ -1842,14 +1843,10 @@ mod tests {
         }
     }
 
-    /// Sequence for [`unique_log`]: distinct paths across parallel tests.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    /// A unique temp log path for one test (pid + sequence): parallel tests
-    /// never collide.
+    /// A unique temp log path for one test; parallel tests never collide,
+    /// because [`unique_path`] carries a per-process counter.
     fn unique_log(name: &str) -> std::path::PathBuf {
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::env::temp_dir().join(format!("agent-mem-{name}-{}-{seq}", std::process::id()))
+        unique_path(&format!("agent-mem-{name}"))
     }
 
     #[test]
@@ -2106,7 +2103,7 @@ mod tests {
         use agent::tui::{App, Role};
         use std::fs;
 
-        let dir = std::env::temp_dir().join(format!("agent-pump-{}", std::process::id()));
+        let dir = unique_path("agent-pump");
         let _ = fs::remove_dir_all(&dir);
 
         let mut catalog = agent::grammars::Catalog::new().with_cache_dir(&dir);

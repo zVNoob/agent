@@ -3,6 +3,7 @@
 //! name a path instead of a pointer.
 use super::*;
 
+use crate::testutil::scratch_dir;
     #[test]
     fn runtime_is_luajit_and_evaluates() {
         let lua = Lua::new();
@@ -1046,12 +1047,7 @@ use super::*;
         // A temp sandwich: base/a/x.txt real file, base/b/link.txt a symlink
         // to it. Resolution must land on the *actual* file either way.
         use std::os::unix::fs::symlink;
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let base = std::env::temp_dir().join(format!(
-            "agent-resolve-{:x}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let base = scratch_dir("agent-resolve");
         let a = base.join("a");
         let b = base.join("b");
         std::fs::create_dir_all(&a).unwrap();

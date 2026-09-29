@@ -2,6 +2,7 @@
 //! answer is remembered against, and how a refusal leaves the filesystem alone.
 use super::*;
 
+use crate::testutil::scratch_dir;
     /// Two tool calls in one round, each of which asks — can the TUI hold two
     /// questions at once?
     ///
@@ -177,9 +178,7 @@ use super::*;
     fn the_permissive_mode_asks_about_writes_connects_and_binds() {
         let lua = shipped_vm();
         prime_the_sandbox(&lua);
-        let dir = std::env::temp_dir().join(format!("agent-permissive-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-permissive");
         let target = dir.join("out.txt");
         // Seeded so the write is an overwrite. Creating a name nothing holds is
         // deliberately not a question — `creating_a_new_name_is_not_a_question`
@@ -333,9 +332,7 @@ use super::*;
     fn hand_to_user_takes_write_trust_back_so_later_writes_ask_again() {
         let lua = shipped_vm();
         prime_the_sandbox(&lua);
-        let dir = std::env::temp_dir().join(format!("agent-hand-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-hand");
         let path = dir.join("mine.txt");
         let path_s = path.to_string_lossy().to_string();
 
@@ -554,13 +551,10 @@ use super::*;
         assert!(back, "and the cwd grant applies to it again");
     }
 
-
     /// `path` should not be met with an error it has to reason about.
     #[test]
     fn hand_to_user_takes_both_a_paths_array_and_a_single_path() {
-        let dir = std::env::temp_dir().join(format!("agent-hand2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-hand2");
         let a = dir.join("a.txt");
         let b = dir.join("b.txt");
         std::fs::write(&a, "a\n").expect("seed a");
@@ -603,7 +597,6 @@ use super::*;
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 
     /// the console, a world-writable tmpfs, and the disks all stay questions.
     #[test]
@@ -668,7 +661,6 @@ use super::*;
             "a device that was only granted for reading still asks to write: {asked:?} {v}"
         );
     }
-
 
     /// and it does not get to skip a write inside a granted tree.
     #[test]
@@ -791,15 +783,12 @@ use super::*;
         );
     }
 
-
     /// silent because nothing was asked and not because nothing was refused.
     #[test]
     fn creating_a_new_name_is_not_a_question() {
         let lua = shipped_vm();
         prime_the_sandbox(&lua);
-        let dir = std::env::temp_dir().join(format!("agent-new-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-new");
         let path = dir.join("brand-new.txt");
         let path_s = path.to_string_lossy().to_string();
 
@@ -844,9 +833,7 @@ use super::*;
     fn an_overwrite_is_still_a_question() {
         let lua = shipped_vm();
         prime_the_sandbox(&lua);
-        let dir = std::env::temp_dir().join(format!("agent-over-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-over");
         let path = dir.join("existing.txt");
         std::fs::write(&path, "original\n").expect("seed");
         let path_s = path.to_string_lossy().to_string();
@@ -885,9 +872,7 @@ use super::*;
     fn a_file_the_process_cannot_read_still_counts_as_taken() {
         let lua = shipped_vm();
         prime_the_sandbox(&lua);
-        let dir = std::env::temp_dir().join(format!("agent-unread-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-unread");
         let path = dir.join("locked.txt");
         std::fs::write(&path, "secret\n").expect("seed");
 
@@ -915,7 +900,6 @@ use super::*;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     /// `chmod` asks on **write** trust, and a refused one leaves the mode alone.
     ///
     /// This was a genuine hole: the mask named files and endpoints, and a
@@ -927,9 +911,7 @@ use super::*;
         use std::os::unix::fs::PermissionsExt;
         let lua = shipped_vm();
         prime_the_sandbox(&lua);
-        let dir = std::env::temp_dir().join(format!("agent-chmod-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-chmod");
         let path = dir.join("payload");
         std::fs::write(&path, "#!/bin/sh\necho hi\n").expect("seed");
         let path_s = path.to_string_lossy().to_string();
@@ -993,9 +975,7 @@ use super::*;
     fn fchmod_is_not_gated_because_it_names_no_path() {
         let lua = shipped_vm();
         prime_the_sandbox(&lua);
-        let dir = std::env::temp_dir().join(format!("agent-fchmod-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-fchmod");
         let src = dir.join("src");
         let dst = dir.join("dst");
         std::fs::write(&src, "x\n").expect("seed");
@@ -1034,9 +1014,7 @@ use super::*;
         // this test is about.
         let (warm, _) = run_policy_bash(&lua, "python3 -c pass", AskAnswer::AllowAndTrust);
         assert_eq!(warm["ok"], true, "warmed python3: {warm}");
-        let dir = std::env::temp_dir().join(format!("agent-xattr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-xattr");
         let path = dir.join("tagged");
         std::fs::write(&path, "x\n").expect("seed");
         let path_s = path.to_string_lossy().to_string();
@@ -1103,15 +1081,12 @@ use super::*;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     /// was in the file.
     #[test]
     fn deleting_a_file_asks_on_write_trust_and_rm_goes_through_it() {
         let lua = shipped_vm();
         prime_the_sandbox(&lua);
-        let dir = std::env::temp_dir().join(format!("agent-rm-{0}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-rm");
         let path = dir.join("doomed.txt");
         std::fs::write(&path, "about to go\n").expect("seed the file to delete");
         let path = path.to_string_lossy().to_string();
@@ -1183,9 +1158,7 @@ use super::*;
     fn a_move_asks_twice_only_when_the_target_exists() {
         let lua = shipped_vm();
         prime_the_sandbox(&lua);
-        let dir = std::env::temp_dir().join(format!("agent-mv-{0}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-mv");
         let src = dir.join("from.txt");
         let dst = dir.join("to.txt");
         let src_s = src.to_string_lossy().to_string();

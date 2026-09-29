@@ -19,6 +19,7 @@ use serde_json::json;
 ///
 /// The `fs` tools ask before touching anything, so a test *has* to answer:
 /// `verdict` is what the user would press.
+use crate::testutil::unique_path;
 fn call_tool_asking(
     name: &str,
     args: &str,
@@ -167,7 +168,6 @@ const FAKE_MCP_FUNC: &str = r#"
     end
     "#;
 
-
 /// Standard fake-server handlers for `fake_mcp_func`: initialize,
 /// tools/list (tools `probe` and `sum`), and tools/call (probe text back
 /// or sum two numbers). Close to the reference `mcp_fake` server's shape,
@@ -212,7 +212,6 @@ const FAKE_MCP_HANDLERS: &str = r#"
     }
     "#;
 
-
 /// Collect pushed output chunks into tables (1-based, so the entry count
 /// is the chunk count) and stamp them onto `opts`; returns `opts, out,
 /// err`. The pump reads the callback fields off the object at drive time,
@@ -227,7 +226,6 @@ const COLLECT: &str = r#"
     end
     "#;
 
-
 /// Allow every syscall: a policy with no own keys, so the interception mask
 /// is empty and nothing is intercepted at all. (Its `__index` is never
 /// consulted for masked syscalls — the mask is the policy's own string
@@ -235,7 +233,6 @@ const COLLECT: &str = r#"
 /// explicitly assign a key, e.g. `allowall.execve = ...`.)
 const ALLOW_ALL: &str =
         r#"setmetatable({}, { __index = function() return function() return true end end })"#;
-
 
 /// A VM with the built-in configuration taken back off: no connections, no
 /// mode in force, no prompt — a neutral `agent` for the tests that need one.
@@ -259,7 +256,6 @@ fn neutral_vm() -> mlua::Lua {
     lua
 }
 
-
 /// A VM with the agent's built-in configuration — the connections and the
 /// modes, which `lua/init.lua` registers as the defaults — so the tests
 /// exercise the real Lua tools.
@@ -271,7 +267,6 @@ fn neutral_vm() -> mlua::Lua {
 fn shipped_vm() -> mlua::Lua {
     vm()
 }
-
 
 /// Drive a tool call the way the event loop does — start it on the config
 /// VM, answer whatever it asks, step it to its result — and collect the
@@ -308,7 +303,6 @@ fn drive_on_vm(
     panic!("{name} never finished");
 }
 
-
 /// One command through the permissive mode's shell, on `lua`, with the
 /// questions it asked. `answers` is what the user presses every time.
 ///
@@ -337,7 +331,6 @@ fn run_policy_bash(
     (v, questions)
 }
 
-
 /// `bash`'s own startup reads — its binary, libc, the NSS files — are asked
 /// like any other read now that every open is gated. A test that cares about
 /// one particular file would otherwise drown in a dozen library questions, and
@@ -357,7 +350,6 @@ fn prime_the_sandbox(lua: &mlua::Lua) {
     }
 }
 
-
 /// Did any of the questions name `needle`? A command's own reads are not the
 /// only ones: `bash` also opens locale and NSS data, and it does some of
 /// that lazily — an error message is what triggers the locale load — so a
@@ -365,7 +357,6 @@ fn prime_the_sandbox(lua: &mlua::Lua) {
 fn asked_about(asked: &[String], needle: &str) -> bool {
     asked.iter().any(|q| q.contains(needle))
 }
-
 
 /// An ask handler that says yes to everything. The default policy asks about
 /// every open and every endpoint, so a test that is about the *tool* — its
@@ -376,7 +367,6 @@ fn allow_all() -> Option<AskHandler> {
     Some(Rc::new(|_: &str, _: bool| AskAnswer::Allow))
 }
 
-
 /// Call the shipped `bash` tool the way the TUI does: on the shipped
 /// config VM, with the round's panel sink and the call's ask handler.
 /// Returns the tool's JSON body.
@@ -386,7 +376,6 @@ fn call_bash(args: &str, sink: &PanelSink, on_ask: Option<AskHandler>) -> serde_
         .expect("the shipped config registers agent.mcps.bash");
     serde_json::from_str(&body).expect("tool json")
 }
-
 
 /// A tool already suspended on `first`, answering whatever it asks, driven
 /// to its return. Every ask is allowed, so this is the "press yes to
@@ -416,7 +405,6 @@ fn drive_to_end(run: &mut ToolRun<'_>, first: ToolStep) -> String {
     }
     panic!("the tool never finished after {asks} asks and {waits} waits");
 }
-
 
 /// A shell run whose handler answers `deny` to questions mentioning
 /// `marker` and `allow` to everything else.
@@ -452,7 +440,6 @@ fn run_policy_bash_except(
     (v, asked.borrow().clone())
 }
 
-
 /// The shell the tests below drive *is* the shipped one: `lua/policy.lua` is
 /// the default sandbox policy, so `require("bash_tool")` already runs under
 /// the four gates and there is nothing to install. Asserted here so a change
@@ -478,7 +465,6 @@ fn assert_default_shell(lua: &mlua::Lua) {
         .expect("mask");
     assert_eq!(gates, MASK, "the default policy's mask is exactly this set");
 }
-
 
 /// The mask is the whole policy: these thirteen syscalls are the ones the
 /// shipped policy decides, and nothing else. A policy that named fewer would silently
@@ -518,14 +504,12 @@ fn drawn(sink: &crate::panels::PanelSink) -> String {
         .collect()
 }
 
-
 /// Read `agent.mode.current()`.
 fn mode_current(lua: &mlua::Lua) -> Option<String> {
     lua.load("return agent.mode.current()")
         .eval()
         .expect("current mode")
 }
-
 
 /// A registered mode's system prompt.
 fn mode_prompt(lua: &mlua::Lua, name: &str) -> String {
@@ -534,17 +518,11 @@ fn mode_prompt(lua: &mlua::Lua, name: &str) -> String {
         .expect("mode prompt")
 }
 
-
-/// A unique temp dir for a fixture tree: `<name>-<pid>-<n>`.
+/// A unique temp dir for a fixture tree — the tests that build a `lua/` tree on
+/// disk, so they all share one naming convention and never collide.
 fn fixture(name: &str) -> PathBuf {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    std::env::temp_dir().join(format!(
-        "agent-lua-{name}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ))
+    unique_path(&format!("agent-lua-{name}"))
 }
-
 
 /// The shipped policy's mask, spelled out. A policy that named fewer would
 /// silently let a connect — or an `rm`, or a `chmod` — through, so the set is
@@ -568,7 +546,6 @@ fn drive_event_to_completion(mut run: EventRun, mut step: EventStep) -> (EventRu
     }
 }
 
-
 /// Read a table the handler stamped onto the event VM's `agent` global.
 fn event_agent_field(run: &EventRun, key: &str) -> mlua::Table {
     run.lua()
@@ -588,8 +565,6 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, Table};
-
-
 
 use crate::memory::Memory;
 use crate::panels::{PaneInit, PanelOp, PanelSink};

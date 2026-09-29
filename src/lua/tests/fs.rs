@@ -2,6 +2,7 @@
 //! or write asking about the path it resolved.
 use super::*;
 
+use crate::testutil::{scratch_dir, unique_path};
     /// than reading it off `agent`) keeps this usable on a bare VM.
     fn patch_apply(lua: &mlua::Lua, old: &str, diff: &str) -> serde_json::Value {
         lua.globals().set("PATCH_OLD", old).expect("set PATCH_OLD");
@@ -151,7 +152,7 @@ use super::*;
     /// at all.
     #[test]
     fn write_file_asks_before_it_writes() {
-        let dir = std::env::temp_dir().join(format!("agent-write-file-test-{}", std::process::id()));
+        let dir = unique_path("agent-write-file-test");
         let _ = std::fs::remove_dir_all(&dir);
         let target = dir.join("nested/deep/hello.txt");
         let args = |content: &str| {
@@ -215,9 +216,7 @@ use super::*;
     /// make one of them a clean error instead.
     #[test]
     fn the_read_tools_ask_and_return_the_file_directly() {
-        let dir = std::env::temp_dir().join(format!("agent-fs-tools-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-fs-tools-test");
         let target = dir.join("notes.txt");
         std::fs::write(&target, "alpha\nbeta\n").expect("seed");
         let path = target.to_string_lossy().to_string();
@@ -283,7 +282,7 @@ use super::*;
         end
         return p
         "#;
-        let path = std::env::temp_dir().join(format!("ask-lib-{}", std::process::id()));
+        let path = unique_path("ask-lib");
         let _ = std::fs::remove_file(&path);
         let cmdline = format!("echo asked > {}", path.display());
 
@@ -378,7 +377,7 @@ use super::*;
         end
         return p
         "#;
-        let path = std::env::temp_dir().join(format!("ask-noreason-{}", std::process::id()));
+        let path = unique_path("ask-noreason");
         let _ = std::fs::remove_file(&path);
         // Headless: no ask handler, so `agent.api.ask_user` answers `false`.
         let out = run_bash(&format!("echo x > {}", path.display()), POLICY, None, None)
@@ -410,7 +409,7 @@ use super::*;
     #[test]
     fn apply_patch_tool_edits_a_file_and_reports_changes() {
         let dir =
-            std::env::temp_dir().join(format!("agent-apply-patch-test-{}", std::process::id()));
+            unique_path("agent-apply-patch-test");
         let _ = std::fs::remove_dir_all(&dir);
         let target = dir.join("script.txt");
         std::fs::create_dir_all(&dir).expect("make scratch dir");

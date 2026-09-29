@@ -4,6 +4,7 @@
 //! model gets back.
 use super::*;
 
+use crate::testutil::scratch_dir;
     /// The compact spec is a *table*, not a side effect: requiring it registers
     /// nothing, so `agent.mode.new("compact", require("compact"))` is the whole
     /// setup and a spec can be inspected, copied, or composed before it is
@@ -351,9 +352,7 @@ use super::*;
     /// cannot see which file.
     #[test]
     fn the_file_tools_ask_about_the_resolved_path() {
-        let dir = std::env::temp_dir().join(format!("agent-fs-ask-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-fs-ask");
         let target = dir.join("notes.txt");
         std::fs::write(&target, "x\n").expect("seed");
         let path = target.to_string_lossy().to_string();
@@ -369,12 +368,12 @@ use super::*;
         // a `..` — because the working directory is trusted by `lua/init.lua`, and
         // a relative path would resolve inside it and never be asked about at all.
         // (Which is the grant working, not a gap in it.)
-        let untidy = format!(
-            "{}/./agent-fs-ask-{}/../agent-fs-ask-{}/notes.txt",
-            std::env::temp_dir().display(),
-            std::process::id(),
-            std::process::id()
-        );
+        //
+        // Built from the real `dir`, so the detour still lands on the file the
+        // fixture wrote — a hand-spelled path naming the pid would break the
+        // moment `unique_path`'s counter made the two names differ.
+        let untidy = format!("{}/./x/../notes.txt", dir.display());
+        std::fs::create_dir_all(dir.join("x")).expect("the segment the path detours through");
         let (v, asked) =
             tool_allowed("fs.read", &serde_json::json!({ "path": &untidy }).to_string());
         assert_eq!(v["ok"], true, "{v}");
@@ -405,9 +404,7 @@ use super::*;
     /// duplication the per-call result boxes were removed for.
     #[test]
     fn read_names_the_path_and_withholds_the_content() {
-        let dir = std::env::temp_dir().join(format!("agent-fs-read-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-fs-read");
         let target = dir.join("secret.txt");
         // Distinctive enough that finding it in a panel op would be unambiguous.
         std::fs::write(&target, "CANARY-LINE-ONE\nCANARY-LINE-TWO\n").expect("seed");
@@ -470,12 +467,12 @@ use super::*;
         // A path that is not the one it means: both are shown, because a panel
         // naming only the resolved one would leave the model looking at a file
         // it never wrote, and the *question* already names the other.
-        let untidy = format!(
-            "{}/./agent-fs-read-{}/../agent-fs-read-{}/secret.txt",
-            std::env::temp_dir().display(),
-            std::process::id(),
-            std::process::id()
-        );
+        //
+        // Built from the real `dir`, so the detour still lands on the file the
+        // fixture wrote — a hand-spelled path naming the pid would break the
+        // moment the counter made two paths differ.
+        let untidy = format!("{}/./x/../secret.txt", dir.display());
+        std::fs::create_dir_all(dir.join("x")).expect("the segment the path detours through");
         let usink = PanelSink::default();
         invoke_mcp_tool_with_asks(
             "fs.read",
@@ -524,9 +521,7 @@ use super::*;
     /// so what landed on disk is the thing being checked.
     #[test]
     fn write_file_shows_the_content_with_its_language_declared() {
-        let dir = std::env::temp_dir().join(format!("agent-fs-write-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-fs-write");
         let target = dir.join("shown.rs");
         let path = target.to_string_lossy().to_string();
         // Something the grammar will actually recognise, so "highlighted" is a
@@ -607,9 +602,7 @@ use super::*;
     /// nobody could see, with the input hint still reading "Enter sends".
     #[test]
     fn a_file_tools_question_is_a_dialog_on_its_own_panel() {
-        let dir = std::env::temp_dir().join(format!("agent-fs-askpanel-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-fs-askpanel");
 
         // The panel ids each tool opened, and the overlays asked on them.
         let overlays = |sink: &PanelSink| -> Vec<(u64, Option<String>, bool)> {
@@ -707,9 +700,7 @@ use super::*;
     /// the line counts, which need the very read the ask is gating.
     #[test]
     fn a_split_panel_can_host_the_question_too() {
-        let dir = std::env::temp_dir().join(format!("agent-fs-patchask-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-fs-patchask");
         let target = dir.join("patched.txt");
         std::fs::write(&target, "one\ntwo\n").expect("seed");
         let path = target.to_string_lossy().to_string();
@@ -771,9 +762,7 @@ use super::*;
     /// over.
     #[test]
     fn a_one_line_file_is_captioned_in_the_singular() {
-        let dir = std::env::temp_dir().join(format!("agent-fs-cap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-fs-cap");
         let target = dir.join("one.txt");
         let path = target.to_string_lossy().to_string();
 
@@ -809,9 +798,7 @@ use super::*;
     /// what the agent was trying to put there.
     #[test]
     fn a_refused_write_says_so_beside_the_content_it_would_have_written() {
-        let dir = std::env::temp_dir().join(format!("agent-fs-wdeny-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-fs-wdeny");
         let target = dir.join("refused.rs");
         let path = target.to_string_lossy().to_string();
         let content = "fn denied() -> bool { true }\n";
@@ -853,9 +840,7 @@ use super::*;
     /// said nothing would be the one shape worse than silence.
     #[test]
     fn a_refused_read_says_so_in_its_own_panel() {
-        let dir = std::env::temp_dir().join(format!("agent-fs-deny-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-fs-deny");
         let target = dir.join("denied.txt");
         std::fs::write(&target, "x\n").expect("seed");
         let path = target.to_string_lossy().to_string();
@@ -900,9 +885,7 @@ use super::*;
     /// the VM is seeded from.
     #[test]
     fn a_file_operation_offers_always_and_asks_every_time() {
-        let dir = std::env::temp_dir().join(format!("agent-fs-always-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-fs-always");
         let args = |name: &str| {
             serde_json::json!({
                 "path": dir.join(name).to_string_lossy(),

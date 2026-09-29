@@ -2,6 +2,7 @@
 //! lock, the auto-required `lib/*` modules, and the LuaJIT runtime underneath.
 use super::*;
 
+use crate::testutil::unique_path;
     /// `print` goes to the status bar once a screen is attached, and to stdout
     /// when there is not one — because a TUI owns the terminal, and because a
     /// headless run still has to be debuggable.
@@ -524,7 +525,7 @@ use super::*;
         end
         return p
         "#;
-        let path = std::env::temp_dir().join(format!("ask-trust-{}.txt", std::process::id()));
+        let path = unique_path("ask-trust");
         let _ = std::fs::remove_file(&path);
         // The same file, opened twice: two questions if nothing is remembered.
         let cmdline = format!("echo one > {0}; echo two > {0}", path.display());
@@ -595,7 +596,7 @@ use super::*;
         end
         return p
         "#;
-        let path = std::env::temp_dir().join(format!("ask-trust-w-{}.txt", std::process::id()));
+        let path = unique_path("ask-trust-w");
 
         // A plain yes: both opens are allowed, and neither is remembered, so the
         // second open asks again.

@@ -2,6 +2,7 @@
 //! answer as a step.
 use super::*;
 
+use crate::testutil::scratch_dir;
     /// A tool call runs on the agent's own VM, so what it decides *persists*:
     /// a path trusted with `[a]lways` is not asked about again on the next call.
     /// That is the whole point of running tools on the config VM rather than a
@@ -10,9 +11,7 @@ use super::*;
     #[test]
     fn a_tool_calls_trust_outlives_the_call_that_granted_it() {
         let lua = shipped_vm();
-        let dir = std::env::temp_dir().join(format!("agent-toolrun-trust-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-toolrun-trust");
         let args = |name: &str| {
             serde_json::json!({
                 "path": dir.join(name).to_string_lossy(),
@@ -74,9 +73,7 @@ use super::*;
     #[test]
     fn a_tool_question_is_a_step_the_driver_answers() {
         let lua = shipped_vm();
-        let dir = std::env::temp_dir().join(format!("agent-toolrun-ask-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = scratch_dir("agent-toolrun-ask");
         let target = dir.join("notes.txt");
         let args = serde_json::json!({ "path": target.to_string_lossy() }).to_string();
 

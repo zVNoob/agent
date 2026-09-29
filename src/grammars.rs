@@ -55,7 +55,6 @@ const GH_API: &str = "https://api.github.com";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryEntry {
     pub name: String,
-    pub filetypes: Vec<String>,
     pub parser_url: String,
     /// Subdirectory within a monorepo holding this parser (e.g. the
     /// `tree-sitter-markdown` repo's two grammars); `None` for single-parser
@@ -110,19 +109,10 @@ pub fn parse_registry(text: &str) -> Result<HashMap<String, RegistryEntry>> {
             .as_str()
             .or(src["url"].as_str())
             .unwrap_or_default();
-        let filetypes = e["filetypes"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|f| f.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
         out.insert(
             name.clone(),
             RegistryEntry {
                 name: name.clone(),
-                filetypes,
                 parser_url: parser_url.to_string(),
                 parser_location: src["parser_location"].as_str().map(str::to_string),
                 queries_url: queries_url.to_string(),
@@ -198,8 +188,6 @@ pub struct LoadedGrammar {
     pub abi: usize,
     pub highlights: Option<String>,
     pub injections: Option<String>,
-    #[allow(dead_code)] // provenance, kept for debugging
-    pub source: PathBuf,
     _lib: Library,
 }
 
@@ -229,7 +217,6 @@ fn load_so(path: &Path, symbol: &str) -> Result<LoadedGrammar> {
         abi,
         highlights: None,
         injections: None,
-        source: path.to_path_buf(),
         _lib: lib,
     })
 }
@@ -619,6 +606,7 @@ fn read_opt(p: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::unique_path;
     /// A grammar this module has never heard of, acquired the way the app does
     /// it: registry lookup, release resolution, tarball, `cc`, dlopen.
     ///
@@ -637,7 +625,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs the network and a C compiler; run with --ignored"]
     async fn an_unseen_grammar_is_fetched_compiled_and_loaded() {
-        let dir = std::env::temp_dir().join(format!("agent-grammar-fetch-{}", std::process::id()));
+        let dir = unique_path("agent-grammar-fetch");
         let _ = fs::remove_dir_all(&dir);
 
         // `with_progress` takes an `Fn`, so the log needs interior mutability —
@@ -732,7 +720,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a compiled grammar; borrows the app's cache, so run with --ignored"]
     async fn a_hand_dropped_shared_object_is_loaded_and_stamped() {
-        let dir = std::env::temp_dir().join(format!("agent-grammar-drop-{}", std::process::id()));
+        let dir = unique_path("agent-grammar-drop");
         let _ = fs::remove_dir_all(&dir);
         // The language has to match the symbol inside the `.so`: `ensure` looks
         // up `tree_sitter_<lang>` and, if that entrypoint is not there, treats the
@@ -823,7 +811,6 @@ mod tests {
         let reg = parse_registry(text).unwrap();
         assert_eq!(reg.len(), 2);
         let bash = &reg["bash"];
-        assert_eq!(bash.filetypes, vec!["bash"]);
         assert_eq!(bash.parser_location, None);
         assert_eq!(bash.symbol(), "tree_sitter_bash");
         let md = &reg["markdown_inline"];
@@ -877,7 +864,7 @@ mod tests {
                 b"#pragma once",
             ),
         ]);
-        let dest = std::env::temp_dir().join(format!("ts-test-single-{}", std::process::id()));
+        let dest = unique_path("ts-test-single");
         let _ = fs::remove_dir_all(&dest);
         extract_src(&single, &dest, None).unwrap();
         assert!(dest.join("src/parser.c").is_file());
@@ -897,7 +884,7 @@ mod tests {
             ),
             ("tree-sitter-markdown-0.5.3/README.md", b"readme"),
         ]);
-        let dest = std::env::temp_dir().join(format!("ts-test-mono-{}", std::process::id()));
+        let dest = unique_path("ts-test-mono");
         let _ = fs::remove_dir_all(&dest);
         extract_src(&mono, &dest, Some("tree-sitter-markdown-inline")).unwrap();
         assert_eq!(
@@ -916,7 +903,7 @@ mod tests {
 
     #[test]
     fn stamp_roundtrips() {
-        let dir = std::env::temp_dir().join(format!("ts-stamp-{}", std::process::id()));
+        let dir = unique_path("ts-stamp");
         let _ = fs::create_dir_all(&dir);
         let st = Stamp {
             name: "json".into(),

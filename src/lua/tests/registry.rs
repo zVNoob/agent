@@ -2,6 +2,7 @@
 //! request's tool catalog, and that a mode can narrow it.
 use super::*;
 
+use crate::testutil::unique_path;
     /// The LuaLS annotation file (`lua/agent_api.meta.lua`) claims a type for
     /// every primitive in the bridge, and a claim like that is only worth
     /// anything if it stays true — an unannotated primitive is exactly what the
@@ -261,7 +262,7 @@ use super::*;
     #[test]
     fn a_mode_narrows_the_tool_set() {
         let lua = shipped_vm();
-        let dir = std::env::temp_dir().join(format!("agent-mode-fs-{}", std::process::id()));
+        let dir = unique_path("agent-mode-fs");
         let _ = std::fs::remove_dir_all(&dir);
         // `None` = the mode does not offer the tool at all. A tool the mode
         // *does* offer still has to be answered: the file tools ask before they

@@ -21,8 +21,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use serde_json::Value;
-
 /// One panel operation emitted by Lua and applied by the TUI transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PanelOp {
@@ -42,12 +40,6 @@ pub enum PanelOp {
     Append { id: u64, text: String },
     /// Replace the panel's whole content, re-highlighting it.
     Set { id: u64, text: String },
-    /// Declare the panel's content language (e.g. `"json"`): the highlighter
-    /// runs that grammar *directly* on the text instead of the markdown
-    /// pipeline, so the body renders syntax-highlighted without a ```lang
-    /// fence. `None` reverts to the markdown pipeline. Applied on the next
-    /// materialization or text change.
-    SetLang { id: u64, lang: Option<String> },
     /// Add a styled byte region to the panel's content (merged with the
     /// markdown segments; clamped to the current text length).
     Highlight {
@@ -195,35 +187,6 @@ impl PanelSink {
     }
 }
 
-/// Render `value` as a boxed transcript panel whose body is the pretty-printed
-/// JSON *declared* as `"json"`: the panel's [`PanelOp::SetLang`] tells the
-/// highlighter to run the runtime-loaded `json` grammar directly on the text,
-/// which themes it with the shared capture table (`property` keys cyan,
-/// `string` green, `number` yellow, `boolean` red, `constant.builtin`
-/// magenta, punctuation gray) — real tree-sitter syntax highlighting with no
-/// tokenizer of our own and no ```lang fence to parse or conceal.
-///
-/// This is a *general* JSON-panel helper on the Rust side of the panel API
-/// (the Lua side is `agent.panel`): pick any `Value`, hand it a title, and a
-/// boxed, syntax-highlighted JSON panel appears. It is not wired to any
-/// specific tool — it exists as the documented showcase of the
-/// `SetLang`/direct-highlight path, kept honest by the tests below.
-pub fn emit_json_panel(sink: &PanelSink, title: &str, value: &Value) {
-    let text = serde_json::to_string_pretty(value).expect("json panel value serializes");
-    let id = sink.alloc_id();
-    sink.push(PanelOp::Create {
-        id,
-        title: title.to_string(),
-        boxed: true,
-        conceal_box: false,
-    });
-    sink.push(PanelOp::Set { id, text });
-    sink.push(PanelOp::SetLang {
-        id,
-        lang: Some("json".to_string()),
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,166 +274,6 @@ mod tests {
             4,
             "the allocator lives in the shared state"
         );
-    }
-
-    #[test]
-    fn emit_json_panel_declares_the_json_language() {
-        let sink = PanelSink::default();
-        emit_json_panel(
-            &sink,
-            "json result",
-            &serde_json::json!({ "ok": true, "n": 42 }),
-        );
-        let ops = sink.ops();
-        // No hand-rolled tokenizer and no ```json fence: the panel *declares*
-        // its language and the highlighter runs the json grammar directly.
-        assert_eq!(ops.len(), 3, "Create + Set + SetLang, got {ops:?}");
-        assert_eq!(
-            ops[0],
-            PanelOp::Create {
-                id: 1,
-                title: "json result".into(),
-                boxed: true,
-                conceal_box: false
-            }
-        );
-        let PanelOp::Set { id, text } = &ops[1] else {
-            panic!("expected Set, got {:?}", ops[1]);
-        };
-        assert_eq!(*id, 1);
-        assert_eq!(
-            text, "{\n  \"n\": 42,\n  \"ok\": true\n}",
-            "the body is the bare pretty json (serde_json sorts keys)"
-        );
-        let PanelOp::SetLang { id, lang } = &ops[2] else {
-            panic!("expected SetLang, got {:?}", ops[2]);
-        };
-        assert_eq!(*id, 1);
-        assert_eq!(lang.as_deref(), Some("json"));
-    }
-
-    #[test]
-    fn json_panel_highlights_via_the_declared_language() {
-        let Some(CachedHl { _catalog, hl }) = cached_highlighter() else {
-            eprintln!("skipping: markdown/json grammars not cached on this machine");
-            return;
-        };
-        let mut panel = TurnPanel::default();
-        panel.set_highlighter(Some(hl));
-        let sink = PanelSink::default();
-        emit_json_panel(
-            &sink,
-            "json result",
-            &serde_json::json!({
-                "stdout": "from sandbox\n",
-                "exit_code": 0,
-                "denied": 0,
-                "ok": true,
-            }),
-        );
-        for op in sink.drain() {
-            panel.apply_op(op);
-        }
-
-        let msg = &panel.messages[0];
-        assert_eq!(msg.boxed.as_deref(), Some("json result"));
-        assert_eq!(
-            msg.lang.as_deref(),
-            Some("json"),
-            "language declared on the message"
-        );
-        assert!(
-            msg.conceal.is_empty(),
-            "direct json highlight conceals nothing"
-        );
-        let text = &msg.text;
-        assert!(!text.contains("```"), "no fence in the panel body");
-        let segs = &msg.segs;
-        assert!(
-            segs.windows(2).all(|w| w[0].start <= w[1].start),
-            "tree-sitter segments are ordered, got {segs:?}"
-        );
-
-        // The loaded `json` grammar's theme (via the shared capture table):
-        // object keys -> property (cyan), string values -> string (green),
-        // numbers -> number (yellow), booleans -> boolean (red). Direct
-        // grammar runs give *exact* boundaries — no fence, no injection
-        // offsets — so every segment is matchable byte-for-byte.
-        let key = text
-            .find("\"exit_code\"")
-            .expect("key present in panel text");
-        let value = text
-            .find("\"from sandbox\\n\"")
-            .expect("stdout value present");
-        let denied = text.find("\"denied\": 0").expect("denied field") + "\"denied\": ".len();
-        let t = text.find("\"ok\": true").expect("ok field") + "\"ok\": ".len();
-        assert!(
-            segs.iter().any(|s| s.start == key
-                && &text[s.start..s.end] == "\"exit_code\""
-                && s.style.fg == Some(Color::LightCyan)),
-            "object key must be property/cyan; segments: {segs:?}"
-        );
-        assert!(
-            segs.iter().any(|s| s.start == value
-                && &text[s.start..s.end] == "\"from sandbox\\n\""
-                && s.style.fg == Some(Color::LightGreen)),
-            "string value must be string/green; segments: {segs:?}"
-        );
-        assert!(
-            segs.iter().any(|s| s.start == denied
-                && &text[s.start..s.end] == "0"
-                && s.style.fg == Some(Color::LightYellow)),
-            "number must be number/yellow; segments: {segs:?}"
-        );
-        assert!(
-            segs.iter().any(|s| s.start == t
-                && &text[s.start..s.end] == "true"
-                && s.style.fg == Some(Color::LightRed)),
-            "boolean must be boolean/red; segments: {segs:?}"
-        );
-    }
-
-    #[test]
-    fn demo_rendered_bash_json_panel() {
-        // `cargo test --lib demo_rendered_bash_json_panel -- --nocapture`
-        let Some(CachedHl { _catalog, hl }) = cached_highlighter() else {
-            eprintln!("(demo skipped: grammars not cached)");
-            return;
-        };
-        let mut panel = TurnPanel::default();
-        panel.set_highlighter(Some(hl));
-        let sink = PanelSink::default();
-        emit_json_panel(
-            &sink,
-            "json result",
-            &serde_json::json!({
-                "stdout": "from sandbox\n",
-                "stderr": "",
-                "exit_code": 0,
-                "exit_signal": null,
-                "syscalls": 190,
-                "denied": 0,
-            }),
-        );
-        for op in sink.drain() {
-            panel.apply_op(op);
-        }
-        let msg = &panel.messages[0];
-        println!(
-            "\n--- json result panel (boxed={:?}, conceal_box={}, lang={:?}) ---",
-            msg.boxed, msg.conceal_box, msg.lang
-        );
-        println!("{}", msg.text);
-        println!("--- tree-sitter segments ---");
-        for sg in &msg.segs {
-            println!(
-                "  [{:3}..{:3}] {:<40} fg={:?}",
-                sg.start,
-                sg.end,
-                msg.text[sg.start..sg.end].replace('\n', "\\n"),
-                sg.style.fg,
-            );
-        }
     }
 
     #[test]

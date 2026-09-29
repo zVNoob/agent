@@ -418,14 +418,6 @@ impl TurnPanel {
                 msg.text = text;
                 Self::rehighlight(&mut self.highlighter, msg);
             }
-            PanelOp::SetLang { id, lang } => {
-                let Some(idx) = self.ensure_panel(id) else {
-                    return;
-                };
-                let msg = &mut self.messages[idx];
-                msg.lang = lang;
-                Self::rehighlight(&mut self.highlighter, msg);
-            }
             PanelOp::Highlight {
                 id,
                 start,

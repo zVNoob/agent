@@ -786,6 +786,7 @@ fn cursor_position(text: &str, width: usize, index: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::unique_path;
     use super::*;
     use crate::lua::InputOp;
     use crate::panels::PanelOp;
@@ -1320,7 +1321,7 @@ mod tests {
         use crate::grammars::Catalog;
         use std::fs;
 
-        let dir = std::env::temp_dir().join(format!("agent-hot-{}", std::process::id()));
+        let dir = unique_path("agent-hot");
         let _ = fs::remove_dir_all(&dir);
 
         // A catalog with the app's own four, and deliberately *not* rust.

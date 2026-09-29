@@ -244,11 +244,6 @@ impl Memory {
         Ok(())
     }
 
-    /// Messages appended since open (session-local; not persisted).
-    pub fn appended(&self) -> u64 {
-        self.seq
-    }
-
     /// The on-disk location of this log.
     pub fn path(&self) -> &Path {
         &self.path
@@ -439,18 +434,12 @@ fn gzip_decompress(bytes: &[u8]) -> io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::testutil::unique_path;
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
-    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
     fn temp_path(tag: &str) -> PathBuf {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "agent-memory-test-{tag}-{}-{id}",
-            std::process::id()
-        ))
+        unique_path(&format!("agent-memory-test-{tag}"))
     }
 
     fn msg(i: u64) -> String {
@@ -686,7 +675,10 @@ mod tests {
         let mut m = Memory::open(&p).expect("open");
         let e = m.append("{not json").expect_err("append must reject");
         assert!(e.to_string().contains("not valid JSON"));
-        assert_eq!(m.appended(), 0);
+        // The counter is unchanged, so the rejected message took no sequence
+        // number: the log's `seq` values stay contiguous.
+        let ok = m.append(r#"{"role":"user","content":"next"}"#).expect("the next append");
+        assert_eq!(ok, 1, "so the rejected one did not consume number 1");
         m.close().expect("close");
         std::fs::remove_file(&p).ok();
     }
@@ -695,8 +687,8 @@ mod tests {
     fn fresh_and_empty_logs_behave() {
         let p = temp_path("empty");
         {
-            let m = Memory::open(&p).expect("open");
-            assert_eq!(m.appended(), 0);
+            let mut m = Memory::open(&p).expect("open");
+            assert!(m.latest(5).unwrap().is_empty(), "a fresh log is empty");
         }
         assert_eq!(std::fs::metadata(&p).unwrap().len(), HEADER_LEN);
         assert!(read_tail(&p, 5).unwrap().is_empty());

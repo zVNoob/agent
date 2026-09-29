@@ -3,6 +3,7 @@
 //! promise that the test suite never reads the real home directory.
 use super::*;
 
+use crate::testutil::{scratch_dir, unique_path};
     /// A user-style config (loaded via [`apply_config_source`], which is what
     /// the real file loader runs): tools are whatever the user writes,
     /// registered into `agent.mcps` directly — there is no mode layer, only
@@ -215,9 +216,7 @@ use super::*;
 
     #[test]
     fn the_users_config_is_seeded_from_the_shipped_one_and_then_belongs_to_them() {
-        let home = std::env::temp_dir().join(format!("agent-seed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).expect("fake home");
+        let home = scratch_dir("agent-seed");
         let cfg = home.join(".config").join("agent").join("init.lua");
 
         // First run: no file, so the shipped one is copied there and that is the
@@ -311,9 +310,7 @@ use super::*;
         // A path whose parent is a *file*, so creating the directory under it
         // cannot work — no permission fiddling, and it fails the same way on
         // every platform and whether or not the suite runs as root.
-        let blocker = std::env::temp_dir().join(format!("agent-blocked-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&blocker);
-        std::fs::create_dir_all(&blocker).expect("scratch");
+        let blocker = scratch_dir("agent-blocked");
         std::fs::write(blocker.join("not-a-dir"), "x").expect("a file where a dir must go");
 
         let (path, origin) = ensure_config(&tree(), Some(&blocker.join("not-a-dir")));
@@ -336,7 +333,7 @@ use super::*;
     /// the directory.
     #[test]
     fn the_user_config_is_one_path_under_home() {
-        let dir = std::env::temp_dir().join(format!("agent-confighome-{}", std::process::id()));
+        let dir = unique_path("agent-confighome");
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = dir.join(".config").join("agent");
         std::fs::create_dir_all(&cfg).expect("make a fake home");
