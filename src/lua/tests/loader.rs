@@ -172,29 +172,155 @@ use super::*;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The tree resolution order, without touching the process environment
-    /// (which other tests' VMs would race on): an explicit dir wins; else
-    /// `lua/` beside the executable when it has an `init.lua`; else `lua/` in
-    /// the working directory.
+    /// The tree resolution order, against **real directories on disk** rather
+    /// than paths that might or might not exist.
+    ///
+    /// The old version of this test asserted the order with hypothetical paths,
+    /// which meant it passed whatever the lookup did as long as it returned
+    /// *something* plausible: it could not tell a search from a fallback. Each
+    /// step here builds the layout it is testing for, so "found it" means the
+    /// directory really was there and the search really did reach it.
+    ///
+    /// The contract, in order:
+    ///
+    ///   1. `$AGENT_LUA_DIR` wins outright — it is not even probed for
+    ///      existence, because an operator who set it means it.
+    ///   2. `<prefix>/share/agent/lua`, found by walking *up* from the
+    ///      executable. This is the install layout and the only one a release
+    ///      build depends on.
+    ///   3. `lua` beside the executable, for a hand-copied binary.
+    ///   4. the tree it was built from, in debug builds only.
+    ///
+    /// And the one that is *not* on the list: the working directory. There is a
+    /// test for that below, because it is the absence that matters most.
     #[test]
     fn lua_dir_resolution_order() {
         let explicit = PathBuf::from("/srv/shared/lua");
         assert_eq!(
             lua_dir_in(Some(explicit.clone()), Some(PathBuf::from("/opt/bin/agent"))),
-            explicit
+            explicit,
+            "the explicit dir wins without being probed, even against an exe path \
+             that would otherwise resolve"
         );
-        // Beside the executable: an exe under <repo>/bin/ finds <repo>/lua.
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        // Build a real install layout: <root>/bin/agent, <root>/share/agent/lua.
+        let root = crate::testutil::scratch_dir("agent-install-layout");
+        let bin = root.join("bin");
+        let shared = root.join("share").join("agent").join("lua");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&shared).expect("share");
+        std::fs::write(shared.join("init.lua"), "-- installed\n").expect("entry script");
+        let exe = bin.join("agent");
         assert_eq!(
-            lua_dir_in(None, Some(repo.join("bin"))),
-            repo.join("lua")
+            lua_dir_in(None, Some(exe.clone())),
+            shared,
+            "the install layout is found by walking up from the executable: the \
+             tree is a *sibling* of bin/, not a child of it"
         );
-        // No lua/init.lua beside the executable -> the working directory.
+
+        // Now a tree beside the executable instead — no share/ anywhere.
+        let beside = bin.join("lua");
+        std::fs::create_dir_all(&beside).expect("beside");
+        std::fs::write(beside.join("init.lua"), "-- beside\n").expect("entry script");
         assert_eq!(
-            lua_dir_in(None, Some(repo.join("bin").join("deep"))),
-            PathBuf::from("lua")
+            lua_dir_in(None, Some(exe.clone())),
+            shared,
+            "share/ wins over a tree beside the executable: the install layout is \
+             the real one and a stray lua/ next to the binary should not shadow it"
         );
-        assert_eq!(lua_dir_in(None, None), PathBuf::from("lua"));
+        let _ = std::fs::remove_dir_all(shared.parent().unwrap());
+
+        assert_eq!(
+            lua_dir_in(None, Some(exe)),
+            beside,
+            "with no share/ tree, one beside the executable is the next place"
+        );
+
+        // Neither: with nothing on disk the lookup returns its last candidate,
+        // so that the caller reports the very path it failed on rather than
+        // inventing a second one at the error site.
+        let nothing = bin.join("elsewhere");
+        std::fs::create_dir_all(&nothing).expect("nothing");
+        let candidates = lua_dir_candidates(None, Some(nothing.join("agent")));
+        let last = candidates.last().expect("at least one candidate");
+        assert_eq!(
+            lua_dir_in(None, Some(nothing.join("agent"))),
+            last.1,
+            "the last candidate is returned, not a fresh guess"
+        );
+        // In a debug build that last candidate is the checkout, which does hold a
+        // tree — that is the whole reason it is there. In a release build it is a
+        // path on the build machine, which is exactly the case that must *not*
+        // silently succeed, so that a broken install is reported rather than
+        // papered over.
+        assert_eq!(
+            cfg!(debug_assertions),
+            last.1.join("init.lua").is_file(),
+            "the build-time fallback is only usable in debug builds; in release it \
+             is a stale path that has to fail loudly. last={last:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The working directory is not on the list, and that is a security property
+    /// rather than a tidiness one.
+    ///
+    /// The lookup used to end in `PathBuf::from("lua")`, so a `lua/` directory
+    /// in whatever directory you happened to be in was enough to supply the
+    /// tree — including `lua/policy.lua`, which is the sandbox policy. For a tool
+    /// whose entire job is asking before it touches a file, running it from a
+    /// checkout of anything at all would silently swap the shipped policy for
+    /// whatever was lying in `./lua`.
+    ///
+    /// Built as a real directory and `set_current_dir`'d into, so this fails if
+    /// the fallback ever comes back. The cwd is restored afterwards even on
+    /// failure, since every other test in the suite resolves paths against it.
+    #[test]
+    fn a_lua_directory_in_the_working_directory_is_never_the_tree() {
+        let dir = crate::testutil::scratch_dir("agent-cwd-lua");
+        std::fs::create_dir_all(dir.join("lua")).expect("cwd tree");
+        std::fs::write(dir.join("lua/init.lua"), "-- from the cwd\n").expect("entry script");
+        let entry = dir.join("lua/init.lua");
+        assert!(entry.is_file(), "the decoy is real: {}", entry.display());
+
+        let before = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&dir).expect("into the decoy");
+        // An exe path that cannot resolve: <dir>/bin/agent, with no share/ and
+        // nothing beside it.
+        let found = lua_dir_in(None, Some(dir.join("bin/agent")));
+        std::env::set_current_dir(&before).expect("back");
+
+        assert_ne!(
+            found, dir.join("lua"),
+            "a tree in the working directory must not be picked up: found {found:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The message for a missing tree has to name where it looked. The version it
+    /// replaced was `lua lib: lua/lib: No such file or directory (os error 2)`,
+    /// which came from failing to *read* a directory rather than from noticing the
+    /// tree was absent — so it named one arbitrary candidate and said nothing
+    /// about the install layout or the one variable that overrides everything.
+    #[test]
+    fn the_missing_tree_message_names_every_place_it_looked() {
+        let candidates = lua_dir_candidates(None, Some(PathBuf::from("/opt/bin/agent")));
+        let msg = missing_tree_message(&candidates);
+        for (what, dir) in &candidates {
+            assert!(
+                msg.contains(dir.to_string_lossy().as_ref()),
+                "the message omits {what} at {}: {msg}",
+                dir.display()
+            );
+        }
+        assert!(
+            msg.contains("AGENT_LUA_DIR"),
+            "and it must name the one thing that overrides all of them: {msg}"
+        );
+        assert!(
+            msg.contains("share"),
+            "and the install layout, which is the answer for most people: {msg}"
+        );
     }
 
     /// The tree the tests load is the one the repo ships: an entry script plus

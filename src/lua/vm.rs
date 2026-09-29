@@ -256,6 +256,24 @@ pub(super) fn setup_tree(
     let agent = lua.create_table()?;
     agent.set("api", lock_table(lua, api.clone(), "api")?)?;
     lua.globals().set("agent", agent)?;
+    // A tree that is not there at all is the one failure a user hits for a
+    // packaging reason rather than a code one, so it gets the one message that
+    // says where the tree was looked for: everything else here reports the path
+    // it was handed, which for a missing tree is not the useful part — the
+    // failure came from *choosing* that path, not from reading it.
+    //
+    // A directory that exists but has no entry script is a different failure and
+    // keeps the path-naming error, because that is what is actually wrong: the
+    // tree was found and it is incomplete.
+    if !dir.is_dir() {
+        let candidates = crate::lua::tree::lua_dir_candidates(
+            std::env::var_os("AGENT_LUA_DIR").map(std::path::PathBuf::from),
+            std::env::current_exe().ok(),
+        );
+        return Err(mlua::Error::RuntimeError(
+            crate::lua::tree::missing_tree_message(&candidates),
+        ));
+    }
     install_require(lua, dir)?;
     load_lib_modules(lua, dir)?;
     // The settings table, created empty, before any configuration runs.

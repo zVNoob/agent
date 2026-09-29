@@ -47,6 +47,10 @@ use mlua::{Lua, Table};
 // at call time, `agent.seccomp` is fine.
 // ---------------------------------------------------------------------------
 
+/// The directory name this package installs under, in `share/`. Part of the
+/// install layout rather than a constant that could drift from the `Makefile`.
+pub(super) const PACKAGE: &str = "agent";
+
 pub(super) fn lua_dir() -> PathBuf {
     lua_dir_in(
         std::env::var_os("AGENT_LUA_DIR").map(PathBuf::from),
@@ -54,17 +58,93 @@ pub(super) fn lua_dir() -> PathBuf {
     )
 }
 
+/// Every place the tree is looked for, in order, as (what it is, the path).
+///
+/// Exposed so that a failure can *list what was tried*. The single most common
+/// way to get this wrong is an incomplete install, and "lua lib: lua/lib: No
+/// such file or directory (os error 2)" says nothing about which of four
+/// directories was meant.
+pub(super) fn lua_dir_candidates(explicit: Option<PathBuf>, exe: Option<PathBuf>) -> Vec<(&'static str, PathBuf)> {
+    let mut out: Vec<(&'static str, PathBuf)> = Vec::new();
+    if let Some(dir) = &explicit {
+        out.push(("$AGENT_LUA_DIR", dir.clone()));
+        return out;
+    }
+    if let Some(bin) = exe.as_deref().and_then(Path::parent) {
+        // `<prefix>/share/agent/lua` — the install layout, found by walking
+        // *up* from the executable, because the tree is not beside the binary
+        // but beside the binary's sibling directory.
+        if let Some(prefix) = bin.parent() {
+            out.push((
+                "installed (share)",
+                prefix.join("share").join(PACKAGE).join("lua"),
+            ));
+        }
+        // A tree laid *beside* the executable: what a hand-copied
+        // `target/release/agent` sitting next to a `lua/` looks like.
+        out.push(("beside the executable", bin.join("lua")));
+    }
+    // The tree this binary was built from — **debug builds only**, so that
+    // `cargo run` and `cargo test` work from any directory without guessing at
+    // the working directory.
+    //
+    // Not in release builds, and the reason is worth stating because the
+    // unconditional version looked harmless and was not: a release binary built
+    // on a machine that still has the checkout would fall back to it, so
+    // `make install` followed by an edit to the checkout's `lua/` would change
+    // the installed agent's behaviour — and a missing `share/` would be silently
+    // papered over instead of reported. A release binary reads the tree it was
+    // installed with, or nothing. `make run` sets `$AGENT_LUA_DIR` for the case
+    // where you want a release build against the working tree anyway.
+    if cfg!(debug_assertions) {
+        out.push((
+            "the tree it was built from (debug builds only)",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        ));
+    }
+    out
+}
+
+/// The first candidate that holds an entry script, or the last one tried.
+///
+/// **There is deliberately no working-directory fallback.** A `lua/` directory
+/// in the current directory used to be enough to load a policy, which for a tool
+/// whose entire job is asking before it touches a file is a hole and not a
+/// convenience: running the agent from a checkout of anything at all would have
+/// silently replaced the shipped sandbox policy with whatever was in `./lua`.
 pub(super) fn lua_dir_in(explicit: Option<PathBuf>, exe: Option<PathBuf>) -> PathBuf {
     if let Some(dir) = explicit {
         return dir;
     }
-    if let Some(parent) = exe.as_deref().and_then(Path::parent) {
-        let beside = parent.join("lua");
-        if beside.join("init.lua").is_file() {
-            return beside;
+    let candidates = lua_dir_candidates(explicit, exe);
+    for (_, dir) in &candidates {
+        if dir.join("init.lua").is_file() {
+            return dir.clone();
         }
     }
-    PathBuf::from("lua")
+    candidates
+        .into_iter()
+        .last()
+        .map(|(_, dir)| dir)
+        .unwrap_or_else(|| PathBuf::from("lua"))
+}
+
+/// The message a missing tree produces, naming every location that was tried and
+/// the one variable that overrides all of them.
+pub(super) fn missing_tree_message(candidates: &[(&'static str, PathBuf)]) -> String {
+    let mut msg = String::from(
+        "the shipped Lua tree was not found. It installs to \
+         <prefix>/share/agent/lua alongside the binary in <prefix>/bin; these \
+         were tried, in order:",
+    );
+    for (what, dir) in candidates {
+        msg.push_str(&format!("\n  {what}: {}", dir.display()));
+    }
+    msg.push_str(
+        "\nSet $AGENT_LUA_DIR to the directory holding init.lua to override all \
+         of them.",
+    );
+    msg
 }
 
 /// Put the tree on the module search path, so `require` finds the modules a

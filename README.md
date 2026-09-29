@@ -52,22 +52,39 @@ and the modes.
 
 ## Quick start
 
-You need a recent Rust toolchain and a C compiler (the sandbox needs neither, but
-grammar highlighting does — it builds parsers from source).
-
 ```sh
 git clone <this repo> && cd agent
-
-# Point it at a chat endpoint, then edit the file it wrote.
-$EDITOR ~/.config/agent/init.lua       # the settings are the lines marked >>>
-
-cargo run                              # the TUI
+make install PREFIX=~/.local          # no root needed; /usr/local is the default
+~/.local/bin/agent
 ```
 
-There is no endpoint flag. On first run the agent copies its own starter config
-to `~/.config/agent/init.lua`, and that file *is* the configuration — what it does
-not set up, the agent does not have. Press `/reload` after editing; there is no
-restart.
+That installs two things, and both are needed:
+
+```
+<prefix>/bin/agent            the executable
+<prefix>/share/agent/lua/     the tree — the sandbox policy, the tools, the
+                              starter configuration, as editable files
+```
+
+The tree is files rather than something compiled into the binary on purpose: a
+tool that asks you before it touches a file ought to let you *read* the policy it
+is asking you to approve. `<prefix>` can be anywhere and the binary finds it by
+walking up from its own path, so it stays relocatable. `$AGENT_LUA_DIR` overrides
+the search if you keep the tree somewhere else.
+
+You need a C compiler for grammar highlighting — parsers are built from source at
+first use — and a network for the first grammar fetch. Nothing else is needed
+beyond a recent Rust toolchain to build it.
+
+**On first run** the agent copies its own starter config to
+`~/.config/agent/init.lua`, and says so. That file *is* the configuration — what
+it does not set up, the agent does not have — and there is no endpoint flag, so
+this is the step that cannot be skipped:
+
+```sh
+$EDITOR ~/.config/agent/init.lua       # the settings are the lines marked >>>
+~/.local/bin/agent                     # press /reload after editing; no restart
+```
 
 One other binary is worth having while you are getting there:
 
@@ -79,6 +96,9 @@ cargo run --bin agent_probe -- "…"     # …or ask it something
 With no argument the probe runs `echo hello-from-sandbox` through the shell, which
 is the quickest end-to-end check that the sandbox, the ask path and the panel
 plumbing are all still wired together.
+
+`make uninstall PREFIX=…` reverses the install. Nothing is written outside
+`<prefix>` and `~/.config/agent`.
 
 ---
 
@@ -593,13 +613,15 @@ nobody registers does not exist.
 ## Development
 
 ```sh
-cargo test && ./scripts/verify-sandbox.sh
+make test          # cargo test
+make gate          # ./scripts/verify-sandbox.sh — what CI runs
+make fmt           # cargo fmt
 ```
 
 `verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
 fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
 `src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
-the check that the sandbox is still there at all. The suite is 387 library tests
+the check that the sandbox is still there at all. The suite is 389 library tests
 and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
 compiler (`-- --ignored` runs them).
 
@@ -634,7 +656,9 @@ Work in progress, and honest about the edges:
   key.
 - **Grammars are fetched and compiled at runtime**, which means a first run on a
   cold cache needs a network and a working `cc`.
-- **No release packaging.** `cargo run` and a config file is the whole install.
+- **`cargo install` does not work, and cannot.** The tree is loose files, so
+  there is nothing for it to install; use `make install`. The Makefile is the
+  whole packaging story — no distro packages, no Homebrew formula.
 
 `RESEARCH-AGENT-EXTENSIBILITY.md` is a dated research brief on how other agents
 handle extensibility and sandboxing, kept as the record of *why* the design looks

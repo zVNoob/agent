@@ -587,7 +587,7 @@ use super::sandbox::{
     cstring_positions, cwd_resolution_ok, dirfd_slot_for, proc_cmdline, read_cstr, resolve_path,
     CSTRING_CAP,
 };
-use super::tree::{load_init, lua_dir_in};
+use super::tree::{load_init, lua_dir_candidates, lua_dir_in, missing_tree_message};
 use super::usage::{Usage, record_usage, usage_guard};
 use super::vm::{AskAnswer, AskHandler, STDLIB, eval_reactor, install_sink, new_vm,
     new_vm_with_ask, new_vm_with_sink, setup_tree};
