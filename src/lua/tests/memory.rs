@@ -132,7 +132,6 @@ use crate::testutil::{scratch_dir, unique_path};
 /// Treating it as "unbound" would make the table fail silently, which is the
 /// failure mode [`Action::parse`] also refuses.
 #[test]
-
 fn the_key_event_hands_back_the_action_the_handler_named() {
     let lua = new_vm().expect("VM");
     lua.load(
@@ -179,8 +178,6 @@ fn the_key_event_hands_back_the_action_the_handler_named() {
     );
 }
 
-/// `nil` and `false` both mean "unbound", and anything else is a broken
-/// binding table that must not be allowed to pass for one.
         /// What the user actually sees while a write is being decided.
         ///
         /// Every other test in this area checks the *ops* — that a panel was opened,

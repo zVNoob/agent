@@ -28,14 +28,14 @@
 --   model       the model name your server knows it by
 --   api_key     sent as `Authorization: Bearer …`; empty means no header
 --
--- The environment overrides all three, which is the quickest way to point at a
--- different server for one run: `AGENT_BASE_URL`, `AGENT_MODEL`,
--- `AGENT_API_KEY`. A local llama.cpp, for example:
+-- There is deliberately no environment override for these: the endpoint is
+-- configuration, not an environment variable, because a file you can read back
+-- is worth more than a shell line that changes what the agent talks to without
+-- a trace. (The headless probe is the one exception — it reads `AGENT_BASE_URL`,
+-- `AGENT_MODEL` and `AGENT_API_KEY` when any one of them is set, so an existing
+-- scripted invocation keeps working. The TUI does not.)
 --
---   AGENT_BASE_URL=http://127.0.0.1:8080/v1 AGENT_MODEL=my-local-model agent
---
--- The values below are the defaults the agent falls back to, and they are also
--- what the environment falls back to.
+-- So: the three lines below are the whole of it.
 -- Fields, not the table. The loader creates `agent.llm` before this file runs,
 -- so a whole-table assignment here would either be ignored (an empty table is
 -- truthy) or throw away every field this file did not mention. Assigning

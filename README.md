@@ -1,216 +1,287 @@
 # agent
 
-> **Work in progress.** The architecture is settled, the gate is green, and the
-> boundaries below are decisions rather than defects. What is young is the
-> project, not the design — and the one thing nobody has done yet is run it
-> end to end. Read [Where the responsibility is](#where-the-responsibility-is)
-> before you point it at anything you care about.
+**A coding agent in your terminal, where the sandbox asks you instead of deciding for you.**
 
-A coding agent in a terminal. A TUI over any OpenAI-compatible chat endpoint,
-with a seccomp-sandboxed shell, file tools, and every layer above the API written
-in Lua — including the tools, the sandbox policy, the permission prompts and the
+A streaming TUI over any OpenAI-compatible endpoint — with a seccomp sandbox that
+intercepts thirteen syscalls and puts each one to you with its arguments decoded
+out of the frozen process, file tools, and every layer above the API written in
+Lua. Including the tools, the sandbox policy, the permission prompts, and the
 modes.
 
-## What is here
+```
+┌─ response ──────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│  I'd like to look at the test for `wrap_lines` before I touch it.        │
+│                                                                          │
+├─ cat src/tui/mod.rs ───────────────────────────────────────────────────────┐
+│                                                                          │
+│   736│ pub fn wrap_lines(text: &str, width: usize) -> Vec<String> {      │
+│   737│     if width == 0 {                                               │
+│   738│         return vec![String::new()];                               │
+│   739│     }                                                             │
+│   740│     let mut out = Vec::new();                                     │
+│   741│     for para in text.split('\n') {                                │
+│   742│         if para.is_empty() {                                      │
+│   743│             out.push(String::new());                               │
+│                                                                          │
+│ ┌─ [y]es · [n]o · [a]lways ───────────────────────────────────────────┐ │
+│ │ The process want to read src/tui/mod.rs                            │ │
+│ └────────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────┘
+ Ctrl+d quit · Ctrl+c stop                                                          │
+```
 
-- A streaming TUI: turn stream, tool-drawn panels, a permission dialog at
-  the bottom of the panel that raised it, a one-line status bar at the bottom,
-  and `/reload`.
-- A Lua surface for all of it: 36 locked bridge primitives, auto-required
-  library modules, a mode system, an ask protocol with three answers, and the
-  sandbox policy.
-- A single-threaded process. One OS thread, a current-thread tokio runtime, no
-  worker pool; tool calls, event handlers and HTTP all run as coroutines the
-  event loop steps.
-- A seccomp user-notify sandbox: `openat`, `unlinkat`, `renameat`/`renameat2`,
-  `chmod`/`fchmodat`, `setxattr`/`lsetxattr`, `removexattr`/`lremovexattr`,
-  `connect`, `bind` and `sendto` are intercepted, and each is *asked* about with
-  its arguments decoded out of the frozen process. Reads, writes, deletes, moves,
-  permission changes and capability changes are all questions about a path, and a
-  move is two of them.
+> **Work in progress.** The architecture is settled and the gate is green; the
+> boundaries below are decisions, not defects. What is young is the project, not
+> the design — and nobody has yet run this end to end against a real model.
+> [Read the security model](#security-model) before you point it at anything you
+> care about.
 
-## Where the responsibility is
+---
+
+## Contents
+
+- [Quick start](#quick-start) · [What's in the box](#whats-in-the-box)
+- [How it works](#how-it-works) · [Security model](#security-model)
+- [Writing a tool](#writing-a-tool) · [Configuration](#configuration)
+- [Keys](#keys) · [Asks and trust](#asks-and-trust)
+- [The sandbox](#the-sandbox) · [Project layout](#project-layout)
+- [Development](#development) · [Status](#status)
+
+---
+
+## Quick start
+
+You need a recent Rust toolchain and a C compiler (the sandbox needs neither, but
+grammar highlighting does — it builds parsers from source).
+
+```sh
+git clone <this repo> && cd agent
+
+# Point it at a chat endpoint, then edit the file it wrote.
+$EDITOR ~/.config/agent/init.lua       # the settings are the lines marked >>>
+
+cargo run                              # the TUI
+```
+
+There is no endpoint flag. On first run the agent copies its own starter config
+to `~/.config/agent/init.lua`, and that file *is* the configuration — what it does
+not set up, the agent does not have. Press `/reload` after editing; there is no
+restart.
+
+One other binary is worth having while you are getting there:
+
+```sh
+cargo run --bin agent_probe            # one headless turn through the sandbox
+cargo run --bin agent_probe -- "…"     # …or ask it something
+```
+
+With no argument the probe runs `echo hello-from-sandbox` through the shell, which
+is the quickest end-to-end check that the sandbox, the ask path and the panel
+plumbing are all still wired together.
+
+---
+
+## What's in the box
+
+| | |
+|---|---|
+| **Streaming TUI** | turn stream, tool-drawn panels, a permission dialog at the bottom of the panel that raised it, a one-line status bar, `/reload`, `/save` |
+| **A seccomp sandbox that asks** | thirteen syscalls intercepted; reads, writes, deletes, moves, permission changes and capability changes are all questions about a *path*, and a move is two of them |
+| **Lua for everything above the API** | 36 locked bridge primitives, nine auto-required library modules, a mode system, an ask protocol with three answers, the sandbox policy, the tools |
+| **One thread** | one OS thread, a current-thread tokio runtime, no worker pool — tool calls, event handlers and HTTP are coroutines the event loop steps |
+| **Runtime syntax highlighting** | tree-sitter grammars fetched from a registry, compiled with your `cc`, and `dlopen`'d — and applied to text already on screen, mid-conversation |
+| **MCP** | a pure-Lua client (`agent.mcp`) that talks to any transport you inject, with per-call progress streaming and its own panels |
+
+---
+
+## How it works
+
+```
+                    ┌──────────────────────────────────────────┐
+  OpenAI-compatible │  src/api.rs — SSE stream → TurnEvents     │
+  chat endpoint  ──▶│                                          │
+                    └────────────────┬─────────────────────────┘
+                                     │  TurnEvent::ToolCallDelta
+                                     ▼
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │  src/main.rs — one event loop, one thread                           │
+   │    • renders, steps coroutines, drains panel ops, pumps grammars    │
+   └───┬──────────────────────────────────────────────┬──────────────────┘
+       │                                              │
+       ▼                                              ▼
+  ┌────────────────────┐              ┌───────────────────────────────┐
+  │ ToolRun (Lua coro) │              │ grammar acquisition (tokio)  │
+  │  on the config VM  │              │  registry → tarball → cc →   │
+  └─────────┬──────────┘              │  dlopen → re-highlight       │
+            │ agent.bash              └───────────────────────────────┘
+            ▼
+  ┌────────────────────┐      ┌──────────────────────────────────┐
+  │  lua/lib/bash.lua  │─────▶│ seccomp user-notify on a fork()  │
+  │  + lua/policy.lua │      │  13 syscalls → ask → verdict     │
+  └────────────────────┘      └──────────────────────────────────┘
+            │                              │
+            └──────────► PanelSink ◄──────┘
+                          (agent.api.panel_*)
+                                │
+                                ▼
+                        TurnPanel (transcript)
+```
+
+The one thing worth internalising: **a tool call runs as a Lua coroutine on the
+agent's own config VM.** Not a thread, not a subprocess — the same VM that holds
+your configuration. That is what makes a path you answer `always` to still be
+trusted on the *next* tool call, and it is why the trust tables used to die with
+each call before they were moved.
+
+---
+
+## Security model
 
 **The agent asks. You decide. Nothing is enforced beyond the decisions you make
 in the moment.** That is the design, not a stage of it — the alternative, a
 sandbox that decides on its own what a command may do, is a different product
 with a different failure mode, and this one deliberately does not do that.
 
-Which means the boundary is worth stating precisely, because the name
-`sandbox` promises more than the mechanism delivers:
+The name `sandbox` promises more than the mechanism delivers, so the boundary is
+worth stating precisely:
 
-- **Asking is not confining.** The sandbox is a bare `fork()` with no
-  `unshare`, so a command keeps the host's mount view and its network
-  namespace. Gating `connect` means you are asked about each destination; it
-  does not make the destination unreachable. See
-  [What the sandbox is](#what-the-sandbox-is) for what does follow from that.
-- **The agent's own network path is not gated either.** `agent.http` and
-  `agent.mcp` are bridge primitives in the agent process, not syscalls in a
-  sandboxed tracee, so no question is asked about them. If that matters for what
-  you are running, it is your call to make — the mechanism to extend is the
-  bridge, not the syscalls.
-- **Trust is yours to grant and revoke, and it lasts as long as the process.** A
-  path or endpoint you answer `always` for is remembered on the agent's own VM,
-  so it holds for every later call and survives `/reload`, but not a restart.
-  `agent.ask.forget` and `forget_server` take any of it back at any time.
-- **The first run asks about every shared library, and it is a flood.** A cold
-  `/bin/cat /dev/null` asks dozens of times, once per file: the loader's cache
-  and map, every `DT_NEEDED` library, the locale catalogues, and the CPU-variant
-  directories it probes that do not exist. The shipped config grants
-  `trust_readonly` on `/lib`, `/lib64`, `/usr`, `/etc/ld.so.cache`,
-  `/proc/self/maps`, `/proc/filesystems` and the five harmless `/dev` entries
-  (plus `trust_write` on `/dev/null`), which is what brings that flood down to
-  the command's own business. The working directory is trusted at startup, which
-  does not help here, since the libraries do not live there. See
-  [Asks and trust](#asks-and-trust).
+- **Asking is not confining.** A command is a plain `fork()` with no `unshare`,
+  so it keeps the host's mount view and its network namespace. Gating `connect`
+  means you are asked about each destination; it does not make the destination
+  unreachable. `ss` lists every listener, and anything on `127.0.0.1` a command
+  can guess is reachable.
+- **The agent's own network path is not gated at all.** `agent.http` and
+  `agent.mcp` are bridge primitives *in the agent process*, not syscalls in a
+  sandboxed tracee, so no question is asked. If that matters for what you are
+  running, it is your call — and the mechanism to extend is the bridge, not the
+  syscalls.
 - **Headless, there is no one to ask, so everything is denied.** The probe, the
-  tests and any run with no ask handler get a sandboxed command that reaches
-  nothing it was not already trusted for.
+  tests, and any run with no ask handler get a command that reaches nothing it was
+  not already trusted for.
+- **Trust lasts as long as the process.** A path or endpoint you answer `always`
+  to is remembered on the agent's VM, so it holds for every later call and
+  survives `/reload` — but not a restart. `agent.ask.forget` and `forget_server`
+  take any of it back at any time.
+- **The first run is a flood, by design.** A cold `/bin/cat /dev/null` asks
+  dozens of times — once per file: the loader's cache and map, every
+  `DT_NEEDED` library, the locale catalogues, and the CPU-variant directories it
+  probes that do not exist. The shipped config pre-grants the boring ones (see
+  [Asks and trust](#asks-and-trust)); the working directory being trusted does
+  not help here, because the libraries do not live there.
 
 Two smaller calls, both reversible and both ours to change on request: the policy
 traps `sendto` alongside the other twelve, because UDP has no handshake and
-leaving it out would make the `connect` gate trivially bypassable; that it traps `renameat2` as well as `renameat`, because glibc's
-`rename()` is `renameat2` now and gating only the other one would have left every
-real `mv` ungated while still looking right; and that the `"all"` mode sentinel
-currently has no shipped user, since `coding` names its registry instead.
+leaving it out would make the `connect` gate trivially bypassable; and it traps
+`renameat2` as well as `renameat`, because glibc's `rename()` is `renameat2` now,
+so gating only the other one would leave every real `mv` ungated while still
+looking right.
 
-## Running it
+---
 
-```sh
-cargo run                              # the TUI
-cargo run --bin agent_probe            # one headless turn, sandbox smoke test
-cargo run --bin agent_probe -- "…"     # …or ask it something
-./scripts/verify-sandbox.sh            # the gate
+## Writing a tool
+
+There is no Rust. A tool is a *connection* — `{ name, tools }` — and
+`agent.mcps` is the registry of them. The registry is the whole of what the agent
+can do: the shell is a connection like any other, and what nobody registers does
+not exist.
+
+```lua
+agent.mcps.mine = {
+  name = "mine",
+  tools = {
+    hello = agent.utils.tool("Say hello.", {
+      type = "object",
+      properties = { who = { type = "string", description = "who to greet" } },
+      required = { "who" },
+    }, function(args)
+      return { ok = true, result = "hello, " .. args.who }
+    end),
+  },
+}
 ```
 
-Four more binaries exist for narrower jobs: `chat` (a terminal setup demo),
-`grammar_probe` (fetch the four grammars the TUI preloads, and parse with each),
-`mcp_fake` (a reference MCP server, which the MCP tests' in-process fake is
-modelled on), and `sandbox` (drive one sandboxed run directly, with no Lua in
-the way).
-
-The probe with no argument runs `echo hello-from-sandbox` through the shell, which
-is the quickest end-to-end check that the sandbox, the ask path and the panel
-plumbing are all still wired together.
-
-The TUI wants a chat endpoint, and it configures itself from
-`~/.config/agent/init.lua`. There is no such file on a fresh machine, so the
-first run copies the shipped `lua/init.lua` there and runs *that* — after which
-the copy is yours: edit it and press `/reload`. It is the whole configuration,
-not an overlay, so what your file does not set up the agent does not have.
-
-That starter file is written to be edited. The settings you will actually change
-are marked `>>>`, each with its documentation attached, and the sections below
-them explain how the rest fits together.
-
-| variable | read by |
-|---|---|
-| `AGENT_LUA_DIR` | anything that builds a Lua VM — the TUI and `agent_probe`, not `chat`/`grammar_probe`/`mcp_fake`/`sandbox`, which have no Lua in them: load a different tree, instead of the `lua/` beside the executable (used only if it holds an `init.lua`, else `./lua`) |
-| `AGENT_BASE_URL`, `AGENT_MODEL`, `AGENT_API_KEY` | **only `agent_probe`**, and only when any one of them is set. A dev-harness override so an existing headless invocation keeps working; the TUI has no environment override at all, because the endpoint is Lua configuration. |
-
-## The gate
-
-```sh
-cargo test && ./scripts/verify-sandbox.sh
-```
-
-`verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
-fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
-`src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It
-is the check that the sandbox is still there at all.
-The suite is 375 library tests and 14 in the `agent` binary, plus 4 that are
-`#[ignore]`d for want of the network or a C compiler (`-- --ignored` runs them).
-
-## How it is put together
-
-The Rust side is the runtime: the chat client, the TUI, the seccomp engine, the
-MCP transports and the Lua bridge. It is a library (`agent`) plus six thin
-binaries — the TUI is `src/main.rs`, and the rest are the probe and the four
-narrow tools listed above.
-
-| | |
-|---|---|
-| `src/lua/` | the `agent` namespace. `mod.rs` is the *contract* (what Lua may see and do); the modules beside it are the implementation, one layer each: `vm` (build a VM), `tree` (assemble it from the shipped `lua/`), `bridge` (the `agent.api` table and its lock), `sandbox` (the seccomp primitives and the `/proc` introspection), `config` (the `agent.llm` surface and the tool registry), `run` (a tool call and an event handler as coroutines the loop steps), `memory` and `usage` (the two small bindings). The tests are under `src/lua/tests/`, split by the shipped Lua surface they exercise rather than by module — nearly all of them build a real VM and drive it end to end, so the module boundary is not the seam they have. |
-| `src/api.rs` | the chat-completions client: tool definitions, request plumbing, SSE parsing, turn accounting. Shared by the TUI and the probe, so it is a library module rather than a copy per binary |
-| `src/tui/` | the screen shell (`mod.rs`) and the conversation component (`panel.rs`), plus the markdown highlighter (`highlight.rs`) |
-
-Everything a user would want to change is Lua, and it is all in `lua/`:
-
-| | |
-|---|---|
-| `lua/init.lua` | the starter configuration: the settings (`agent.llm`, the context window, the log), the tools, the modes, the trust grants and the automatic compaction — each documented where it is set, with the `>>>`-marked lines being the ones meant to be edited. Copied to `~/.config/agent/init.lua` on first run |
-| `lua/lib/*.lua` | library modules, auto-required in sorted order and cached; each publishes itself on `agent` (`agent.ask`, `agent.bash`, `agent.mode`, `agent.utils`, …) |
-| `lua/*.lua` | root modules, reached by name: `fs` (read, write_file, hand_to_user, apply_patch), `bash_tool`, `policy`, `coding`, `compact`, `mcps` |
-| `lua/api.lua` | the bridge's annotations, and what the loader checks at startup: a primitive without one, or one for a primitive that no longer exists, is a startup error |
-| `lua/agent_api.meta.lua` | the same 36 primitives as LuaLS types, for editors |
-
-`lua/init.lua` and `~/.config/agent/init.lua` share a name on purpose — they
-are the same kind of thing, a chunk of Lua that configures the agent — and they
-never meet: the shipped one is only what a fresh config is seeded from. Delete
-your copy and the next run re-seeds it from whatever ships next, which is also
-how you pick up a newer starter after an upgrade.
-
-A tool is a connection — `{ name, tools }` — and `agent.mcps` is the registry of
-them. The registry is the whole of what the agent can do: nothing is hard-coded
-in Rust, the shell is a connection like any other, and what nobody registers does
-not exist. Out of the box `lua/init.lua` registers exactly two — `fs` and
-`bash`.
+The model sees it as `mine.hello` — tools are advertised as `{connection}.{tool}`,
+so two servers offering the same tool name do not collide. The callback returns
+the MCP shape: `{ ok = true, result = … }`, `{ ok = false, error = "…" }`, or a
+bare `false` to deny.
 
 **A tool call puts nothing in the transcript.** Not the arguments, not the result,
 not an error — the loop records the result for the model and draws nothing. A tool
 is in charge of its own reporting, which is also the only way it can be formatted
-properly: `agent.panel` opens a panel, `p:append` fills it, and `agent.split_panel`
-splits it. The shell is the worked example — a panel titled with the command, with
-stdout appended as it arrives. A tool that wants to be seen draws itself; a tool
-that wants to be quiet is quiet. The cost is that a tool with nothing to say is
-invisible, including when it fails — and the fix is the tool's, not the loop's.
-The shipped `fs` tools each draw their own panel, and each asks its permission
-question *inside* that panel, so a question is never asked into the void. `fs.read`
-covers both kinds of path — a file comes back numbered, a directory comes back as
-a listing — and shows only the resolved path, plus the one the model wrote when
-the two differ. `fs.write_file` shows the bytes it wrote, highlighted.
+properly:
 
-`fs.apply_patch` is the fourth: a pure-Lua unified-diff engine, asked once for the
-file it is about to edit. It draws a *split* panel — the file before on the left,
-after on the right, each pane declaring the file's own language so tree-sitter can
-run on it. A unified diff could not do that: the grammar would choke on the `+`
-and `-` prefixes, which is the reason the split panel exists at all.
+```lua
+local p = agent.panel("my report", { boxed = true })
+p:append("done\n")
+p:ask("delete the scratch file?", false)   -- the dialog, inside this box
+```
 
-`fs.hand_to_user` is the odd one out, and it exists because creating a file is
-silent by design: a new name records write-trust for itself, so a directory full
-of generated files is a set of paths the agent can keep rewriting with no further
-questions. That is right while it is still building them and wrong once they are
-yours, and nothing else in the system revokes a grant the agent made to itself.
-`hand_to_user` takes those paths back, so the next write asks again. It touches
-no file and therefore asks nothing itself; it also cannot widen anything, since a
-path the agent was never granted has nothing to forget — and it reports which
-paths those were, so a confused call is visible rather than quiet. Only the write
-half is given up: reads of a handed-over file stay silent. `agent.ask.forget(path)`
-takes both halves.
+The cost of that choice is that a tool with nothing to say is invisible,
+*including when it fails* — and the fix is the tool's, not the loop's. The one
+exception is an MCP tool, whose code is on the other side of the wire and so
+could never report itself: `lua/lib/mcp.lua` therefore draws for it, one panel
+per call, and `{ draw = false }` opts out.
 
-**An MCP tool is the exception, and the module draws for it.** Its code is on
-the other side of the wire, so there is no arrangement in which it could report
-itself — it would be invisible forever. `lua/lib/mcp.lua` therefore opens a panel
-per call, titled `{connection}.{tool}`, before the request; fills it with the
-result's text blocks, with `notifications/progress` appended as they arrive
-(setting that callback is what asks the server for them); and marks a failure as
-one. `agent.mcp(name, transport, { draw = false })` opts out, and then the
-request on the wire is byte for byte what it always was.
+The shipped tools are all in `lua/`, all documented where they are set:
 
-## Modes
+| tool | what it does |
+|---|---|
+| `fs.read` | a file comes back numbered, a directory as a listing; shows the resolved path, and the one the model wrote when the two differ |
+| `fs.write_file` | asks first; draws the bytes it wrote, with the file's language declared so the highlighter runs on it |
+| `fs.apply_patch` | a pure-Lua unified-diff engine, asked once for the file it is about to edit; draws a **split** panel — before on the left, after on the right, each pane declaring its own language |
+| `fs.hand_to_user` | gives write-trust on paths back, so the next write asks again. Exists because *creating* a file is silent by design, which is right while the agent is still building them and wrong once they are yours |
+| `bash.bash` | runs a command through the seccomp sandbox under the Lua policy, streaming stdout into a panel titled with the command |
 
-A mode is a prompt and a tool set, switched as a pair; `set` overwrites exactly
+---
+
+## Configuration
+
+Everything is `~/.config/agent/init.lua`, a chunk of Lua. The lines you will
+actually want to change are marked `>>>`, each with its documentation attached,
+and the sections around them explain the rest.
+
+| § | what it holds |
+|---|---|
+| 1 · THE ENDPOINT | base URL, model, key and system prompt — the `>>>` lines |
+| 2 · THE CONTEXT WINDOW | the size that turns automatic compaction on |
+| 3 · THE CONVERSATION LOG | where the transcript is archived |
+| 4 · TOOLS | which connections are registered; out of the box, `fs` and `bash` |
+| 5 · MODES | `coding` (the working mode) and `compact` (no tools at all) |
+| 6 · TRUST | the pre-grants that keep the first run survivable |
+| 7 · WHAT HAPPENS AT THE END OF A TURN | the automatic compaction policy |
+| 8 · KEYS | the whole binding table |
+| 9 · WHAT IS NOT IN THIS FILE | what you must not put in a config, and why |
+
+`lua/init.lua` and `~/.config/agent/init.lua` share a name on purpose — they are
+the same kind of thing — and they never meet: the shipped one is only what a fresh
+config is seeded from. Delete your copy and the next run re-seeds it from whatever
+ships next, which is also how you pick up a newer starter after an upgrade.
+
+### Environment
+
+There is almost none, deliberately: the endpoint is configuration, not an
+environment variable.
+
+| variable | read by |
+|---|---|
+| `AGENT_LUA_DIR` | anything that builds a Lua VM — the TUI and `agent_probe`. Loads a different tree instead of the `lua/` beside the executable (used only if it holds an `init.lua`, else `./lua`) |
+| `AGENT_BASE_URL`, `AGENT_MODEL`, `AGENT_API_KEY` | **only `agent_probe`**, and only when any one of them is set. A dev-harness override so an existing headless invocation keeps working; the TUI has no environment override at all |
+
+### Modes
+
+A mode is a prompt and a tool set, switched as a pair — `set` overwrites exactly
 `agent.llm.system_prompt` and `agent.mcps`, and the next request already runs in
-it. Two are built in and `coding` is the one in force: `coding` (the working
-mode) and `compact` (no tools at all, so a compaction turn can only answer). A
-config that wants neither drops them with `agent.mode.forget_all()`. See
-`lua/lib/mode.lua`.
+it. `compact` narrows to nothing, so a compaction turn can only answer.
+`agent.mode.forget_all()` drops both built-ins. See `lua/lib/mode.lua`.
+
+---
 
 ## Keys
 
 Rust binds two keys and nothing else: `Ctrl+c` (stop the running command) and
-`Ctrl+d` (leave). Everything else — `Enter` to send, `Esc` to leave, `q`,
-`Alt+c`, `Alt+Enter`, scrolling — is a config's business, bound by name in Lua:
+`Ctrl+d` (leave). Everything else — `Enter`, `Esc`, `q`, `Alt+c`, `Alt+Enter`,
+scrolling — is a config's business, bound by name in Lua:
 
 ```lua
 agent.on_event("key", function(k) return BIND[k.spec] end)   -- see lua/init.lua §8
@@ -218,76 +289,53 @@ agent.on_event("key", function(k) return BIND[k.spec] end)   -- see lua/init.lua
 
 The handler is given `spec` (the chord as a table writes it — `alt+enter`,
 `ctrl+c`, `f5`), `char`, and the three modifier booleans, and returns an action
-name (`newline`, `send`, `quit`, `interrupt`, `conceal`, `scroll_up`,
-`scroll_down`, `top`, `bottom`) or nothing, meaning the key keeps its default.
+name — `newline`, `send`, `quit`, `interrupt`, `conceal`, `scroll_up`,
+`scroll_down`, `top`, `bottom` — or nothing, meaning the key keeps its default.
 
 **Returning a name is a shorthand, not the limit.** A handler can also call
 `agent.api.input_insert(text)` (or `input_backspace` / `input_clear`) and change
 the input line directly, so a binding is not limited to a set of actions frozen
 into Rust — a chord bound to `input_insert("0")` types a zero mid-sentence, which
-is what a leader key is for. That is why `Alt+Enter` is a line in
-`lua/init.lua` rather than a Rust default: it was kept here as a "fallback for
-terminals that cannot send the chord", which was never true, because such a
-terminal does not deliver a distinguishable event and Rust would not have
-received one either.
+is what a leader key is for. That is why `Alt+Enter` is a line in `lua/init.lua`
+rather than a Rust default: it was kept here as a "fallback for terminals that
+cannot send the chord", which was never true, because such a terminal does not
+deliver a distinguishable event and Rust would not have received one either.
 
 **A bare letter is a character first and a command second.** A letter reaches an
 action only when the input line is empty; a chord always does. That one rule is
-what makes a flat table safe — without it, `BIND["q"] = "quit"` would quit the
-app halfway through the word "quick" — and it lives in Rust precisely so that a
-config gets it for free. It is also why leaving is `Ctrl+d` and not a letter.
-Input edits are exempt: by the time one is queued a command has already been
-chosen, so a leader key works mid-sentence.
+what makes a flat table safe — without it, `BIND["q"] = "quit"` would quit the app
+halfway through the word "quick" — and it lives in Rust precisely so a config gets
+it for free. It is also why leaving is `Ctrl+d` and not a letter. Input edits are
+exempt: by the time one is queued a command has already been chosen, so a leader
+key works mid-sentence.
 
-The event is **not fired while a permission question is on screen**: `y`/`n`/`a`
-are verdicts there, and a table that could redirect them could answer a question
-by accident. `Ctrl+c` is the exception that proves the rule — it *does* work with
-a question up, because the command asking is the one thing worth interrupting,
-and its tree is frozen on that very question.
+Two more things the event machinery gets right:
 
-`Ctrl+c` reaches the sandbox through a per-run flag, not a signal: the caller
-that wants to interrupt has no reference to the running tree, which lives inside
-the tool's coroutine, and it cannot signal a pid because the tree grows as it
-forks. The request travels to the one place that can act on it, which kills the
-whole captured tree and lets the run finish the ordinary way — so the result
-comes back marked `interrupted` rather than looking like a command that crashed.
-The flag is per-run: an earlier global version let one request kill every
-concurrent sandbox, which is a bug the test suite found by having many.
+- The event is **not fired while a permission question is on screen**. `y`/`n`/`a`
+  are verdicts there, and a table that could redirect them could answer a
+  question by accident. `Ctrl+c` is the deliberate exception — it *does* work
+  with a question up, because the command asking is the one thing worth
+  interrupting, and its tree is frozen on that very question.
+- `[y]es` / `[n]o` in a dialog are clickable, and a click is turned into the
+  letter inside the brackets and run through the same `ask_choice` a keypress
+  uses — so a pointer and a keypress are the same decision *by construction*
+  rather than by two copies agreeing.
 
-This is also where the click path meets the keyboard. `[y]es`/`[n]o` in a dialog
-are clickable, and a click is turned into the letter inside the brackets and run
-through the same `ask_choice` a keypress uses — so a pointer and a keypress are
-the same decision by construction rather than by two copies agreeing.
+`Ctrl+c` reaches the sandbox through a per-run flag, not a signal: the caller has
+no reference to the running tree, which lives inside the tool's coroutine, and it
+cannot signal a pid because the tree grows as it forks. The request travels to the
+one place that can act, which kills the whole captured tree and lets the run
+finish the ordinary way — so the result comes back marked `interrupted` rather
+than looking like a crash.
 
-## The status bar
-
-The bottom row is one line, and it is the only place anything reports *in
-progress*: `streaming...` while a turn's answer is arriving, grammar acquisition
-at startup (which is a registry lookup, a tarball and a C compile per language,
-before the first frame — a cold cache used to be a blank screen), and anything
-Lua `print`s. A second message replaces the first, so a run of progress steps
-reads as the latest one rather than a queue, and the bar empties when the thing
-it described is over rather than showing a state that has passed.
-
-`print` is Lua's own, argument handling and all — `tostring` each argument, join
-with tabs — pointed at the bar instead of stdout, because a TUI owns the terminal
-and a stray print would scribble over it. Headless (the probe, the tests) there
-is no screen, so `print` goes to stdout exactly as before. It is one line either
-way: a status bar is not a log. Output meant to be read later belongs in a
-panel, via `agent.panel`.
-
-The `bash` tool titles its panel with the command it is running, so what ran is
-visible without expanding anything. The title is one row, so the command is
-flattened to a single line and cut with an ellipsis if it is still too wide for
-the box — the full command is in the transcript either way, in the model's own
-call.
+---
 
 ## Asks and trust
 
 Nothing that touches a file or an endpoint is decided silently. A tool asks
-through its own panel — `panel:ask(text, always)` — and the question appears as
-a **dialog at the bottom of that panel's own box**, under the output it has
-produced so far:
+through its own panel — `panel:ask(text, always)` — and the question appears as a
+**dialog at the bottom of that panel's own box**, under the output it has produced
+so far:
 
 ```
 ┌─ cat /etc/hostname [−] ─────────────────────────────────┐
@@ -298,24 +346,28 @@ produced so far:
 └───────────────────────────────────────────────────────┘
 ```
 
-The question belongs to the thing that raised it, and the panel is what raises
-it, so there is no separate prompt in the transcript and nothing accumulates
-while you think: a cold command asks dozens of times and the transcript still
-grows by nothing. Your answer goes on the status bar — `allowed`, `allowed, and
-remembered`, or `denied` — because one line cannot pile up.
+The question belongs to the thing that raised it, so there is no separate prompt
+in the transcript and nothing accumulates while you think. Your answer goes on the
+status bar — `allowed`, `allowed, and remembered`, or `denied` — because one line
+cannot pile up.
 
-`[a]lways` is offered only when the answer is one the agent can act on: a
-question with a path or an endpoint to remember offers it, and one without does
-not. Only `always` is remembered, as path trust or as a trustworthy-server
-entry, kept in separate tables so revoking one never revokes the other.
+`[a]lways` is offered only when the answer is one the agent can act on: a question
+with a path or an endpoint to remember offers it, and one without does not. Only
+`always` is remembered, as path trust or as a trustworthy-server entry, kept in
+separate tables so revoking one never revokes the other.
 
-With no one to ask at all — headless, the tests, the probe — every ask denies,
-so a sandboxed run reaches nothing it was not already trusted for.
+### The four tables
+
+| | |
+|---|---|
+| `trust(path)` | may be here at all |
+| `trust_write(path)` | …and may make things here |
+| `trust_readonly(path)` | may be *looked at*, and no more — this is the system tree |
+| `block(path)` | never, whatever a grant above says |
 
 Path trust is a prefix, so trusting a directory trusts everything under it. That
 is what makes the library flood survivable, and the shipped config spends it on
-what a dynamically-linked program reads before its own first line — the loader's
-cache, its map of the process, and every `DT_NEEDED` library and locale message:
+what a dynamically-linked program reads before its own first line:
 
 ```lua
 -- lua/init.lua §6, verbatim in shape
@@ -330,24 +382,20 @@ end
 -- and the /dev entries that carry nothing, plus a write grant on /dev/null
 ```
 
-`trust_readonly` is its own table, not the general one, and the difference is
-the point: "you may look here" and "you may make things here" are different
-promises, and a system directory is only ever the first. (There are four tables
-in all — `general`, `write`, `readonly`, `blocked`; see `lua/lib/ask.lua`.) Every read under `/usr`
-is silent; every write, **create**, delete and move there still asks. That last
-one is why it cannot be a plain `trust` — a create is otherwise silent by design,
-and a read-only grant that let the agent quietly drop a file into `/usr` would not
-be read-only at all. A *working directory* is granted with plain `trust`, so work
-in a repository still creates quietly, which is the point of a working directory.
+`trust_readonly` is its own table rather than the general one, and the difference
+is the point: "you may look here" and "you may make things here" are different
+promises, and a system directory is only ever the first. Every read under `/usr` is
+silent; every write, **create**, delete and move there still asks. That last one is
+why it cannot be a plain `trust` — a create is otherwise silent by design, so a
+read-only grant that let the agent quietly drop a file into `/usr` would not be
+read-only at all. A *working directory* is granted with plain `trust`, so work in a
+repository still creates quietly, which is the point of a working directory.
 
-`/etc/ld.so.preload` is deliberately **not** granted. It is the file that decides
-what gets loaded into every process, so trusting it would mean trusting whatever
-it names, and those names are not the loader's to hold.
+`/etc/ld.so.preload` is deliberately **not** granted: it decides what gets loaded
+into every process, so trusting it would mean trusting whatever it names.
 
-There is a **blocklist** as well as the three trust tables, and it is what makes
-the others composable. A directory grant covers its whole subtree, so trusting
-the working directory trusts every file in it — and without a negative there is
-no way to take one back:
+`block` is what makes the grants composable — a directory grant covers its whole
+subtree, and without a negative there is no way to take one back:
 
 ```lua
 agent.ask.trust(cwd)              -- the project, quietly
@@ -355,63 +403,127 @@ agent.ask.block(cwd .. "/.env")   -- except this
 agent.ask.block(cwd .. "/.git")   -- and this whole tree
 ```
 
-A block is a **preference, not a one-way door**: `trust` on a path that carries
-a block of its own lifts the block and grants, so changing your mind is just
-trusting it again. But *exact* is the load-bearing word. A block on a **directory**
-is a statement about a tree, so naming something inside it does not lift it —
-`block("/a")` then `trust("/a/b")` is refused, because the only way to say "not
-in this tree" is to say it about the tree. Lift the directory block, or grant the
-directory.
+A block is a **preference, not a one-way door**: `trust` on a path that carries a
+block of its own lifts the block and grants, so changing your mind is just trusting
+it again. But *exact* is the load-bearing word — a block on a **directory** is a
+statement about a tree, so naming something inside it does not lift it. `unblock`
+is the explicit spelling of the same lift, and `forget(path)` reaches the same
+place. One asymmetry worth knowing: a block also stops the policy's *create* rule
+from silently trusting a new name, so the agent cannot un-block a path you
+excluded by creating a file at it.
 
-`unblock` is the explicit spelling of the same lift, and either way the enclosing
-grant was never revoked — only stood in front of. `forget(path)` reaches the same
-place: given a path with no grant of its own but covered by a directory that has
-one, it blocks it rather than dropping nothing. Calling `forget` twice leaves
-nothing behind.
+The working directory is trusted at startup. `forget` takes a grant back,
+`forget_write` the write half only, `forget_readonly` the read-only one, and
+`forget_all` empties every table. Each is listed by `trusted_paths`,
+`trusted_write_paths`, `trusted_readonly_paths` and `blocked_paths`.
 
-One asymmetry worth knowing: a block also stops the policy's *create* rule from
-silently trusting a new name, so the agent cannot un-block a path you excluded by
-creating a file at it. The automatic grant stays out of it; only a `trust` in your
-config lifts a block.
+---
 
-The working directory is trusted at startup, so work inside a repository asks
-nothing. `forget` takes a grant back, `forget_write` the write half only,
-`forget_readonly` the read-only one, and `forget_all` empties every table. Each
-is listed by `trusted_paths`, `trusted_write_paths`, `trusted_readonly_paths` and
-`blocked_paths`.
-
-## What the sandbox is
+## The sandbox
 
 It is a **syscall filter that asks**, and calling it a jail would be a lie about
-what it does. A command runs as a plain `fork()` of the agent — no namespaces,
-no chroot, no dropped capabilities — and every syscall the policy names is
+what it does. A command runs as a plain `fork()` of the agent — no namespaces, no
+chroot, no dropped capabilities — and every syscall the policy names is
 intercepted, decoded, and put to you before it runs.
 
-The mechanics, stated so there is nothing to discover later:
+```
+openat  unlinkat  renameat  renameat2  chmod  fchmodat
+setxattr  lsetxattr  removexattr  lremovexattr  connect  bind  sendto
+```
 
 - **Anything not named in the policy is not intercepted at all.** The policy's
   keys *are* the mask, so a syscall nobody named runs straight through the kernel
-  under its default (allow) and never reaches a callback. The shipped policy is
-  the [thirteen above](#what-is-here); each is a decision, and the absences are
-  decisions too — `mkdirat` and `rmdir` are left out on purpose, while
-  `linkat` and `symlinkat` are a real gap rather than a decision, and say so in
-  `lua/policy.lua`.
-- **`agent.http` and `agent.mcp` are not syscalls.** They are bridge primitives
-  in the agent process, so no filter and no question stands between a tool and
-  the network through them. Only a command inside a sandboxed run is gated.
+  under its default (allow) and never reaches a callback. Each of the thirteen is a
+  decision, and the absences are decisions too: `mkdirat` and `rmdir` are left out
+  on purpose, while `linkat` and `symlinkat` are a **real gap** rather than a
+  decision, and say so in `lua/policy.lua`.
+- **`agent.http` and `agent.mcp` are not syscalls** — see
+  [Security model](#security-model).
 - **A denied syscall kills the tracee.** That is the enforcement, and it is
   coarse: the whole run ends, not just the call.
-- **The network stays shared.** No `unshare(CLONE_NEWNET)`, so a sandboxed
-  command is in the host's network namespace: `ss` lists every listener, and
-  anything on `127.0.0.1` it can guess is reachable. Gating `connect` makes you
-  the one who decides, not the gate.
+- **The network stays shared.** No `unshare(CLONE_NEWNET)`.
 
-What it does give, and the reason to want it: a real kernel-level floor under
-every decision *you* make, the arguments of a frozen syscall read out of the
-process — including the `struct sockaddr` of a `connect`, so a question can name
-the host and the port rather than just "a connection" — and a prompt with three
-answers, so the decision is yours and stays yours until you revoke it.
+What it does give, and the reason to want it: a real kernel-level floor under every
+decision *you* make, the arguments of a frozen syscall read out of the process —
+including the `struct sockaddr` of a `connect`, so a question can name the host
+and the port rather than just "a connection" — and a prompt with three answers, so
+the decision is yours and stays yours until you revoke it.
 
-In one line: **it moves the decision to you at the moment it matters, and gets
-out of the way.** It does not make the decision for you, and it is not trying to
-be the only thing between the command and the machine.
+In one line: **it moves the decision to you at the moment it matters, and gets out
+of the way.**
+
+---
+
+## Project layout
+
+```
+src/
+  main.rs            the agent binary: the TUI, the event loop, tool rounds
+  api.rs             chat-completions client — SSE parsing, turn accounting
+  seccomp/           the user-notify engine and the x86-64 syscall tables
+  lua/               the `agent` namespace
+    mod.rs             the contract: what Lua may see and do
+    vm.rs  tree.rs     building a VM; assembling it from the shipped lua/
+    bridge.rs          the agent.api table and the lock that guards it
+    sandbox.rs         the seccomp primitives and the /proc introspection
+    config.rs run.rs   the agent.llm surface; a tool call as a coroutine
+    memory.rs usage.rs the two small bindings
+    tests/             split by shipped Lua surface, not by module
+  tui/               the screen shell, the transcript, the markdown highlighter
+  mcp.rs panels.rs    MCP transports; the Lua→TUI panel op stream
+lua/                 everything a user would want to change
+  init.lua           the starter configuration, seeded to ~/.config on first run
+  fs.lua  bash_tool.lua  policy.lua  coding.lua  compact.lua  mcps.lua
+  lib/*.lua          auto-required, each publishing itself on `agent`
+scripts/             the gate
+```
+
+A tool is a connection and `agent.mcps` is the registry of them. The registry is
+the whole of what the agent can do — nothing is hard-coded in Rust, and what
+nobody registers does not exist.
+
+---
+
+## Development
+
+```sh
+cargo test && ./scripts/verify-sandbox.sh
+```
+
+`verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
+fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
+`src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
+the check that the sandbox is still there at all. The suite is 375 library tests
+and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
+compiler (`-- --ignored` runs them).
+
+Other binaries, for narrower jobs: `chat` (a terminal setup demo, no Lua),
+`grammar_probe` (fetch the four grammars the TUI preloads and parse a sample
+with three of them), `mcp_fake` (a reference MCP server), `sandbox` (drive one
+sandboxed run directly).
+
+---
+
+## Status
+
+Work in progress, and honest about the edges:
+
+- **Nobody has run this end to end against a real model yet.** Everything is
+  green because it is hermetically tested; the integration is not.
+- **`linkat` and `symlinkat` are ungated.** A real gap in the policy, not a
+  decision — the sandbox engine resolves the paths, the policy just does not ask.
+- **`fchmod` is ungated**, and cannot be asked about: it names a descriptor, not
+  a path, and a question needs something to name. Reaching it means the process
+  already holds an open descriptor — which cost read or write trust when it
+  opened it. So read-trust on a path currently implies being able to make that
+  file executable, via `fchmod`. The path-based `fchmodat` *is* gated; closing
+  this would need the engine to resolve an fd to a path through
+  `/proc/<pid>/fd`, which is real work and a design decision rather than a policy
+  key.
+- **Grammars are fetched and compiled at runtime**, which means a first run on a
+  cold cache needs a network and a working `cc`.
+- **No release packaging.** `cargo run` and a config file is the whole install.
+
+`RESEARCH-AGENT-EXTENSIBILITY.md` is a dated research brief on how other agents
+handle extensibility and sandboxing, kept as the record of *why* the design looks
+the way it does. It is not the documentation — this file and the module docs are.
