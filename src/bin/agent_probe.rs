@@ -34,11 +34,7 @@
 //! (it returns `false` inside handlers): check it if your compaction handler
 //! depends on the write side.
 
-#[path = "../api.rs"]
-mod api;
-#[path = "../tools.rs"]
-mod tools;
-
+use agent::api;
 use anyhow::Result;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -142,7 +138,7 @@ async fn main() -> Result<()> {
     // The tool catalog is the Lua registry, reindexed exactly as the TUI does
     // per request: whatever the configuration registered.
     let tool_defs = agent::lua::mcps_tool_defs(&vm)
-        .map(tools::adopt_mcp_tools)
+        .map(agent::tools::adopt_mcp_tools)
         .unwrap_or_default();
     let chat = api::Chat::connect(&config, tool_defs);
     let offered: std::collections::HashSet<String> = chat

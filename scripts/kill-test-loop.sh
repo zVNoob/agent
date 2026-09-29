@@ -7,13 +7,18 @@
 # runtime inside the ioctl). Run them repeatedly to catch any regression that
 # re-introduces an intermittently starved reactor.
 #
+# These live in `seccomp`, not in the tokio readiness adapter that used to hold
+# them: the shipped design drives a sandbox cooperatively as a Lua coroutine
+# (see `src/lua.rs`, `ToolRun`), so the timer the starvation hit is the loop's.
+#
 # Usage: scripts/kill-test-loop.sh [N]      (default N=5)
 set -euo pipefail
 
 N="${1:-5}"
 TESTS=(
-  async_sandbox::tests::kill_handle_interrupts_a_running_tree_promptly
-  async_sandbox::tests::kill_during_a_frozen_ask_terminates_promptly
+  seccomp::tests::a_handle_stops_its_own_run_and_the_result_says_so
+  seccomp::tests::a_request_reaches_only_the_run_whose_handle_it_came_from
+  seccomp::tests::a_later_run_cannot_see_an_earlier_runs_request
 )
 
 for i in $(seq 1 "$N"); do

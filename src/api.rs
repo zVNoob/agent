@@ -136,21 +136,21 @@ impl Turn {
     /// `predicted_n`). `None` on a half the server did not mention, and both
     /// `None` when it mentioned neither — which is what `agent.llm.usage.reported`
     /// says to Lua.
-    pub fn tokens(&self) -> agent::lua::Usage {
+    pub fn tokens(&self) -> crate::lua::Usage {
         let n = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64);
         if let Some(u) = &self.usage {
-            return agent::lua::Usage {
+            return crate::lua::Usage {
                 prompt: n(u, "prompt_tokens"),
                 completion: n(u, "completion_tokens"),
             };
         }
         if let Some(t) = &self.timings {
-            return agent::lua::Usage {
+            return crate::lua::Usage {
                 prompt: n(t, "prompt_n"),
                 completion: n(t, "predicted_n"),
             };
         }
-        agent::lua::Usage::default()
+        crate::lua::Usage::default()
     }
 
     /// One-line token/timing summary, if the server reported one. No stdio.
@@ -250,8 +250,6 @@ impl TurnBuilder {
     }
 }
 
-/// Parse one SSE `data:` payload into a list of caller-visible events.
-/// Pure: no printing, no side effects beyond `acc` bookkeeping.
 /// The payload of one SSE `data:` line, or `None` when the line is not one:
 /// a different field, the `[DONE]` sentinel, or an empty payload.
 fn sse_payload(line: &str) -> Option<&str> {
@@ -260,7 +258,12 @@ fn sse_payload(line: &str) -> Option<&str> {
         .filter(|payload| *payload != "[DONE]" && !payload.is_empty())
 }
 
-fn acc_sse(payload: &str, acc: &mut TurnAccState) -> Vec<TurnEvent> {
+/// Turn one SSE `data:` payload into the caller-visible events it carries.
+///
+/// Pure: it parses and nothing else. Accumulation is [`TurnBuilder`]'s job, and
+/// it is the *only* accumulator — this function used to keep a second one
+/// (`TurnAccState`) alongside it, which no production code ever read.
+fn acc_sse(payload: &str) -> Vec<TurnEvent> {
     let mut events = Vec::new();
     let Ok(evt) = serde_json::from_str::<Value>(payload) else {
         return events;
@@ -268,11 +271,9 @@ fn acc_sse(payload: &str, acc: &mut TurnAccState) -> Vec<TurnEvent> {
     let ch = &evt["choices"][0];
 
     if let Some(d) = ch["delta"]["content"].as_str() {
-        acc.content.push_str(d);
         events.push(TurnEvent::Content(d.to_string()));
     }
     if let Some(d) = ch["delta"]["reasoning_content"].as_str() {
-        acc.reasoning.push_str(d);
         events.push(TurnEvent::Reasoning(d.to_string()));
     }
     // Tool calls stream as: delta.tool_calls[i].{index,id,function.name,function.arguments}
@@ -285,58 +286,18 @@ fn acc_sse(payload: &str, acc: &mut TurnAccState) -> Vec<TurnEvent> {
                 arguments: tc["function"]["arguments"].as_str().map(str::to_string),
             };
             if delta.id.is_some() || delta.name.is_some() || delta.arguments.is_some() {
-                acc.note_tool_delta(&delta);
                 events.push(TurnEvent::ToolCallDelta(delta));
             }
         }
     }
     if let Some(u) = evt.get("usage") {
-        acc.usage = Some(u.clone());
         events.push(TurnEvent::Usage(u.clone()));
     }
     // llama.cpp reports timing/token stats in the final chunk instead of `usage`.
     if let Some(t) = evt.get("timings") {
-        acc.timings = Some(t.clone());
         events.push(TurnEvent::Timings(t.clone()));
     }
     events
-}
-
-/// Internal bookkeeping for one SSE stream (feed by `acc_sse`).
-struct TurnAccState {
-    content: String,
-    reasoning: String,
-    tool_calls: Vec<ToolCallAcc>,
-    usage: Option<Value>,
-    timings: Option<Value>,
-}
-
-impl TurnAccState {
-    fn new() -> Self {
-        Self {
-            content: String::new(),
-            reasoning: String::new(),
-            tool_calls: Vec::new(),
-            usage: None,
-            timings: None,
-        }
-    }
-
-    fn note_tool_delta(&mut self, delta: &ToolCallDelta) {
-        while self.tool_calls.len() <= delta.index {
-            self.tool_calls.push(ToolCallAcc::default());
-        }
-        let slot = &mut self.tool_calls[delta.index];
-        if let Some(id) = delta.id.as_ref().filter(|id| !id.is_empty()) {
-            slot.id = id.clone();
-        }
-        if let Some(n) = &delta.name {
-            slot.name = n.clone();
-        }
-        if let Some(a) = &delta.arguments {
-            slot.arguments.push_str(a);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +377,6 @@ impl Chat {
         let events = stream! {
             let mut byte_stream = byte_stream;
             let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
-            let mut acc = TurnAccState::new();
 
             while let Some(chunk) = byte_stream.next().await {
                 let chunk = chunk.context("reading response stream")?;
@@ -424,7 +384,7 @@ impl Chat {
                     if b == b'\n' {
                         let line = String::from_utf8_lossy(&line_buf).trim().to_string();
                         if let Some(payload) = sse_payload(&line) {
-                            for event in acc_sse(payload, &mut acc) {
+                            for event in acc_sse(payload) {
                                 yield Ok(event);
                             }
                         }
@@ -438,7 +398,7 @@ impl Chat {
             if !line_buf.is_empty() {
                 let line = String::from_utf8_lossy(&line_buf).trim().to_string();
                 if let Some(payload) = sse_payload(&line) {
-                    for event in acc_sse(payload, &mut acc) {
+                    for event in acc_sse(payload) {
                         yield Ok(event);
                     }
                 }
@@ -457,49 +417,70 @@ impl Chat {
 mod tests {
     use super::*;
 
-    #[test]
-    fn assembles_content_across_fragments() {
-        let mut acc = TurnAccState::new();
-        acc_sse(r#"{"choices":[{"delta":{"content":"Hel"}}]}"#, &mut acc);
-        acc_sse(r#"{"choices":[{"delta":{"content":"lo"}}]}"#, &mut acc);
-        assert_eq!(acc.content, "Hello");
+    /// Parse SSE payloads into a finished [`Turn`], the way the loop does:
+    /// every event `acc_sse` produces, through `TurnBuilder`, and nothing else.
+    /// A test that fed a second accumulator instead would prove a path the
+    /// product never takes.
+    fn turn_of(payloads: &[&str]) -> Turn {
+        let mut builder = TurnBuilder::new();
+        for payload in payloads {
+            for event in acc_sse(payload) {
+                builder.apply(event);
+            }
+        }
+        builder.finish()
     }
 
     #[test]
-    fn collects_reasoning_separately() {
-        let mut acc = TurnAccState::new();
-        acc_sse(
+    fn assembles_content_across_fragments() {
+        let turn = turn_of(&[
+            r#"{"choices":[{"delta":{"content":"Hel"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"lo"}}]}"#,
+        ]);
+        assert_eq!(turn.content, "Hello");
+    }
+
+    /// Reasoning is *surfaced* but not *kept*: it is drawn live and never
+    /// enters conversation history, so [`TurnBuilder::apply`] drops it. Pinned
+    /// because the events still have to arrive — the reasoning block is drawn
+    /// from the stream, not from the finished turn.
+    #[test]
+    fn reasoning_reaches_the_caller_but_never_the_turn() {
+        let mut seen = Vec::new();
+        for event in acc_sse(r#"{"choices":[{"delta":{"reasoning_content":"think "}}]}"#)
+            .into_iter()
+            .chain(acc_sse(r#"{"choices":[{"delta":{"reasoning_content":"hard"}}]}"#))
+        {
+            if let TurnEvent::Reasoning(d) = &event {
+                seen.push(d.clone());
+            }
+        }
+        assert_eq!(seen, ["think ", "hard"], "the caller sees every fragment");
+
+        let turn = turn_of(&[
             r#"{"choices":[{"delta":{"reasoning_content":"think "}}]}"#,
-            &mut acc,
+            r#"{"choices":[{"delta":{"content":"answer"}}]}"#,
+        ]);
+        assert_eq!(turn.content, "answer", "the answer is kept");
+        assert!(
+            !turn.content.contains("think"),
+            "and the reasoning never leaks into it: {}",
+            turn.content
         );
-        acc_sse(
-            r#"{"choices":[{"delta":{"reasoning_content":"hard"}}]}"#,
-            &mut acc,
-        );
-        assert_eq!(acc.reasoning, "think hard");
-        assert!(acc.content.is_empty());
     }
 
     #[test]
     fn assembles_tool_call_across_deltas() {
-        let mut acc = TurnAccState::new();
-        // id + name arrive on the first delta
-        acc_sse(
+        let turn = turn_of(&[
+            // id + name arrive on the first delta
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"probe_tool","arguments":""}}]}}]}"#,
-            &mut acc,
-        );
-        // arguments arrive as fragments
-        acc_sse(
+            // arguments arrive as fragments
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":"}}]}}]}"#,
-            &mut acc,
-        );
-        acc_sse(
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"4,\"b\":5}"}}]}}]}"#,
-            &mut acc,
-        );
+        ]);
 
-        assert_eq!(acc.tool_calls.len(), 1);
-        let call = &acc.tool_calls[0];
+        assert_eq!(turn.tool_calls.len(), 1);
+        let call = &turn.tool_calls[0];
         assert_eq!(call.id, "call_1");
         assert_eq!(call.name, "probe_tool");
         assert_eq!(call.arguments, r#"{"a":4,"b":5}"#);
@@ -507,17 +488,12 @@ mod tests {
 
     #[test]
     fn tracks_timings_and_usage() {
-        let mut acc = TurnAccState::new();
-        acc_sse(
+        let turn = turn_of(&[
             r#"{"choices":[{"delta":{"content":"x"}}],"usage":{"total_tokens":7}}"#,
-            &mut acc,
-        );
-        acc_sse(
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"timings":{"predicted_n":9}}"#,
-            &mut acc,
-        );
-        assert_eq!(acc.usage.as_ref().unwrap()["total_tokens"], 7);
-        assert_eq!(acc.timings.as_ref().unwrap()["predicted_n"], 9);
+        ]);
+        assert_eq!(turn.usage.as_ref().unwrap()["total_tokens"], 7);
+        assert_eq!(turn.timings.as_ref().unwrap()["predicted_n"], 9);
     }
 
     #[test]
@@ -537,28 +513,42 @@ mod tests {
         assert_eq!(turn.tool_calls[0].arguments, r#"{"a":1,"b":2}"#);
     }
 
+    /// A payload the server never meant for us is dropped, not turned into an
+    /// empty event: an unparseable line, and the `[DONE]` sentinel.
+    #[test]
+    fn unparseable_and_sentinel_lines_yield_nothing() {
+        assert!(acc_sse("not json at all").is_empty());
+        assert!(sse_payload("data: [DONE]").is_none(), "the sentinel is not a payload");
+        assert!(sse_payload("data: ").is_none(), "nor is an empty one");
+        assert!(sse_payload("event: ping").is_none(), "nor another SSE field");
+        assert_eq!(sse_payload("data: {}"), Some("{}"));
+    }
+
     #[test]
     fn stats_survive_event_to_turn_path() {
-        // Regression: stats must ride the event stream, not just `TurnAccState`.
-        let mut acc = TurnAccState::new();
-        let mut events = acc_sse(
+        // Regression: stats must ride the event stream, all the way to the turn
+        // the summary line and `agent.llm.usage` read.
+        let turn = turn_of(&[
             r#"{"choices":[{"delta":{"content":"x"}}],"usage":{"total_tokens":7}}"#,
-            &mut acc,
-        );
-        events.extend(acc_sse(
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"timings":{"predicted_n":9,"predicted_per_second":114.0}}"#,
-            &mut acc,
-        ));
-
-        let mut builder = TurnBuilder::new();
-        for event in events {
-            builder.apply(event);
-        }
-        let turn = builder.finish();
+        ]);
         assert_eq!(turn.usage.as_ref().unwrap()["total_tokens"], 7);
         assert_eq!(turn.timings.as_ref().unwrap()["predicted_n"], 9);
         let summary = turn.summary().unwrap();
         assert!(summary.contains("9 tokens"), "summary was: {summary}");
         assert!(summary.contains("114 tok/s"), "summary was: {summary}");
+
+        // `tokens()` reads whichever dialect the server spoke. This turn carried
+        // an OpenAI `usage` block *and* llama.cpp `timings`; `usage` wins,
+        // and this payload's `total_tokens` is not a count `tokens()` can map,
+        // so both halves are `None` — the shape `agent.llm.usage.reported`
+        // reports as "the server said nothing usable".
+        let usage_only = turn_of(&[
+            r#"{"choices":[{"delta":{"content":"x"}}],"usage":{"prompt_tokens":11,"completion_tokens":4}}"#,
+        ]);
+        let t = usage_only.tokens();
+        assert_eq!(t.prompt, Some(11));
+        assert_eq!(t.completion, Some(4));
+        assert_eq!(turn.tokens(), crate::lua::Usage::default());
     }
 }

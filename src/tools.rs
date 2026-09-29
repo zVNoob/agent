@@ -1,20 +1,21 @@
 //! Tool plumbing shared by the binaries that embed the agent loop.
 //!
 //! There are **no built-in tools**: every tool the model may call is registered
-//! in Lua, in `agent.mcps`, and advertised from there (see
-//! [`adopt_mcp_tools`] and `crate::lua::mcps_tool_defs`). The sandboxed shell
-//! that used to be a `ToolDef` assembled here is `lua/bash_tool.lua` — a
-//! connection like any other, so the registry is the single place that decides
-//! what the agent can do, and a mode that lists no connections has no shell.
+//! in Lua, in `agent.mcps`, and advertised from there (see [`adopt_mcp_tools`]
+//! and [`crate::lua::mcps_tool_defs`]). The sandboxed shell that used to be a
+//! `ToolDef` assembled here is `lua/bash_tool.lua` — a connection like any
+//! other, so the registry is the single place that decides what the agent can
+//! do, and a mode that lists no connections has no shell.
 
 use crate::api::ToolDef;
 
-/// Translate lib-level tools registered in `agent.mcps`
-/// ([`agent::lua::McpToolDef`], reindexed fresh per request — never cached)
-/// into this binary's API [`ToolDef`]s. Dead-code allowed: only the TUI
-/// consumes it.
-#[allow(dead_code)]
-pub fn adopt_mcp_tools(tools: Vec<agent::lua::McpToolDef>) -> Vec<ToolDef> {
+/// Translate the tools registered in Lua in `agent.mcps`
+/// ([`crate::lua::McpToolDef`], reindexed fresh per request — never cached)
+/// into the [`ToolDef`]s the request advertises. One-for-one and in the
+/// registry's own order, because this is the whole catalog: whatever the
+/// registry holds is what the model is shown, and the dispatch gate in the
+/// binaries refuses anything else.
+pub fn adopt_mcp_tools(tools: Vec<crate::lua::McpToolDef>) -> Vec<ToolDef> {
     tools
         .into_iter()
         .map(|t| ToolDef {
@@ -38,7 +39,7 @@ mod tests {
     #[test]
     fn registry_tools_translate_one_for_one() {
         let tools = adopt_mcp_tools(vec![
-            agent::lua::McpToolDef {
+            crate::lua::McpToolDef {
                 name: "bash".into(),
                 description: "run a command".into(),
                 parameters: serde_json::json!({
@@ -47,7 +48,7 @@ mod tests {
                     "required": ["cmdline"],
                 }),
             },
-            agent::lua::McpToolDef {
+            crate::lua::McpToolDef {
                 name: "read".into(),
                 description: "read a file".into(),
                 parameters: serde_json::json!({ "type": "object" }),

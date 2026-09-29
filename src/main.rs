@@ -53,17 +53,11 @@
 //! All server-communicating logic lives in `api`; rendering and interaction
 //! state live in `agent::tui`; the terminal setup mirrors `bin/chat.rs`.
 
-// api.rs is shared, frozen, and included per-binary; from_env is now unused
-// here because the endpoint comes from Lua config (see `main`), so allow it.
-#[allow(dead_code)]
-mod api;
-mod tools;
-
+use agent::api::{Chat, TurnBuilder, TurnEvent, assistant_tool_message};
 use agent::grammars::Catalog;
 use agent::status::StatusKind;
 use agent::tui::{Action, App, Click, Effect, MarkdownHighlighter, Role};
 use anyhow::Result;
-use api::{Chat, TurnBuilder, TurnEvent, assistant_tool_message};
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
@@ -124,7 +118,7 @@ async fn main() -> Result<()> {
         ),
     }
     let llm = agent::lua::llm_config(&config_vm).map_err(anyhow::Error::msg)?;
-    let config = api::ChatConfig {
+    let config = agent::api::ChatConfig {
         base_url: llm.base_url,
         api_key: llm.api_key,
         model: llm.model,
@@ -357,7 +351,7 @@ fn is_submit_key(key: &KeyEvent) -> bool {
 /// Await the in-flight turn's next event (parks forever when no turn is
 /// active — the branch is only polled while `stream.is_some()`).
 async fn next_turn_event(
-    stream: &mut Option<api::TurnStream>,
+    stream: &mut Option<agent::api::TurnStream>,
 ) -> Option<Result<TurnEvent, anyhow::Error>> {
     match stream {
         Some(s) => s.next().await,
@@ -674,8 +668,8 @@ struct PendingQuestion {
 /// reindexed on every call and **never cached in Rust**, so a config edit
 /// (picked up by `/reload`) is advertised on the very next request (see
 /// `agent::lua`'s config section).
-fn tool_defs(vm: &mlua::Lua) -> Result<Vec<api::ToolDef>> {
-    Ok(tools::adopt_mcp_tools(
+fn tool_defs(vm: &mlua::Lua) -> Result<Vec<agent::api::ToolDef>> {
+    Ok(agent::tools::adopt_mcp_tools(
         agent::lua::mcps_tool_defs(vm).map_err(anyhow::Error::msg)?,
     ))
 }
@@ -778,9 +772,9 @@ fn offered_tools(chat: &Chat) -> std::collections::HashSet<String> {
 /// Re-derive the advertised tool list from the live registry before a request
 /// and swap the chat only when the set actually changed (reindexing every
 /// request is what keeps a config edit immediate; the swap is the minimal step
-/// that surfaces the change to the frozen `api::Chat`, which fixes its tools at
+/// that surfaces the change to the frozen [`Chat`], which fixes its tools at
 /// connect time).
-fn refresh_chat_tools(chat: &mut Chat, config: &api::ChatConfig, vm: &mlua::Lua) -> Result<()> {
+fn refresh_chat_tools(chat: &mut Chat, config: &agent::api::ChatConfig, vm: &mlua::Lua) -> Result<()> {
     let tools = tool_defs(vm)?;
     if serde_json::to_string(&tools)? != serde_json::to_string(chat.tools())? {
         *chat = Chat::connect(config, tools);
@@ -1009,7 +1003,7 @@ async fn run<W: Write>(
     lua_rx: &mut mpsc::UnboundedReceiver<agent::lua::AgentCommand>,
     app: &mut App,
     chat: &mut Chat,
-    config: &api::ChatConfig,
+    config: &agent::api::ChatConfig,
     vm: &mlua::Lua,
     catalog: &mut Catalog,
     initial_history: Vec<Value>,
@@ -1021,7 +1015,7 @@ async fn run<W: Write>(
     // watermark; see `save_history`). The replayed prefix already lives in the
     // log, so the watermark starts past it: only *new* messages get archived.
     let mut saved_upto: usize = history.len();
-    let mut stream: Option<api::TurnStream> = None;
+    let mut stream: Option<agent::api::TurnStream> = None;
     let mut builder = TurnBuilder::new();
     let mut tool_rounds: usize = 0;
     // Tool-round state: queued calls (id, name, arguments) still waiting to
