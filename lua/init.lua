@@ -677,7 +677,7 @@ end)
 -- visible pending state and a timeout — neither of which exists yet, so the
 -- armed prefix is invisible. That is the whole of the caveat.
 --
--- Note also that the hint under the input box is built from the three keys Rust
+-- Note also that the hint under the input box is built from the two keys Rust
 -- binds (`KEY_HELP` in `src/tui/mod.rs`), so nothing in `BIND` appears in it.
 -- The agent cannot read this table's shape, and a hint that guessed at it would
 -- be wrong more often than not.

@@ -100,7 +100,7 @@ pub struct Message {
     pub(crate) boxed: Option<String>,
     /// Declared highlighting language (e.g. `"json"`): when set, the
     /// highlighter runs that grammar *directly* on `text` instead of the
-    /// markdown pipeline (see [`PanelOp::SetLang`]). `None` = markdown, the
+    /// markdown pipeline (see [`PanelOp::SetPaneLang`]). `None` = markdown, the
     /// default for every message.
     pub(crate) lang: Option<String>,
     /// When `boxed` is set, whether the box's *content* follows the markup-
@@ -643,7 +643,7 @@ impl TurnPanel {
         msg.dirty = true;
         match highlighter {
             Some(hl) => {
-                // A declared language (SetLang) bypasses the markdown
+                // A declared language (SetPaneLang) bypasses the markdown
                 // pipeline and runs that grammar directly on the text.
                 let h = match msg.lang.as_deref() {
                     Some(lang) => hl.highlight_lang(lang, &msg.text),

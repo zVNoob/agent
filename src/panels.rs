@@ -65,8 +65,12 @@ pub enum PanelOp {
     /// Replace pane `pane` (1-based) of a split panel's text, re-highlighting
     /// the pane with its declared language.
     SetPane { id: u64, pane: usize, text: String },
-    /// Declare pane `pane`'s highlighting language (the direct-grammar path,
-    /// like [`PanelOp::SetLang`]); `None` renders the pane's text plain.
+    /// Declare pane `pane`'s highlighting language: the highlighter runs that
+    /// grammar *directly* on the pane's text instead of the markdown pipeline,
+    /// so it renders syntax-highlighted without a ```lang fence. `None` renders
+    /// the pane's text plain. This is the only declared-language op: a single
+    /// panel has no equivalent, because every shipped tool that shows code
+    /// (`fs.write_file`, `fs.apply_patch`) uses a split panel.
     SetPaneLang {
         id: u64,
         pane: usize,

@@ -4,29 +4,6 @@
 use super::*;
 
 use crate::testutil::{scratch_dir, unique_path};
-    /// A user-style config (loaded via [`apply_config_source`], which is what
-    /// the real file loader runs): tools are whatever the user writes,
-    /// registered into `agent.mcps` directly — there is no mode layer, only
-    /// the primitives (agent.utils.tool, agent.shq, agent.bash).
-    ///
-    /// It is also the worked example of the policy convention: a policy is a
-    /// local table in the file that applies it, because `agent.bash` takes one
-    /// A user's `~/.config/agent/init.lua` has to do what it is for: override
-    /// the endpoint and the prompt, and register connections, all through the
-    /// real loader, with the per-request reindex picking them up.
-    ///
-    /// This used to be a test that read "the example config the repo ships" —
-    /// and had been quietly passing for as long as no such file existed, because
-    /// it returned early when `config_path()` was `None`. The repo ships no
-    /// config; the user writes one. So it is written here instead, and asserted
-    /// through the same path the loader takes.
-    #[test]
-    fn tmp_probe_llm() {
-        let lua = vm();
-        let base: String = lua.load("return tostring(agent.llm.base_url)").eval().unwrap();
-        let shq: String = lua.load("return type(agent.shq)").eval().unwrap();
-        println!("PROBE base_url={base:?} shq={shq:?}");
-    }
 
     /// Two connections offering the *same* tool name are two tools, and the
     /// names the model sees have to say so.
@@ -93,6 +70,18 @@ use crate::testutil::{scratch_dir, unique_path};
         );
     }
 
+    /// A user's `~/.config/agent/init.lua` has to do what it is for: override
+    /// the endpoint and the prompt, and register connections, all through the
+    /// real loader, with the per-request reindex picking them up.
+    ///
+    /// This used to be a test that read "the example config the repo ships" —
+    /// and had been quietly passing for as long as no such file existed, because
+    /// it returned early when the config path was `None`. The repo ships no
+    /// example config; the user writes one. So it is written here instead, and
+    /// asserted through the same path the loader takes.
+    ///
+    /// It is also the worked example of the policy convention: a policy is a
+    /// local table in the file that applies it, because `agent.bash` takes one.
     #[test]
     fn a_user_config_overrides_the_built_ins_and_registers_connections() {
         let lua = new_vm_with_sink(None).expect("vm");

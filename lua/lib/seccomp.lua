@@ -12,33 +12,37 @@
 --   policy.openat = function(sys)
 --     local flags = sc.arg(sys, "openat")        -- the right arg, by name
 --     if sc.is_tty_probe(flags) then return true end
---     if sc.check(sys, "openat", "WRITE") then   -- O_WRONLY or O_RDWR?
+--     if sc.check_sys(sys, "openat", "WRITE") then  -- O_WRONLY or O_RDWR?
 --       return agent.deny("write open denied: " .. sc.describes("openat", flags))
 --     end
 --     return true
 --   end
 --
--- The three functions:
+-- Note the argument order: `check` takes the flags *value*, not the syscall
+-- table, so it can be called on a number that came from anywhere. `check_sys`
+-- is the wrapper that pulls the argument out for you.
 --
---   sc.arg(sys, "openat")              -> the flags argument of that syscall
---   sc.check(sys, "openat", "WRITE")   -> are all the named flags set?
---   sc.check(sys, "openat", {"TRUNCATE", "APPEND"})
---   sc.check(sys, "access", "W")       -> a W_OK access check
---   sc.check(sys, "mmap.prot", "EXEC") -> PROT_EXEC (note: mmap has two
---                                        flag arguments, hence the qualified
---                                        name — "mmap" alone is an error)
+--   sc.arg(sys, "openat")                 -> the flags argument of that syscall
+--   sc.check("openat", flags, "WRITE")    -> are all the named flags set?
+--   sc.check("openat", flags, {"TRUNCATE", "APPEND"})
+--   sc.check("access", mode, "W")         -> a W_OK access check
+--   sc.check("mmap.prot", prot, "EXEC")   -> PROT_EXEC (mmap has two flag
+--                                          arguments, hence the qualified
+--                                          name — "mmap" alone is an error)
 --
---   sc.check_any(sys, "openat", {"TRUNCATE", "APPEND"})  -- any of them?
---   sc.describes(sys, "openat", flags)   -> "O_RDWR|O_CREAT|O_TRUNC"
+--   sc.check_any("openat", flags, {"TRUNCATE", "APPEND"})  -- any of them?
+--   sc.check_sys(sys, "openat", "WRITE")  -- the same, reading the arg for you
+--   sc.describes("openat", flags)         -> "O_RDWR|O_CREAT|O_TRUNC"
 --
--- `sys` may be the syscall table or a bare flags value: `check` is pure and
--- works on the number alone (`sc.check("openat", 2050, "WRITE")`), which is
--- what makes it easy to test and reuse outside a policy.
+-- On the path side, for the `*at` family:
+--
+--   sc.dirfd(sys)        -> the dirfd an `*at` call is relative to, or nil
+--   sc.paths(sys)        -> the C-string arguments, resolved (see below)
 --
 -- The flag vocabularies are plain tables of name -> value (Linux, x86-64
 -- values), so anything this module does not cover is still reachable:
--- `sc.O.O_TMPFILE`, `sc.PROT`, `sc.MAP`, `sc.MS`, `sc.MAY`, `sc.AT`. Bit
--- values of 0 are tested as "the whole value is 0" (how O_RDONLY and
+-- `sc.O.O_TMPFILE`, `sc.PROT`, `sc.MAP`, `sc.MS`, `sc.MAY`, `sc.AT`. A
+-- `flags` value of 0 is tested as "the whole value is 0" (how O_RDONLY and
 -- PROT_NONE read), and any bits left over by `describes` are appended in hex
 -- rather than silently dropped.
 --

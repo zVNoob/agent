@@ -884,7 +884,7 @@ impl MarkdownHighlighter {
 
     /// Highlight `text` directly with the grammar named by `lang` (e.g.
     /// `"json"`), bypassing the markdown pipeline — used by panels whose
-    /// `SetLang` declares the language instead of carrying a ```lang fence.
+    /// `SetPaneLang` declares the language instead of carrying a ```lang fence.
     /// The named grammar's own `highlights.scm` themes the whole body with the
     /// shared capture table, and the ranges come back exact (no injected-tree
     /// offsets). An unloaded or unknown language degrades to plain text.
@@ -1229,15 +1229,15 @@ mod tests {
         assert!(normalize_markdown_injections(other).is_none());
     }
 
-    /// Which fenced-block languages can be highlighted at all.
+    /// Which fenced-block languages get a *preloaded* configuration.
     ///
     /// Block inlining works by the markdown grammar *injecting* the fenced
     /// language's parser into the range of the block, and `tree-sitter-highlight`
-    /// only injects a language it was given a configuration for. So this list is
-    /// the whole of what can be inlined: a ```rust or ```cpp block gets no
-    /// configuration, no injection happens, and the block renders as plain text
-    /// inside an otherwise highlighted message. That is not a bug in the
-    /// injection — it is the boundary of a closed list.
+    /// only injects a language it was given a configuration for. So this list
+    /// decides what is ready at startup, not what is possible: a ```rust or
+    /// ```cpp block is not in it, so nothing is injected and the block renders
+    /// as one flat `markup.raw.block` — still marked as code, but with no
+    /// structure inside (see `an_uninjected_block_still_reads_as_code`).
     ///
     /// Pinned as an exact set, and *not* derived from the catalog, because the
     /// two lists are maintained in different files (`INJECTED` here, `GRAMMARS` in
@@ -1271,22 +1271,14 @@ mod tests {
     /// What an un-injected block actually looks like, which is not what this file
     /// used to claim.
     ///
-    /// The old claim here was "the code inside it is unstyled", and it was wrong
-    /// in a way worth recording. The markdown grammar captures a fenced block
-    /// whole — `markup.raw.block` — whether or not its language is injected, and
-    /// the theme paints a `raw` capture light green. So an un-injected block is a
-    /// *flat* colour, not plain text: it reads as code, and it is the same colour
-    /// as the fence, but there is no structure inside it. That is a better failure
-    /// than plain text would be, and a worse one to diagnose — and it is why
-    /// nothing about this boundary was ever obvious.
+    /// The old claim was "the code inside it is unstyled", and it was wrong in a
+    /// way worth recording: the markdown grammar captures a fenced block whole —
+    /// `markup.raw.block` — whether or not its language is injected, and the theme
+    /// paints a `raw` capture light green. So an un-injected block is a *flat*
+    /// colour, not plain text. It reads as code, and it is the same colour as the
+    /// fence, but there is no structure inside it. That is a better failure than
+    /// plain text would be and a worse one to diagnose.
     ///
-    /// The visual claim needs the markdown grammar, so it is measured in
-    /// `a_grammar_that_arrives_late_is_applied_to_text_already_rendered` (ignored:
-    /// needs the network and a `cc`), which asserts exactly this — one flat colour
-    /// before, more than one after. This test, in its previous form, asserted only
-    /// that a string it had just built contained its own substring: it exercised
-    /// `format!`, not the highlighter, and its name described behaviour it never
-    /// touched.
     /// The capture-name merge, which is the whole of what adding a language costs
     /// every other layer.
     ///

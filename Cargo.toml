@@ -25,7 +25,7 @@ libloading = "0.8"
 flate2 = "1"
 tar = "0.4"
 
-# Lua policy substrate (see `src/seccomp.rs` module docs): the sandbox is
+# Lua policy substrate (see `src/seccomp/mod.rs` module docs): the sandbox is
 # exposed to Lua *only*; LuaJIT is embedded via mlua. `vendored` compiles
 # LuaJIT from source (the C compiler and `make` grammar acquisition already
 # require), so no system LuaJIT install is needed.

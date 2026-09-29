@@ -455,7 +455,7 @@ impl App {
 
     /// Handle one key press, and say what the caller still has to do.
     ///
-    /// With no binding table in play this is just the three keys in `KEY_HELP`;
+    /// With no binding table in play this is just the two keys in `KEY_HELP`;
     /// everything else a config wants to bind, it binds in Lua and the loop calls
     /// [`App::perform`] directly. Anything that is not a command is text —
     /// backspace deletes, a printable character types itself — which is the rule
@@ -909,7 +909,7 @@ mod tests {
         assert!(app.panel.messages.is_empty(), "Enter is not a Rust binding");
     }
 
-    /// The hint names the three, and only the three. A hint that listed a Lua
+    /// The hint names the two, and only the two. A hint that listed a Lua
     /// binding would be a guess, and a wrong guess about which keys work is worse
     /// than a short list.
     #[test]
@@ -1237,7 +1237,7 @@ mod tests {
         assert_eq!(app.perform(Action::ScrollDown), Effect::Continue);
     }
 
-    /// The three keys Rust binds are named by an action each, so the table and
+    /// The two keys Rust binds are named by an action each, so the table and
     /// the action vocabulary cannot drift apart.
     #[test]
     fn the_default_table_names_real_actions_and_the_hint_comes_from_it() {
@@ -1298,6 +1298,20 @@ mod tests {
         );
     }
 
+    /// What an un-injected block actually looks like, which is not what the
+    /// highlighter's own docs used to claim. The old claim was "the code inside
+    /// it is unstyled", and it was wrong in a way worth recording: the markdown
+    /// grammar captures a fenced block whole — `markup.raw.block` — whether or
+    /// not its language is injected, and the theme paints a `raw` capture light
+    /// green. So an un-injected block is a *flat* colour, not plain text. It
+    /// reads as code, and it is the same colour as the fence, but there is no
+    /// structure inside it. That is a better failure than plain text would be and
+    /// a worse one to diagnose.
+    ///
+    /// This test is where that is measured — one flat colour before, more than one
+    /// after — which is why it is worth the `#[ignore]`: the boundary cannot be
+    /// checked without a grammar in hand.
+    ///
     /// Hot loading, end to end: a fenced language with no grammar is *noticed*,
     /// fetched in the background, taken into use, and applied to text that was
     /// already on screen.

@@ -751,6 +751,9 @@ enum GrammarOutcome {
     Failed(String, String),
 }
 
+/// The dispatch gate: a tool call runs only if this request offered that name.
+/// A mode that swapped the registry, a tool nobody registered, and an old call
+/// replayed out of the history all land here.
 fn may_run(name: &str, offered: &std::collections::HashSet<String>) -> Result<(), String> {
     if offered.contains(name) {
         Ok(())
@@ -2043,10 +2046,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The dispatch gate: a tool call runs only if this request offered that
-    /// name. A mode that swapped the registry, a tool nobody registered, and an
-    /// old call replayed out of the history all land here.
-    #[test]
     /// A failed fetch must not wedge the queue.
     ///
     /// This is a regression test, and the bug it pins was in the wiring rather
@@ -2057,6 +2056,7 @@ mod tests {
     /// left the flag set and every grammar behind it unfetched for the rest of the
     /// session. Nothing crashed and nothing was logged as an error; highlighting
     /// just silently stopped improving.
+    #[test]
     fn a_failed_fetch_still_releases_the_queue() {
         let mut q = GrammarQueue::default();
         for lang in ["rust", "python"] {

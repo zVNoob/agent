@@ -31,8 +31,10 @@
 --   * a table — the mode's tool set, replacing what is in force (`compact`
 --     passes an empty one, so that mode has no tools at all);
 --   * the string `"all"` — leave the registry in force and swap only the
---     prompt, so the mode is "whatever tools this session has" (`coding`
---     passes this);
+--     prompt, so the mode is "whatever tools this session has". Nothing ships
+--     using it: `coding` passes `require("mcps")` instead, so the mode names
+--     the shipped registry explicitly rather than whatever happens to be
+--     registered when the mode is written.
 --   * `nil` — the same as an empty table, no tools.
 --
 -- `"all"` is read at switch time, not at registration, so a connection

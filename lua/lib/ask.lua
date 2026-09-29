@@ -57,12 +57,14 @@
 -- ## Ask once, remember afterwards
 --
 -- A sandboxed command opens the same file over and over; asking about each open
--- is the difference between one question and twenty. Two trust tables hold what
--- the user has vouched for, and they answer two different questions:
+-- is the difference between one question and twenty. Four trust tables hold
+-- what the user has vouched for, and they answer different questions:
 --
 --   agent.ask.trust("~/src/vendor")        -- may the agent be here at all?
 --   agent.ask.trust_write("/tmp/scratch")  -- and may it *write* here?
---   agent.ask.is_trusted(p)                -- the general table only
+--   agent.ask.trust_readonly("/usr")       -- may it be *looked at*, and no more?
+--   agent.ask.block("~/.env")              -- never, whatever a grant above says
+--   agent.ask.is_trusted(p)                -- the general and read-only tables
 --   agent.ask.is_write_trusted(p)          -- the write table only
 --
 -- `trust_write` records in **both** tables, because writing implies being
@@ -433,8 +435,9 @@ function M.trust_write(path)
   return full
 end
 
---- May the agent be at this path at all? The general table only — which is what
---- an ask consults, and what a policy asks when the mode bits are not the point.
+--- May the agent be at this path at all? The general table *and* the read-only
+--- one — which is what an ask consults, and what a policy asks when the mode
+--- bits are not the point.
 function M.is_trusted(path)
   if is_blocked(path) then return false end
   -- A read-only grant counts: this is the question "may the agent be *at* this
@@ -506,14 +509,14 @@ function M.trusted_write_paths()
   return listing(trust_tables.write)
 end
 
---- The read-only table, listed in the same shape. The three lists are separate
+--- The read-only table, listed in the same shape. The four lists are separate
 --- on purpose: `trusted_paths()` cannot tell you that `/usr` is a promise not to
 --- write, and that difference is the whole reason it is its own table.
 function M.trusted_readonly_paths()
   return listing(trust_tables.readonly)
 end
 
---- Forget everything, both tables (a test hook, and an escape hatch).
+--- Forget everything, all four tables (a test hook, and an escape hatch).
 function M.forget_all()
   for _, into in pairs(trust_tables) do
     for key in pairs(into) do into[key] = nil end

@@ -23,7 +23,7 @@ use super::vm::{AskAnswer, AskHandler, new_vm_with_ask_from, user_config};
 // ---------------------------------------------------------------------------
 //
 // The agent's configuration lives in Lua, not in environment variables. A
-// user config (`~/.config/agent/init.lua`, see [`config_path`]) is loaded
+// user config (`~/.config/agent/init.lua`, see [`ensure_config`]) is loaded
 // after `lua/init.lua` and can set:
 //
 //   1. the LLM endpoint — `agent.llm = { base_url, model, api_key }`,

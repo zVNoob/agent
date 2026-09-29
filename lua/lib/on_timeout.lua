@@ -10,8 +10,9 @@
 --   agent.on_timeout(1000, fn)            -- wait 1s, then run fn
 --
 -- On a *reactor-driven* coroutine — a `turn_completed` event handler running on
--- the agent's single thread — the wait yields `{ __agent_await = "timeout" }`
--- and the reactor resumes it when its timer fires, so nothing else freezes.
+-- the agent's single thread — the wait yields
+-- `{ __agent_await = "timeout", ms = <the number asked for> }` and the reactor
+-- resumes it when its timer fires, so nothing else freezes.
 -- Anywhere else (a tool thread, the config VM, a test) it falls back to a real
 -- thread sleep through `agent.api.sleep`, then runs `fn`.
 --

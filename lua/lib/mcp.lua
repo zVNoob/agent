@@ -428,7 +428,8 @@ local function connect(name, func, opts)
 
   -- Public streaming tool-call entry point: same shape as `tool(args)`, with
   -- per-round streaming callbacks — `conn:invoke(name, args, callopts)`.
-  -- A tool named "invoke" would shadow it (see the collision note above).
+  -- A tool named "invoke" would shadow this method, because `conn` is a table
+  -- holding the tools and a metatable whose `__index` is this function.
   function conn:invoke(tname, args, callopts)
     return invoke_tool(tname, args, callopts)
   end

@@ -132,7 +132,7 @@ M.tools.bash = agent.utils.tool(
   .. "first — shown as a dialog at the bottom of the result panel, and \"always\" makes that "
   .. "path or endpoint stop asking. The working directory is already trusted, so "
   .. "work there is silent (headless runs deny every ask). Returns stdout/stderr, "
-  .. "the exit status, and the syscall/denied counters.",
+  .. "the exit status, and a denied count.",
   {
     type = "object",
     properties = {
