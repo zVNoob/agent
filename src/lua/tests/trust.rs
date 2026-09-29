@@ -82,8 +82,8 @@ use crate::testutil::scratch_dir;
         let (mut run, step) = ToolRun::start(&lua, "fs.read", &args)
             .expect("start")
             .expect("registered read");
-        let (text, always) = match step {
-            ToolStep::Ask { text, always } => (text, always),
+        let (text, remember) = match step {
+            ToolStep::Ask { text, remember } => (text, remember),
             other => panic!("expected a question, got {other:?}"),
         };
         assert_eq!(
@@ -91,7 +91,11 @@ use crate::testutil::scratch_dir;
             format!("Allow read {}", target.to_string_lossy()),
             "the question names the path"
         );
-        assert!(always, "a file operation can be remembered, so `always` is offered");
+        assert_eq!(
+            remember.as_deref(),
+            Some(ALWAYS_LABEL),
+            "a file operation can be remembered, and says so by name"
+        );
         let step = run
             .answer(verdict_to_lua(
                 &lua,
@@ -124,9 +128,12 @@ use crate::testutil::scratch_dir;
         .expect("register a bare-ask tool");
         let (mut run, step) = ToolRun::start(&lua, "askonce.askonce", "{}").expect("start").unwrap();
         match step {
-            ToolStep::Ask { text, always } => {
+            ToolStep::Ask { text, remember } => {
                 assert_eq!(text, "a question with no path");
-                assert!(!always, "nothing to remember, so no `always`");
+                assert!(
+                    remember.is_none(),
+                    "nothing to remember, so no third answer at all"
+                );
             }
             other => panic!("expected a question, got {other:?}"),
         }

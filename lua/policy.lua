@@ -144,20 +144,22 @@
 --
 -- Everything above except the last two groups is a question about a **thing** —
 -- a path, a host, a port — so it can be matched against a trust table, and an
--- `always` has something to record. The rest ask about a **capability**: the
--- syscall is itself what is being vouched for, and there is no path, host or
--- port in it for a table to hold. Those are asked with `always = false`, which
--- is what makes the dialog read `[y]es · [n]o` instead of
--- `[y]es · [n]o · [a]lways`, and is why they come round again on the next call.
+-- `always` has something to record. Those records outlive the run, because the
+-- file or the host does: trusting `/srv/app` today is still true tomorrow.
 --
--- The repetition is the design rather than a shortfall. An `always` is a
--- promise about a *specific* thing — this file, this host — and it is read back
--- the next time that same thing comes up. For "this program may reach
--- anything" there is nothing to be specific about, so the only honest options
--- are to ask every time or to guess once and remember. Asking costs a prompt
--- per call, paid only by programs that use these at all; guessing would be a
--- grant the user made about a capability they could not name, made invisible
--- from the next question onwards.
+-- The rest ask about a **capability**: the syscall is itself what is being
+-- vouched for, and there is no path, host or port in it for a table to hold. So
+-- `always` is not a flag there but a *string* — `lways this run` — and it is
+-- exactly what it says. The grant is keyed on the sandbox's own id, is the same
+-- for a whole tree however it forks, and ends when that run does.
+--
+-- That scope is the design rather than a limitation, and the wider alternative
+-- was the obvious first cut: a capability table that outlived the run would
+-- answer the *next* command's `io_uring_enter` with no question at all, and
+-- "this program may reach any file" is not a decision anyone makes about a
+-- *program* — the next `bash` is a different program that would inherit it
+-- invisibly. Scoped, the question comes back once per command rather than once
+-- per syscall, which is the honest frequency for a grant that broad.
 --
 -- Where a capability names *another process* — `pidfd_getfd`,
 -- `process_vm_readv`, `process_vm_writev` — its pid is deliberately left out of
@@ -170,7 +172,10 @@
 --
 -- A file question is remembered by the path tables in `agent.ask`
 -- (`ask_trust_read` / `ask_trust_write`); a network question by the
--- trustworthy-server table (`ask_server`): a host, or one `host:port`. Separate
+-- trustworthy-server table (`ask_server`): a host, or one `host:port`. A
+-- capability question is remembered by neither — it is keyed on the run and
+-- dies with it, so it is the one answer here that does not outlive the
+-- question. Separate
 -- tables on purpose — a trusted file is not a trusted peer, and forgetting one
 -- must never forget the other. A plain `yes` is for that one operation; only
 -- `always` is recorded, and both tables live on the agent's own VM, so a grant
@@ -396,28 +401,39 @@ end
 policy.renameat = ask_rename
 policy.renameat2 = ask_rename
 
--- A question about a **capability** rather than a thing: the syscall is what is
--- being vouched for, and there is no path, host or port in it for a trust table
--- to hold or an `always` to record. `for_syscall` builds the description — name,
--- pid, and the tracee's own command line, so the user sees *who* is asking and
--- not only what — and turning `always` off is the one edit, which is exactly
--- the override `ask.for_syscall`'s own docs describe.
+-- One gate per capability, and a *closure* rather than a shared helper call,
+-- because the thing each gate has to remember is keyed by its own name: the
+-- accepted set is a two-level table, and a closure is what keeps each gate
+-- reading only its own row of it. Nothing here is global to the policy table
+-- either — `require("policy")` hands the same table to every call, so any state
+-- captured at load time would be shared by every command, which is exactly what
+-- a per-run grant must not be.
 --
--- Everything routed here also repeats, because `always = false` leaves nothing
--- behind to match against. That is the point, not a shortfall; see "Two kinds
--- of question" in the header.
-local function ask_capability(sys, what)
-  local q = ask.for_syscall(sys, what)
-  -- The path is dropped as well as the flag, and not because there is none
-  -- here: `for_syscall` fills `path` from whatever the engine decoded, and
-  -- `ask` short-circuits to `true` when that path is already trusted. Leaving a
-  -- trusted path in the table would mean the gate answers itself from a grant
-  -- the user made about a *file*, so the invariant "a capability is never
-  -- answered by a path" would hold only for as long as the engine's pathname
-  -- table stays right. Set here instead, where it cannot drift.
-  q.path = nil
-  q.always = false
-  return ask.ask(q)
+-- The loop, and why each step is there:
+--
+--   1. already accepted in *this* run? Then the gate answers itself. This is
+--      the whole of what the grant is for: a program that opens one ring should
+--      be asked once about it, not once per `io_uring_enter` for the rest of the
+--      command. `sys.run` is the sandbox's own id, so the next command asks
+--      again — the grant is scoped to the thing the user actually looked at.
+--   2. otherwise build the question. `for_syscall` fills the description; `path`
+--      is *dropped*, because `ask` short-circuits to `true` on a trusted path
+--      and a grant about a file must not answer a question about a capability
+--      (set here rather than left to the engine's pathname table staying right).
+--   3. `always` is a string rather than a flag, and the string is what the
+--      dialog draws after the `[a]`. "always" would be a lie: a capability
+--      grant cannot outlive the run, so it says `lways this run` and the user
+--      reads the scope at the moment they choose it.
+local function capability_gate(name, what)
+  return function(sys)
+    if ask.capability_granted(name, sys.run) then return true end
+    local q = ask.for_syscall(sys, what)
+    q.path = nil
+    q.always = "lways this run"
+    q.capability = name
+    q.run = sys.run
+    return ask.ask(q)
+  end
 end
 
 -- The ring. All three are asked, and none of them is decoded: the work is in
@@ -431,31 +447,25 @@ end
 -- policy is for. So the second clause is in the sentence rather than in a note
 -- below it: a user who read only the first words would not know what they had
 -- agreed to.
-policy.io_uring_setup = function(sys)
-  return ask_capability(
-    sys, "to create an io_uring event loop, which can then reach any file or " ..
-         "endpoint without asking about it")
-end
-
-policy.io_uring_enter = function(sys)
-  return ask_capability(
-    sys, "to submit work to an io_uring event loop, which can reach any file " ..
-         "or endpoint without asking about it")
-end
-
-policy.io_uring_register = function(sys)
-  return ask_capability(
-    sys, "to register files or buffers with an io_uring event loop, which can " ..
-         "then read and write them without asking about it")
-end
+policy.io_uring_setup = capability_gate(
+  "io_uring_setup",
+  "to create an io_uring event loop, which can then reach any file or endpoint " ..
+  "without asking about it")
+policy.io_uring_enter = capability_gate(
+  "io_uring_enter",
+  "to submit work to an io_uring event loop, which can reach any file or " ..
+  "endpoint without asking about it")
+policy.io_uring_register = capability_gate(
+  "io_uring_register",
+  "to register files or buffers with an io_uring event loop, which can then " ..
+  "read and write them without asking about it")
 
 -- Opening by handle. No path, so nothing for the tables above to hold; and its
 -- `path` argument is not read on purpose, because it is a hint that decides
 -- nothing and naming it would be worse than naming nothing.
-policy.open_by_handle_at = function(sys)
-  return ask_capability(
-    sys, "to open a file by an opaque handle, naming no path at all")
-end
+policy.open_by_handle_at = capability_gate(
+  "open_by_handle_at",
+  "to open a file by an opaque handle, naming no path at all")
 
 -- Taking the handle. This one *does* name a real path, so it is an ordinary
 -- read-trust question: the user is vouching for this file being read, the same
@@ -492,7 +502,7 @@ for name, what in pairs({
   pkey_mprotect = "to change the protection key on a mapping",
   pkey_free = "to free a memory protection key",
 }) do
-  policy[name] = function(sys) return ask_capability(sys, what) end
+  policy[name] = capability_gate(name, what)
 end
 
 return policy

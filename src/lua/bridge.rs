@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use mlua::{Lua, Table};
 
-use crate::panels::{PaneInit, PanelOp, PanelSink};
+use crate::panels::{PaneInit, PanelOp, PanelSink, remember_label};
 
 use super::memory::{lua_memory_append, lua_memory_flush, lua_memory_latest, lua_memory_path};
 use super::run::{lua_ask_user, lua_input_op, lua_trigger, InputOp};
@@ -312,12 +312,15 @@ pub(super) fn install_panel_primitives(
     api.set("panel_overlay", {
         let sink = sink_slot.clone();
         lua.create_function(
-            move |_: &Lua, (id, text, always): (u64, Option<String>, Option<bool>)| {
+            move |_: &Lua, (id, text, always): (u64, Option<String>, mlua::Value)| {
                 if let Some(s) = &*sink.borrow() {
                     s.push(PanelOp::Overlay {
                         id,
                         text,
-                        always: always.unwrap_or(false),
+                        // `always` is widened from a bool to `true | string |
+                        // nil` so a grant that lasts one run can be *called*
+                        // that in the prompt. See `panels::Remember`.
+                        remember: remember_label(&always),
                     });
                 }
                 Ok(())

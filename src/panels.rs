@@ -96,15 +96,53 @@ pub enum PanelOp {
     /// visible and expands a collapsed box; clearing it returns the panel to its
     /// plain boxed rendering when the run resumes.
     ///
-    /// `always` is whether the question had something to remember, and it is
-    /// what decides the key prompt in the dialog's title — `[a]lways` is only
-    /// offered when the answer is one the agent can act on. Ignored when
-    /// clearing.
+    /// `remember` is what the dialog's third answer is called, if it has one —
+    /// see [`Remember`]. A question with nothing to remember does not offer the
+    /// key at all. Ignored when clearing.
     Overlay {
         id: u64,
         text: Option<String>,
-        always: bool,
+        remember: Remember,
     },
+}
+
+/// What a question's third answer is called — `None` when there is no third
+/// answer, which is the case whenever the asking side has nothing to record.
+///
+/// Reached from Lua as `always`, which may be `true`, a string, or absent. `true`
+/// is the plain `[a]lways`, used wherever the grant outlives the question: a
+/// path, a host. A string is the *text drawn after the `[a]`*, and it exists
+/// because some grants are narrower than "always" and must not be labelled as
+/// though they were not — a capability is remembered for the sandbox run it was
+/// accepted in, so it says `lways this run`, and the user reads the limit at the
+/// moment they choose it rather than discovering it later.
+///
+/// The string is the text only: the `[a]` and the brackets belong to the panel,
+/// so no caller can offer a key the handler does not answer, and a caller that
+/// writes the whole label anyway gets the same prompt.
+pub type Remember = Option<String>;
+
+/// The label a plain `always` draws. Named here rather than inlined so the
+/// historical spelling lives in one place.
+pub const ALWAYS_LABEL: &str = "lways";
+
+/// Normalise Lua's `always` into a [`Remember`].
+///
+/// `true` is the plain label; a string is used as written, minus a leading `[a]`
+/// if the caller included it, so `"[a]lways this run"` and `"lways this run"` are
+/// one intent and not two prompts. Everything else — `false`, `nil`, a number —
+/// is no third answer, because a question nobody can record must not offer a
+/// key that records nothing.
+pub fn remember_label(always: &mlua::Value) -> Remember {
+    match always {
+        mlua::Value::Boolean(true) => Some(ALWAYS_LABEL.to_string()),
+        mlua::Value::String(s) => {
+            let text = s.to_string_lossy();
+            let trimmed = text.strip_prefix("[a]").unwrap_or(&text).trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Initialization for one pane of a [`PanelOp::Split`] panel: its caption and

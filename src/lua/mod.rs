@@ -19,11 +19,20 @@
 //! only — this mechanism has no syscall return values, by design):
 //!
 //! ```text
-//! { name = "openat", nr = 257, pid = 1234,
+//! { name = "openat", nr = 257, pid = 1234, run = 7,
 //!   cmdline = "bash -c echo hi > /tmp/x",          -- caller's /proc/<pid>/cmdline
 //!   args = { [1] = <number>, ..., [6] = <number> } }   -- 1-based, lossy f64
 //!   str   = { [2] = "/tmp/x" }   -- C-string args, dereferenced; paths resolved
 //! ```
+//!
+//! `run` identifies **which sandbox** the call arrived in, and is the same for
+//! every syscall in a tree however it forks, and different for every run. It
+//! exists so a policy can scope state to a run: a gate that needs to remember
+//! something for the length of one command — a capability the user accepted,
+//! say — keys that memory on `run` and is answered for the rest of the command
+//! and not one moment longer. It is a counter rather than the root pid because
+//! pids are recycled, and a grant keyed on one would outlive the run that made
+//! it (see `Syscall::run` in `src/seccomp/`).
 //!
 //! `cmdline` is the calling process's `/proc/<pid>/cmdline` — its argv joined
 //! with spaces (the `ps`-style view), `""` when it can't be read (the process

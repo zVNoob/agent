@@ -1258,7 +1258,7 @@ use crate::testutil::scratch_dir;
         sys: &serde_json::Value,
         paths: &[(usize, &str)],
         verdict: &str,
-    ) -> (mlua::Table, mlua::Value) {
+    ) -> (Option<mlua::Table>, mlua::Value) {
         // The syscall table arrives as JSON text and is decoded by the same
         // bridge primitive the Lua side decodes MCP replies with, rather than
         // being spliced into the chunk: a JSON object is not a Lua table, and
@@ -1278,12 +1278,22 @@ use crate::testutil::scratch_dir;
           sys.str[entry[1]] = entry[2]
         end
         -- `verdict_src` is Lua source, so that a call site can say what the user
-        -- pressed — `true`, or `agent.deny("…")` — in the same words the policy
-        -- docs use rather than by hand-building the table.
+        -- pressed — `true`, `agent.deny("…")`, or an allow-and-remember table —
+        -- in the same words the policy docs use rather than by hand-building it.
         local verdict = load("return " .. verdict_src)()
         local co = coroutine.create(function() return gate(sys) end)
         local ok, q = coroutine.resume(co)
         assert(ok, tostring(q))
+        -- A gate that answers itself never yields, and the coroutine simply
+        -- finishes with `true`. That is not a failure mode of the helper: it is
+        -- the thing a granted capability looks like from out here, and the one
+        -- way to tell it from a question that was asked and allowed. So the
+        -- yield and the return are both reported, and which one happened is the
+        -- caller's business to assert.
+        if coroutine.status(co) == "dead" then
+          assert(q == true, "a gate that did not ask returned " .. tostring(q))
+          return nil, q
+        end
         assert(type(q) == "table",
                "the gate asked, and the question was: " .. tostring(q))
         local done, ret = coroutine.resume(co, verdict)
@@ -1291,7 +1301,7 @@ use crate::testutil::scratch_dir;
         return q, ret
     "#,
         )
-        .call::<(mlua::Table, mlua::Value)>((gate, sys.to_string(), str, verdict))
+        .call::<(Option<mlua::Table>, mlua::Value)>((gate, sys.to_string(), str, verdict))
         .expect("gate ran")
     }
 
@@ -1299,13 +1309,31 @@ use crate::testutil::scratch_dir;
     /// and no path anywhere in it. The command line is the ordinary
     /// server-worker shape, which is the point — the question has to be
     /// answerable when the asker is a thread with no argument list.
-    fn ring_call(name: &str) -> serde_json::Value {
+    fn ring_call(name: &str, run: i64) -> serde_json::Value {
         json!({
             "name": name,
             "pid": 4242,
+            "run": run,
             "args": [3, 1, 1, 0, 0, 0],
             "cmdline": "nginx: worker process",
         })
+    }
+
+    /// How many capabilities this VM has granted, across all runs. The measure
+    /// of "did that answer get remembered" for the tables the path grants use.
+    fn granted_capability_count(lua: &mlua::Lua) -> usize {
+        lua.load(
+            r#"
+        local ask = require("ask")
+        local n = 0
+        for _, for_run in pairs(ask.capabilities()) do
+          for _ in pairs(for_run) do n = n + 1 end
+        end
+        return n
+    "#,
+        )
+        .eval()
+        .expect("capability table")
     }
 
     /// An `io_uring` ring is the one gate here added because of what it
@@ -1317,8 +1345,9 @@ use crate::testutil::scratch_dir;
     ///
     ///  - all three entry points are gated, because gating `setup` alone would
     ///    be undone by `enter` and gating `enter` alone by `register`;
-    ///  - none offers `always`, because a ring is not a path and there is no
-    ///    table an "always" could record into;
+    ///  - each names no path, so the path tables cannot answer one of these by
+    ///    themselves — a grant about a file must not answer a question about a
+    ///    capability;
     ///  - each says what allowing it *means*, because "yes" here is not
     ///    permission to do one thing — it is permission to do everything the
     ///    rest of this policy asks about, silently, for as long as the ring
@@ -1329,7 +1358,8 @@ use crate::testutil::scratch_dir;
         prime_the_sandbox(&lua);
 
         for gate in ["io_uring_setup", "io_uring_enter", "io_uring_register"] {
-            let (q, ret) = ask_through_gate(&lua, gate, &ring_call(gate), &[], "true");
+            let (q, ret) = ask_through_gate(&lua, gate, &ring_call(gate, 11), &[], "true");
+            let q = q.expect("the gate asked");
             let description: String = q.get("description").expect("a description");
 
             assert!(
@@ -1347,10 +1377,22 @@ use crate::testutil::scratch_dir;
                  thing that identifies it: {description}"
             );
             assert_eq!(
-                q.get::<Option<bool>>("always").expect("an always field"),
-                Some(false),
-                "{gate} offers no `always`: there is no path or endpoint in a ring \
-                 for one to record"
+                q.get::<String>("always").expect("an always field"),
+                "lways this run",
+                "{gate} names the third answer by its own scope. `lways` would be a \
+                 promise the grant cannot keep: the memory is keyed on the sandbox \
+                 run, so the next command asks again"
+            );
+            assert_eq!(
+                q.get::<String>("capability").expect("a capability field"),
+                gate,
+                "{gate} records under its own name, which is what makes one \
+                 grant silence one gate and not the other two"
+            );
+            assert_eq!(
+                q.get::<i64>("run").expect("a run field"),
+                11,
+                "{gate} carries the run the grant belongs to"
             );
             assert_eq!(
                 q.get::<Option<String>>("path").expect("a path field"),
@@ -1365,40 +1407,113 @@ use crate::testutil::scratch_dir;
         }
     }
 
-    /// A capability gate repeats, because `always = false` leaves nothing to
-    /// match the next call against. That is the design rather than a shortfall,
-    /// and it is asserted as behaviour rather than read off the flag: ask
-    /// twice, allow both times, and both are questions.
+    /// Accepting the risk stops the *flood* without widening anything: within
+    /// one run the gate answers itself, and outside it the gate asks again.
     ///
-    /// Paired with the check that nothing was written down — an "always" with
-    /// nothing to record would be the other half of the same claim.
+    /// Both halves are asserted against behaviour rather than read off a flag,
+    /// because the flag would be satisfied by a design that either forgot
+    /// everything or forgot to scope:
+    ///
+    ///  - a plain `yes` asks again. It is one operation, like any other gate's,
+    ///    and the panel's `[a]` is the way to say more.
+    ///  - an "always" answers itself for the rest of the run — the same run id,
+    ///    and a *different pid*, because a server's worker is not the process
+    ///    that was asked and the grant is meant to cover the tree.
+    ///  - and it stops there: the same capability, one run id later, is asked
+    ///    again. This is the half that matters most and the one a
+    ///    process-unscoped table would fail.
     #[test]
-    fn a_capability_gate_asks_again_and_records_nothing() {
+    fn accepting_a_capability_stops_the_flood_for_that_run_only() {
         let lua = shipped_vm();
         prime_the_sandbox(&lua);
-        let before = trusted_entry_count(&lua);
 
-        let (first, _) = ask_through_gate(&lua, "bpf", &ring_call("bpf"), &[], "true");
-        let (second, _) = ask_through_gate(&lua, "bpf", &ring_call("bpf"), &[], "true");
-
-        let first = first.get::<String>("description").expect("description");
-        let second = second.get::<String>("description").expect("description");
+        // A plain `yes` is one operation.
+        let (q, ret) = ask_through_gate(&lua, "bpf", &ring_call("bpf", 21), &[], "true");
+        let asked = q.expect("a plain yes is still a question");
         assert_eq!(
-            first, second,
-            "the same question, so the second one being asked is a decision and \
-             not a difference in the syscall"
+            asked.get::<String>("description").expect("description"),
+            "bpf (pid 4242) requests to load a program into the kernel \
+             [nginx: worker process]",
+            "and it is about the capability itself, which is the whole of what a \
+             capability gate can name"
         );
         assert!(
-            first.contains("bpf"),
-            "and it is about the capability itself, which is the whole of what a \
-             capability gate can name: {first}"
+            matches!(ret, mlua::Value::Boolean(true)),
+            "allowed: {ret:?}"
+        );
+        let (q, _) = ask_through_gate(&lua, "bpf", &ring_call("bpf", 21), &[], "true");
+        assert_eq!(
+            q.expect("a plain yes is still a question")
+                .get::<String>("description")
+                .expect("description"),
+            asked.get::<String>("description").expect("description"),
+            "a plain yes asks again — the same question, so the second asking is \
+             a decision and not a difference in the syscall"
+        );
+
+        // "Always" answers itself for the rest of the run, across the tree.
+        let (_, granted) = ask_through_gate(&lua, "bpf", &ring_call("bpf", 21), &[], TRUST);
+        assert!(
+            matches!(granted, mlua::Value::Boolean(true)),
+            "the grant is an allow: {granted:?}"
+        );
+        assert_through_gate_allows_silently(&lua, "bpf", &ring_call("bpf", 21));
+        let mut other_worker = ring_call("bpf", 21);
+        other_worker["pid"] = json!(4311);
+        assert_through_gate_allows_silently(&lua, "bpf", &other_worker);
+
+        // …and stops there. A different run is a different command.
+        assert_through_gate_asks(&lua, "bpf", &ring_call("bpf", 22));
+
+        // …and one grant silences one gate, not every gate.
+        assert_through_gate_asks(&lua, "userfaultfd", &ring_call("userfaultfd", 21));
+
+        assert_eq!(
+            granted_capability_count(&lua),
+            1,
+            "exactly one entry, for the one capability that was accepted"
         );
         assert_eq!(
             trusted_entry_count(&lua),
-            before,
-            "and nothing was written down, which is the other half of the same \
-             claim: there is no table a capability gate could record into, so \
-             there is nothing for the next call to match against"
+            trusted_entry_count(&lua),
+            "…and the path tables are untouched: a capability is not a file"
+        );
+    }
+
+    /// The gate returned `true` without raising a question — which is what
+    /// "answers itself" looks like from out here, and the only way to tell it
+    /// from an allow.
+    /// The verdict "allow, and remember it" — the one `AskAnswer::AllowAndTrust`
+    /// becomes (`verdict_to_lua` in `src/lua/config.rs`). Spelled out here so
+    /// the two ends of the protocol cannot drift: a test that granted with a
+    /// different shape would silently test nothing.
+    const TRUST: &str = r#"{ __agent_verdict = "allow", trust = true }"#;
+
+    fn assert_through_gate_allows_silently(lua: &mlua::Lua, gate: &str, sys: &serde_json::Value) {
+        let (q, ret) = ask_through_gate(lua, gate, sys, &[], "true");
+        assert!(
+            q.is_none(),
+            "{gate} should not have asked in run {}, but raised: {:?}",
+            sys["run"],
+            q.and_then(|q| q.get::<String>("description").ok())
+        );
+        assert!(
+            matches!(ret, mlua::Value::Boolean(true)),
+            "{gate} allowed: {ret:?}"
+        );
+    }
+
+    /// The gate raised a question with a description naming `gate`.
+    fn assert_through_gate_asks(lua: &mlua::Lua, gate: &str, sys: &serde_json::Value) {
+        let (q, _) = ask_through_gate(lua, gate, sys, &[], "true");
+        let description: String = q
+            .expect("the gate asked")
+            .get("description")
+            .expect("a description");
+        assert!(
+            description.starts_with(&format!("{gate} (pid ")),
+            "{gate} should have asked in run {}: {description}",
+            sys["run"]
         );
     }
 
@@ -1479,7 +1594,9 @@ use crate::testutil::scratch_dir;
 
         let (q, _) = ask_through_gate(&lua, "open_by_handle_at", &asked, &[(4, path.as_str())], "true");
         assert_eq!(
-            q.get::<Option<String>>("path").expect("a path field"),
+            q.expect("the gate asked")
+                .get::<Option<String>>("path")
+                .expect("a path field"),
             None,
             "the gate dropped the path, so the trust table cannot answer it: the \
              grant above was about reading a file, and this is about an opaque \
@@ -1491,7 +1608,9 @@ use crate::testutil::scratch_dir;
         let other = dir.join("elsewhere").to_string_lossy().to_string();
         let (part, _) = ask_through_gate(&lua, "name_to_handle_at", &named, &[(2, other.as_str())], "true");
         assert_eq!(
-            part.get::<Option<String>>("path").expect("a path field"),
+            part.expect("the gate asked")
+                .get::<Option<String>>("path")
+                .expect("a path field"),
             Some(other),
             "…while its partner does keep the path, which is what makes it a \
              read-trust question instead of a capability one"

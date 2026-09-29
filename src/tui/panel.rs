@@ -42,7 +42,7 @@ use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarStat
 
 use super::highlight::{MarkdownHighlighter, Segment, style_for_spec};
 use super::wrap_lines;
-use crate::panels::PanelOp;
+use crate::panels::{PanelOp, Remember};
 
 /// Cols reserved for the role tag (e.g. `assistant `) at the start of a
 /// message's first row. Continuation rows are indented by the same amount.
@@ -540,14 +540,18 @@ impl TurnPanel {
                 Self::rehighlight_pane(&mut self.highlighter, p);
                 self.messages[idx].dirty = true;
             }
-            PanelOp::Overlay { id, text, always } => {
+            PanelOp::Overlay {
+                id,
+                text,
+                remember,
+            } => {
                 let Some(idx) = self.ensure_panel(id) else {
                     return;
                 };
                 let msg = &mut self.messages[idx];
                 msg.overlay = text.map(|t| Overlay {
                     text: t,
-                    always,
+                    remember: remember.clone(),
                 });
                 msg.dirty = true; // the overlay adds rows inside the box
                 if msg.overlay.is_some() {
@@ -997,7 +1001,7 @@ impl TurnPanel {
                         // letting it through would fold away the very question
                         // the pointer was aimed at.
                         let offset = col - left - FRAME_COLS - PROMPT_COL;
-                        return match prompt_hit(&overlay_prompt(overlay.always), offset) {
+                        return match prompt_hit(&overlay_prompt(&overlay.remember), offset) {
                             Some(key) => Click::Answer(key),
                             None => Click::Nothing,
                         };
@@ -1149,13 +1153,13 @@ fn fit_title(title: &str, room: usize) -> String {
     format!("{head}…")
 }
 
-/// A pending permission dialog on a boxed message: what is being asked, and
-/// whether the answer has something to remember (which is what offers
-/// `[a]lways`).
+/// A pending permission dialog on a boxed message: what is being asked, and what
+/// its third answer is called — `None` when there is no third answer, which is
+/// whenever the asking side had nothing to record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Overlay {
     pub text: String,
-    pub always: bool,
+    pub remember: Remember,
 }
 
 /// A boxed message's rows, replacing the role tag row: a title border
@@ -1342,13 +1346,19 @@ fn overlay_title(prompt: &str, inner: usize, style: Style) -> Line<'static> {
 /// The key prompt drawn as the dialog's title: the user answers the pending
 /// permission ask with `y` (allow) or `n` (deny) while the sandbox keeps the
 /// asking syscall frozen — and with `a` as well when the question had something
-/// to remember, which is the only case where "always" is an answer the agent
+/// to remember, which is the only case where a third answer is one the agent
 /// can act on rather than a promise it cannot keep.
-fn overlay_prompt(always: bool) -> String {
-    if always {
-        "[y]es \u{00B7} [n]o \u{00B7} [a]lways".to_string()
-    } else {
-        "[y]es \u{00B7} [n]o".to_string()
+///
+/// The third answer's *name* comes from the ask rather than from here, because
+/// not every remembering answer is an "always": a capability is remembered for
+/// the sandbox run it was accepted in, and draws `lways this run` so the limit
+/// is on screen while the choice is being made. The bracket and the `a` are
+/// this function's — the text after them is not, which is what stops a caller
+/// from offering a key the handler does not answer.
+fn overlay_prompt(remember: &Remember) -> String {
+    match remember {
+        None => "[y]es \u{00B7} [n]o".to_string(),
+        Some(label) => format!("[y]es \u{00B7} [n]o \u{00B7} [a]{label}"),
     }
 }
 
@@ -1396,7 +1406,11 @@ fn overlay_rows(msg: &Message, content_w: usize) -> Vec<Line<'static>> {
     // Mini-panel top border, filled with ─ to the full inner width. The key
     // prompt lives in the title, so it stays on one line and never competes
     // with the description for the row budget below.
-    out.push(overlay_title(&overlay_prompt(overlay.always), inner, title));
+    out.push(overlay_title(
+        &overlay_prompt(&overlay.remember),
+        inner,
+        title,
+    ));
 
     // The dialog's own box is `inner` cells wide, so its body row
     // `│ text │` has to come to `inner` too: four cells of chrome — the two
@@ -1701,6 +1715,7 @@ fn clip_segments(text: &str, segs: &[Segment], bs: usize, be: usize) -> Vec<Span
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::panels::ALWAYS_LABEL;
 
     #[test]
     fn content_height_counts_wrapped_rows() {
@@ -2213,7 +2228,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: Some("The process want to read /etc/hostname".into()),
-            always: true,
+            remember: Some(ALWAYS_LABEL.into()),
         });
         let rows = show(&panel);
         assert!(dialog_for(&rows, "/etc/hostname"), "panel 1's own: {rows:?}");
@@ -2229,13 +2244,13 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: None,
-            always: false,
+            remember: None,
         });
         // Panel 2 now asks, and the two never overlap.
         panel.apply_op(PanelOp::Overlay {
             id: 2,
             text: Some("The process want to read /etc/hosts".into()),
-            always: true,
+            remember: Some(ALWAYS_LABEL.into()),
         });
         let rows = show(&panel);
         assert!(
@@ -2254,7 +2269,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 2,
             text: None,
-            always: false,
+            remember: None,
         });
         let rows = show(&panel);
         assert_eq!(
@@ -2291,7 +2306,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: Some("The process want to read /etc/hostname".into()),
-            always: true,
+            remember: Some(ALWAYS_LABEL.into()),
         });
         assert_eq!(
             panel.messages.len(),
@@ -2354,7 +2369,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: Some("The process want to read /etc/hosts".into()),
-            always: true,
+            remember: Some(ALWAYS_LABEL.into()),
         });
         assert_eq!(panel.messages.len(), 1, "still one message");
 
@@ -2373,7 +2388,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: None,
-            always: false,
+            remember: None,
         });
         let shown = render(&panel);
         assert!(
@@ -2406,7 +2421,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: Some("The process want to reach example.com".into()),
-            always: false,
+            remember: None,
         });
         let flat: String = BorderedRenderer::lines(&panel.messages, 52, true)
             .iter()
@@ -2534,7 +2549,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: Some(desc.into()),
-            always: true,
+            remember: Some(ALWAYS_LABEL.into()),
         });
         assert_eq!(panel.messages.len(), 1);
         assert!(
@@ -2588,7 +2603,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: Some(desc.into()),
-            always: true,
+            remember: Some(ALWAYS_LABEL.into()),
         });
         assert!(
             !panel.messages[0].collapsed,
@@ -2600,7 +2615,7 @@ mod tests {
         );
 
         // Clearing the overlay returns the box to its plain rows.
-        panel.apply_op(PanelOp::Overlay { id: 1, text: None, always: false });
+        panel.apply_op(PanelOp::Overlay { id: 1, text: None, remember: None });
         let m = &panel.messages[0];
         assert!(m.overlay.is_none());
         let inner = content_w.saturating_sub(4);
@@ -3314,7 +3329,7 @@ mod tests {
         let mut m = split_msg();
         m.overlay = Some(Overlay {
             text: "applying…".into(),
-            always: false,
+            remember: None,
         });
         let lines = BorderedRenderer::lines(std::slice::from_ref(&m), 80, true);
         assert_eq!(
@@ -3367,7 +3382,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: Some("The process want to read /etc/hostname".into()),
-            always: true,
+            remember: Some(ALWAYS_LABEL.into()),
         });
 
         // The same render path the frame uses, so the columns below are the
@@ -3453,7 +3468,7 @@ mod tests {
         panel.apply_op(PanelOp::Overlay {
             id: 1,
             text: Some("The process want to list /home".into()),
-            always: false,
+            remember: None,
         });
         // The same render path the frame uses, so the columns below are the
         // columns on screen.
@@ -3508,7 +3523,7 @@ mod tests {
             PanelOp::Overlay {
                 id: 1,
                 text: Some("The process want to read /etc/hostname".into()),
-                always: true,
+                remember: Some(ALWAYS_LABEL.into()),
             },
         ] {
             panel.apply_op(op);
@@ -3554,4 +3569,115 @@ mod tests {
         }
         assert_eq!(prompt_hit("[y]es", 5), None, "past the end of the label");
     }
+
+    /// The third answer is named by the ask, and the name reaches the screen and
+    /// the click target. This is the whole reason `always` is a string: a grant
+    /// that lasts one run must not be drawn as `[a]lways`, and a label that is
+    /// merely longer would shift where the clickable region sits — so both halves
+    /// are checked, the glyphs and the target, and against each other.
+    ///
+    /// A narrower answer is not a smaller one: `lways this run` still answers
+    /// `a`, and clicking it is still `Click::Answer('a')`.
+    #[test]
+    fn a_narrower_grant_is_drawn_and_clicked_under_its_own_name() {
+        const W: usize = 64;
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Create {
+            id: 1,
+            title: "cat /etc/hostname".into(),
+            boxed: true,
+            conceal_box: false,
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "output\n".into(),
+        });
+        panel.apply_op(PanelOp::Overlay {
+            id: 1,
+            text: Some("the process wants an io_uring ring".into()),
+            remember: Some("lways this run".into()),
+        });
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: (W + 1) as u16,
+            height: 30,
+        };
+        // The same render path the frame uses, so the columns below are the
+        // columns on screen.
+        let rows: Vec<String> = BorderedRenderer::lines(&panel.messages, W, true)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let (row, title) = rows
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.contains("[n]o"))
+            .expect("the dialog is on screen");
+
+        assert!(
+            title.contains("[a]lways this run"),
+            "the third answer says what it remembers, not `always`: {title}"
+        );
+        assert!(
+            !title.contains("[a]lways \u{00B7}"),
+            "and it is not the plain one with a note after it, which would be two \
+             answers where there is one: {title}"
+        );
+
+        let col_of = |needle: &str| title[..title.find(needle).expect("drawn")].chars().count();
+        assert_eq!(
+            panel.handle_click(col_of("[a]lways"), row, area),
+            Click::Answer('a'),
+            "the labelled key is the clickable target"
+        );
+        // Past the end of the longer word but still inside the label: the range
+        // has to cover the whole of what was drawn, or a click on the words
+        // answers nothing — which reads as a broken mouse rather than as a
+        // narrower-than-expected target.
+        assert_eq!(
+            panel.handle_click(col_of("[a]lways") + "lways this run".chars().count() - 1, row, area),
+            Click::Answer('a'),
+            "the target covers the label it drew, not just the bracketed letter"
+        );
+        assert_eq!(
+            panel.handle_click(title.chars().count() - 1, row, area),
+            Click::Nothing,
+            "and stops at the end of the prompt, as before"
+        );
+    }
+
+    /// The prompt is derived from the label rather than matched against a fixed
+    /// set of strings, so a label with an interior bracket or a `·` cannot
+    /// produce a prompt whose clickable ranges disagree with its own glyphs.
+    /// Asserted on the labels that are actually in use rather than on the
+    /// function, because that is where the disagreement would show.
+    #[test]
+    fn the_prompt_is_the_label_it_was_given() {
+        assert_eq!(overlay_prompt(&None), "[y]es \u{00B7} [n]o");
+        assert_eq!(
+            overlay_prompt(&Some(ALWAYS_LABEL.into())),
+            "[y]es \u{00B7} [n]o \u{00B7} [a]lways"
+        );
+        assert_eq!(
+            overlay_prompt(&Some("lways this run".into())),
+            "[y]es \u{00B7} [n]o \u{00B7} [a]lways this run"
+        );
+        // Every answer the prompt offers is clickable, whatever the label is.
+        for label in ["lways", "lways this run", "lways until reload"] {
+            let prompt = overlay_prompt(&Some(label.to_string()));
+            for key in ['y', 'n', 'a'] {
+                let at = prompt
+                    .find(&format!("[{key}]"))
+                    .unwrap_or_else(|| panic!("{prompt} offers {key}"));
+                assert_eq!(
+                    prompt_hit(&prompt, at),
+                    Some(key),
+                    "the [{key}] in {prompt} is where it is drawn"
+                );
+            }
+        }
+    }
+
 }

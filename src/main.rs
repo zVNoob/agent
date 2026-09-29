@@ -488,19 +488,21 @@ fn record_verdict(app: &mut App, choice: AskChoice) -> agent::lua::AskAnswer {
 
 /// The three keys that answer a permission question, mapped to the three
 /// answers. `y` and `n` always answer; `a` only answers when the question
-/// offered "always" — otherwise a stray `a` is not an answer to anything, and
-/// treating it as one would remember a path the asking side never offered.
+/// offered a third answer — otherwise a stray `a` is not an answer to anything,
+/// and treating it as one would remember something the asking side never
+/// offered. *Which* third answer is the question's business (`panels::
+/// Remember`); the verdict is the same one either way.
 ///
 /// Returns `None` for any other key: while a question is on screen it is the
 /// only thing that responds, so a keystroke is never mistaken for input text.
 /// The loop's own keys are still live — `Ctrl+c` (stop the command asking) and
 /// `Ctrl+d` (leave) — and a Lua key handler is deliberately *not* consulted
 /// here, so a table cannot redirect a verdict.
-fn ask_choice(code: KeyCode, always: bool) -> Option<AskChoice> {
+fn ask_choice(code: KeyCode, remember: &agent::panels::Remember) -> Option<AskChoice> {
     match code {
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(AskChoice::Yes),
         KeyCode::Char('n') | KeyCode::Char('N') => Some(AskChoice::No),
-        KeyCode::Char('a') | KeyCode::Char('A') if always => Some(AskChoice::Always),
+        KeyCode::Char('a') | KeyCode::Char('A') if remember.is_some() => Some(AskChoice::Always),
         _ => None,
     }
 }
@@ -583,8 +585,8 @@ fn start_next_tool<'lua>(
 /// verdict is left alone, because the user has not decided yet.
 ///
 /// A question becomes [`PendingQuestion`], which the loop draws; the ask's own
-/// `always` flag rides along, and it is what decides whether `[a]lways` is one
-/// of the offered keys.
+/// `always` rides along as the name of the third answer, so a grant with a
+/// narrower life than "always" keeps it and the dialog says so.
 fn advance_tool(
     flight: &mut ToolFlight<'_>,
     verdict: Option<mlua::Value>,
@@ -603,11 +605,11 @@ fn advance_tool(
             }),
             None,
         ),
-        ToolStep::Ask { text, always } => (
+        ToolStep::Ask { text, remember } => (
             None,
             Some(PendingQuestion {
                 text: text.clone(),
-                always: *always,
+                remember: remember.clone(),
             }),
         ),
         // Waiting: nothing to show, and the pulse brings us back.
@@ -664,7 +666,9 @@ fn fold_tool_outcome(
 /// and whether `[a]lways` is one of the answers.
 struct PendingQuestion {
     text: String,
-    always: bool,
+    /// What the third answer is called, if there is one — `panels::Remember`,
+    /// drawn by the panel and consulted here only for whether it is present.
+    remember: agent::panels::Remember,
 }
 
 /// The per-request tool catalog: exactly what the user's `agent.mcps` registry
@@ -1203,7 +1207,7 @@ async fn run<W: Write>(
                     // everything else is ignored until the user decides.
                     // `a` is a verdict only when the question offered "always".
                     if key.kind == KeyEventKind::Press {
-                        match ask_choice(key.code, question.always) {
+                        match ask_choice(key.code, &question.remember) {
                             Some(choice) => {
                                 let answer = record_verdict(app, choice);
                                 pending_verdict = Some(agent::lua::verdict_to_lua(vm, &answer));
@@ -1397,7 +1401,7 @@ async fn run<W: Write>(
                 // careful about when a *permission* can be granted by either.
                 Click::Answer(letter) => {
                     if let Some(question) = pending_question.take() {
-                        match ask_choice(KeyCode::Char(letter), question.always) {
+                        match ask_choice(KeyCode::Char(letter), &question.remember) {
                             Some(choice) => {
                                 let answer = record_verdict(app, choice);
                                 pending_verdict = Some(agent::lua::verdict_to_lua(vm, &answer));
@@ -2233,19 +2237,31 @@ mod tests {
     /// would be read as "yes, and remember" for a question that has nothing to
     /// remember.
     #[test]
-    fn the_ask_keys_offer_always_only_when_the_question_did() {
+    fn the_ask_keys_offer_a_third_answer_only_when_the_question_had_one() {
+        use agent::panels::{ALWAYS_LABEL, Remember};
         use crossterm::event::KeyCode;
-        // Offered: all three.
-        assert_eq!(ask_choice(KeyCode::Char('y'), true), Some(AskChoice::Yes));
-        assert_eq!(ask_choice(KeyCode::Char('n'), true), Some(AskChoice::No));
-        assert_eq!(ask_choice(KeyCode::Char('a'), true), Some(AskChoice::Always));
+        let offered: Remember = Some(ALWAYS_LABEL.to_string());
+        // Offered: all three. What the third one is *called* is the panel's
+        // business, so a run-scoped `lways this run` answers exactly as a plain
+        // `lways` does.
+        assert_eq!(ask_choice(KeyCode::Char('y'), &offered), Some(AskChoice::Yes));
+        assert_eq!(ask_choice(KeyCode::Char('n'), &offered), Some(AskChoice::No));
+        assert_eq!(
+            ask_choice(KeyCode::Char('a'), &offered),
+            Some(AskChoice::Always)
+        );
+        assert_eq!(
+            ask_choice(KeyCode::Char('a'), &Some("lways this run".into())),
+            Some(AskChoice::Always),
+            "a narrower grant is still a grant"
+        );
         // Uppercase too — the answer is not case-sensitive.
-        assert_eq!(ask_choice(KeyCode::Char('A'), true), Some(AskChoice::Always));
-        assert_eq!(ask_choice(KeyCode::Char('Y'), false), Some(AskChoice::Yes));
+        assert_eq!(ask_choice(KeyCode::Char('A'), &offered), Some(AskChoice::Always));
+        assert_eq!(ask_choice(KeyCode::Char('Y'), &None), Some(AskChoice::Yes));
         // Not offered: `a` answers nothing, and neither does anything else —
         // a question on screen must not eat the user's typing.
-        assert_eq!(ask_choice(KeyCode::Char('a'), false), None);
-        assert_eq!(ask_choice(KeyCode::Char('A'), false), None);
+        assert_eq!(ask_choice(KeyCode::Char('a'), &None), None);
+        assert_eq!(ask_choice(KeyCode::Char('A'), &None), None);
         for code in [
             KeyCode::Char('x'),
             KeyCode::Enter,
@@ -2253,7 +2269,7 @@ mod tests {
             KeyCode::Up,
             KeyCode::Char('c'),
         ] {
-            assert_eq!(ask_choice(code, true), None, "{code:?} is not an answer");
+            assert_eq!(ask_choice(code, &offered), None, "{code:?} is not an answer");
         }
     }
     /// A tool call is invisible in the transcript: not its arguments, not its

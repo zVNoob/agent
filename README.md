@@ -162,13 +162,15 @@ worth stating precisely:
 - **Trust lasts as long as the process.** A path or endpoint you answer `always`
   to is remembered on the agent's VM, so it holds for every later call and
   survives `/reload` — but not a restart. `agent.ask.forget` and `forget_server`
-  take any of it back at any time.
-- **Allowing a capability is a wider answer than allowing a file.** The gates for
-  `io_uring`, `bpf` and `open_by_handle_at` ask about a capability rather than a
-  thing, so they cannot offer `always` — but a plain `yes` still means the
-  program may now do that, and for a ring it means it may also do everything
-  else this policy asks about, silently, until the run ends. Read the second
-  clause of the question; the first one is the verb.
+  take any of it back at any time. A **capability** is the exception: it lasts
+  one sandbox run, because there is no specific thing about it to outlive
+  anything.
+- **Allowing a capability is a wider answer than allowing a file.** A `yes` on
+  `io_uring` means the program may now do that — and, since a ring can do the
+  file work this policy asks about without asking, that it may also do all of
+  that silently, for the rest of the run. Its third answer says so in its own
+  name (`lways this run`) rather than as a plain `always`, because that is the
+  honest scope. Read the second clause of the question; the first is the verb.
 - **The first run is a flood, by design.** A cold `/bin/cat /dev/null` asks
   dozens of times — once per file: the loader's cache and map, every
   `DT_NEEDED` library, the locale catalogues, and the CPU-variant directories it
@@ -489,15 +491,32 @@ reading the list above for, because each one closes a route around all the other
   memory, the kernel itself. None of them has an argument worth decoding, so
   each is one line in `lua/policy.lua` and one plain question.
 
-Capability questions carry **no `always`**, and so they come round again on the
-next call. That is deliberate, not a shortfall: an `always` is a promise about a
-*specific* thing, and for "this program may reach anything" there is nothing to be
-specific about. Asking each time costs a prompt per call, paid only by programs
-that use these — almost none. Guessing once would be a grant you made about a
-capability you could not name, made invisible from the next question onwards. So
-the question says what a *yes* means, because here it is not permission to do one
-thing: for a ring, it is permission to reach any file or endpoint without asking
-again, for as long as the run lasts.
+Capability questions can be remembered, but only for the sandbox run they were
+accepted in — so their third answer is not `always` but **`lways this run`**, and
+that is what the dialog draws:
+
+```
+┌─ cat /etc/hostname [−] ─────────────────────────────────┐
+│ ┌─ [y]es · [n]o · [a]lways this run ─────────────────┐ │
+│ │ nginx (pid 4242) requests to submit work to an      │ │
+│ │ io_uring event loop, which can reach any file or    │ │
+│ │ endpoint without asking about it [nginx: worker]    │ │
+│ └─────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────┘
+```
+
+`y` is one operation and asks again. `a` answers itself for the rest of *that
+command* — every worker in the tree, however many times — and the next `bash`
+asks afresh. That scope is the design, not a shortfall. An `always` is a promise
+about a *specific* thing, and "this program may reach any file" is not specific
+to anything: kept past the run, it would be inherited silently by the next
+command, which is a different program. A per-run grant costs you one question
+per command instead of one per syscall, and cannot leak past the thing you read.
+
+The id a grant is keyed on is a counter, not the process's pid: one value per
+sandbox for its whole life, never reused. Pids are recycled, so a grant keyed on
+one would outlive the run that made it and be picked up by whatever the kernel
+hands that number to next.
 
 `memfd_secret` is the near miss, and is deliberately **not** gated: glibc uses it
 for the per-thread guard pages behind `MALLOC_TUNABLE_*`, and a gate that fires on
@@ -553,7 +572,7 @@ cargo test && ./scripts/verify-sandbox.sh
 `verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
 fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
 `src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
-the check that the sandbox is still there at all. The suite is 380 library tests
+the check that the sandbox is still there at all. The suite is 384 library tests
 and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
 compiler (`-- --ignored` runs them).
 

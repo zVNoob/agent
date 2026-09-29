@@ -292,9 +292,9 @@ fn drive_on_vm(
                     asked,
                 )
             }
-            ToolStep::Ask { text, always } => {
+            ToolStep::Ask { text, remember } => {
                 asked.push(text.clone());
-                let answer = on_ask(&text, always);
+                let answer = on_ask(&text, remember.is_some());
                 step = run.answer(verdict_to_lua(lua, &answer)).expect("answer");
             }
             ToolStep::Waiting { .. } => step = run.wait().expect("wait"),
@@ -543,7 +543,7 @@ use std::sync::{Arc, Mutex};
 use mlua::{Lua, Table};
 
 use crate::memory::Memory;
-use crate::panels::{PaneInit, PanelOp, PanelSink};
+use crate::panels::{ALWAYS_LABEL, PaneInit, PanelOp, PanelSink, Remember};
 use crate::seccomp::{self, FdSlot, Step, Verdict};
 
 use super::config::{

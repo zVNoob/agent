@@ -795,7 +795,7 @@ mod tests {
     use crate::testutil::unique_path;
     use super::*;
     use crate::lua::InputOp;
-    use crate::panels::PanelOp;
+    use crate::panels::{ALWAYS_LABEL, PanelOp};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1605,7 +1605,7 @@ mod tests {
             PanelOp::Overlay {
                 id: 1,
                 text: Some("The process want to read /etc/hostname".into()),
-                always: true,
+                remember: Some(ALWAYS_LABEL.into()),
             },
         ] {
             app.panel.apply_op(op);

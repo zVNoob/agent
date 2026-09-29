@@ -232,6 +232,9 @@ pub(super) fn syscall_into_table(lua: &Lua, s: &seccomp::Syscall) -> mlua::Resul
     t.set("name", name.as_str())?;
     t.set("nr", s.nr as i64)?;
     t.set("pid", s.pid as i64)?;
+    // Which sandbox this call arrived in — the identity a policy scopes
+    // per-run state to. See `Syscall::run`.
+    t.set("run", s.run as i64)?;
     t.set("cmdline", proc_cmdline(s.pid))?;
     let args = lua.create_table()?;
     // u64 -> f64 is lossy for pointer-sized args; documented in module docs.

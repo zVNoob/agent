@@ -274,7 +274,7 @@ use crate::testutil::scratch_dir;
             .filter(|op| matches!(op, PanelOp::Overlay { .. }))
             .collect();
         assert_eq!(dialogs.len(), 2, "asked, then cleared: {ops:?}");
-        let PanelOp::Overlay { id, text, always } = dialogs[0] else {
+        let PanelOp::Overlay { id, text, remember } = dialogs[0] else {
             unreachable!("filtered above");
         };
         assert_eq!(*id, 1, "on the command's own panel, not another message");
@@ -283,7 +283,11 @@ use crate::testutil::scratch_dir;
             desc.contains("The process want to") && desc.contains('/'),
             "the dialog shows the question and the path it is about: {desc:?}"
         );
-        assert!(*always, "a path can be remembered, so `always` is offered");
+        assert_eq!(
+            remember.as_deref(),
+            Some(ALWAYS_LABEL),
+            "a path can be remembered, and says so by name"
+        );
         let PanelOp::Overlay { text, .. } = dialogs[1] else {
             unreachable!("filtered above");
         };
@@ -603,11 +607,13 @@ use crate::testutil::scratch_dir;
         let dir = scratch_dir("agent-fs-askpanel");
 
         // The panel ids each tool opened, and the overlays asked on them.
-        let overlays = |sink: &PanelSink| -> Vec<(u64, Option<String>, bool)> {
+        let overlays = |sink: &PanelSink| -> Vec<(u64, Option<String>, Remember)> {
             sink.ops()
                 .iter()
                 .filter_map(|op| match op {
-                    PanelOp::Overlay { id, text, always } => Some((*id, text.clone(), *always)),
+                    PanelOp::Overlay { id, text, remember } => {
+                        Some((*id, text.clone(), remember.clone()))
+                    }
                     _ => None,
                 })
                 .collect()
@@ -654,13 +660,15 @@ use crate::testutil::scratch_dir;
             Some(format!("Allow read {path}").as_str()),
             "naming the path being read: {asked:?}"
         );
-        assert!(
-            asked[0].2,
-            "and offering [a]lways, which is what makes the answer rememberable"
+        assert_eq!(
+            asked[0].2.as_deref(),
+            Some(ALWAYS_LABEL),
+            "and offering a third answer by name, which is what makes the answer \
+             rememberable"
         );
         assert_eq!(
             asked[1],
-            (ids[0], None, false),
+            (ids[0], None, None),
             "the dialog is cleared once answered, so it cannot outlive its question"
         );
 
@@ -739,14 +747,18 @@ use crate::testutil::scratch_dir;
             .collect();
         assert_eq!(asked.len(), 1, "the write was asked about: {asked:?}");
         match &asked[0] {
-            PanelOp::Overlay { id, text, always } => {
+            PanelOp::Overlay { id, text, remember } => {
                 assert_eq!(*id, split_id.0, "asked on the patch panel itself");
                 assert_eq!(
                     text.as_deref(),
                     Some(format!("Allow write {path}").as_str()),
                     "naming the file being patched"
                 );
-                assert!(*always, "with [a]lways offered");
+                assert_eq!(
+                    remember.as_deref(),
+                    Some(ALWAYS_LABEL),
+                    "with the third answer offered by name"
+                );
             }
             _ => unreachable!(),
         }

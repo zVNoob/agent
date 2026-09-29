@@ -53,7 +53,7 @@ use super::*;
         second.push(PanelOp::Overlay {
             id: write_id,
             text: Some("Allow write cppreact.hpp".into()),
-            always: true,
+            remember: Some(ALWAYS_LABEL.into()),
         });
         app.drain_panel_ops(&second);
 

@@ -14,6 +14,8 @@ use std::cell::RefCell;
 use mlua::{Lua, Table};
 use tokio::sync::mpsc;
 
+use crate::panels::{Remember, remember_label};
+
 use super::config::{split_qualified};
 use super::vm::{AskAnswer, AskHandler};
 
@@ -25,9 +27,11 @@ use super::vm::{AskAnswer, AskHandler};
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolStep {
     /// The tool asked the user a question. `text` is what the prompt shows and
-    /// `always` is whether it may offer `[a]lways` — Lua's flag, carried
-    /// through untouched. Resume with the verdict (see [`ToolRun::answer`]).
-    Ask { text: String, always: bool },
+    /// `remember` is what its third answer is called, if it has one — Lua's
+    /// `always`, normalised by [`remember_label`] so a grant narrower than
+    /// "always" keeps its own name. Resume with the verdict (see
+    /// [`ToolRun::answer`]).
+    Ask { text: String, remember: Remember },
     /// The tool suspended on a reactor wait: an `agent.on_timeout` inside the
     /// tool, or the sandbox's own cooperative cadence between idle steps (the
     /// drive loop in `lua/lib/bash.lua` yields one every time `agent.api.step`
@@ -162,9 +166,10 @@ pub(super) fn decode_tool_ask(yielded: mlua::Value) -> Result<ToolStep, String> 
                 other => Err(format!("tool: unknown await request {other:?}")),
             };
         }
-        // An ask table: `description` names the question, `always` says whether
-        // the prompt may offer to remember it. Both are optional, because a
-        // hand-built ask may carry neither.
+        // An ask table: `description` names the question, `always` says what the
+        // prompt's third answer is called (`true` for the plain `lways`, a
+        // string for a grant with a narrower life). Both are optional, because
+        // a hand-built ask may carry neither.
         let text = match t.get::<mlua::Value>("description") {
             Ok(mlua::Value::String(s)) => s.to_string_lossy().to_string(),
             Ok(mlua::Value::Nil) | Err(_) => String::new(),
@@ -172,19 +177,22 @@ pub(super) fn decode_tool_ask(yielded: mlua::Value) -> Result<ToolStep, String> 
                 .to_string()
                 .map_err(|e| format!("tool: ask description: {e}"))?,
         };
-        let always = matches!(t.get::<mlua::Value>("always"), Ok(mlua::Value::Boolean(true)));
-        return Ok(ToolStep::Ask { text, always });
+        let remember = match t.get::<mlua::Value>("always") {
+            Ok(v) => remember_label(&v),
+            Err(_) => None,
+        };
+        return Ok(ToolStep::Ask { text, remember });
     }
     // A bare string is the other ask shape: the question, with nothing to
     // remember and so no `[a]lways` on offer.
     match yielded {
         mlua::Value::String(s) => Ok(ToolStep::Ask {
             text: s.to_string_lossy().to_string(),
-            always: false,
+            remember: None,
         }),
         mlua::Value::Nil => Ok(ToolStep::Ask {
             text: String::new(),
-            always: false,
+            remember: None,
         }),
         other => Err(format!(
             "tool yielded an unsupported value {} (only agent.ask and \

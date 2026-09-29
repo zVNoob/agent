@@ -385,9 +385,12 @@ fn drive_blocking(
     loop {
         match step {
             ToolStep::Returned(text) => return Ok(Some((text.clone(), text))),
-            ToolStep::Ask { text, always } => {
+            ToolStep::Ask { text, remember } => {
                 let verdict = match &on_ask {
-                    Some(h) => verdict_to_lua(lua, &h(&text, always)),
+                    // The label is for the prompt; a handler is only ever asked
+                    // whether a third answer exists, so the scope in it is not
+                    // lost — only the drawing of it, which nobody is here for.
+                    Some(h) => verdict_to_lua(lua, &h(&text, remember.is_some())),
                     // Nobody to ask: a tool must never hang on an orphaned
                     // question, so this is a denial.
                     None => mlua::Value::Boolean(false),

@@ -78,14 +78,17 @@ local function run(args)
   -- anywhere in the transcript, and nothing has to guess which panel the
   -- question belongs to.
   --
-  -- `always` decides whether the dialog offers `[a]lways` beside yes and no: a
-  -- question with a path to remember offers it (the `for_syscall` shape the
-  -- shipped policy asks), and one without does not.
+  -- `always` decides whether the dialog offers a third answer beside yes and
+  -- no, and what it is called: `true` for a question with a path or an endpoint
+  -- to remember (the `for_syscall` shape the shipped policy asks), a string for
+  -- one whose remembering is narrower — a capability is remembered for this run
+  -- only and says so, because "always" would be a promise it cannot keep — and
+  -- falsy for a question with nothing to remember at all.
   local r = s:run(function(a)
     local text, always
     if type(a) == "table" then
       text = type(a.description) == "string" and a.description or tostring(a.description)
-      always = a.always == true
+      always = a.always
     else
       text = tostring(a)
     end
