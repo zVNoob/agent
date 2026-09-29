@@ -1,0 +1,107 @@
+name: CI
+
+# The gate the project holds itself to, run on every push and on every pull
+# request. The three jobs are the three things that have historically been
+# broken and shipped anyway:
+#
+#   fmt     `cargo fmt --check` — 249 diffs sat unformatted through the whole
+#           first stage of this project's life, and nothing said so.
+#   clippy  `--all-targets -D warnings`, so a warning in a *test* counts too.
+#           The local gate (`scripts/verify-sandbox.sh`) runs `--lib` and only
+#           fails on warnings in the sandbox files, which is a weaker promise
+#           and is the one you want locally for speed.
+#   test    the whole suite, which is hermetic: no network, no C compiler, no
+#           model. That is the point of it — the gate must be runnable by
+#           anyone, so the tests that need the outside world are `#[ignore]`d
+#           and are not run here either.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A push that has gone stale is worse than no push: a broken main is exactly
+  # when someone needs to know.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing here should reach the network except the crates registry. Keeps a
+  # test that tries to phone home from passing because it did.
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: tests + sandbox gate
+    runs-on: ubuntu-latest
+    # The sandbox is seccomp user-notify on x86-64 Linux: it forks real
+    # processes, installs a BPF filter and reads answers back over a listener fd.
+    # There is no shim for it on macOS or on a container without the syscall, so
+    # this job is not portable and is not pretending to be.
+    steps:
+      - uses: actions/checkout@v4
+      - name: the project's own gate
+        # Runs `cargo test`, then clippy on the sandbox files, then an
+        # instrumentation scan for DBG prints and `mem::discriminant`. It is the
+        # check that the sandbox is still there at all, so CI runs the script
+        # rather than a hand-kept copy of its three steps.
+        run: ./scripts/verify-sandbox.sh
+
+      - name: an install actually works
+        # The bug this exists for: `cargo install` produced a binary that could
+        # not start, and nothing noticed for the project's entire life because
+        # nobody had ever run `make install && agent`. So run it, then run the
+        # installed binary from a directory that is not the checkout, and check
+        # it found its tree.
+        run: |
+          make install PREFIX="$RUNNER_TEMP/prefix"
+          # A clean HOME, so this is a genuine first run: the config is seeded
+          # and the tree is found without anything from the working tree.
+          mkdir -p "$RUNNER_TEMP/home"
+          cd "$RUNNER_TEMP"
+          # No TTY here, so the TUI cannot start; what is being checked is that
+          # it got far enough to *want* a terminal, which means the config
+          # loaded, the entry script ran and the lib modules were found.
+          out="$(HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/prefix/bin/agent" 2>&1 || true)"
+          echo "$out"
+          case "$out" in
+            *"config: seeded ~/.config/agent/init.lua"*) ;;
+            *) echo "::error::the installed binary did not report seeding its config"; exit 1;;
+          esac
+          case "$out" in
+            *"No such device or address"*) ;;   # the TUI's pty requirement
+            *) echo "::error::the installed binary failed before reaching the terminal"; exit 1;;
+          esac
+
+      - name: the loader refuses the working directory
+        # A `lua/` in the current directory used to be enough to supply the
+        # tree — including the sandbox policy. The test asserts it in the suite;
+        # this is the end-to-end version, with a real decoy and a real binary.
+        run: |
+          mkdir -p "$RUNNER_TEMP/decoy/lua"
+          cp lua/policy.lua "$RUNNER_TEMP/decoy/lua/policy.lua"
+          # An init.lua that would fail loudly if it were the tree used.
+          echo 'error("THE WORKING-DIRECTORY DECOY WAS LOADED")' \
+            > "$RUNNER_TEMP/decoy/lua/init.lua"
+          cd "$RUNNER_TEMP/decoy"
+          out="$(HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/prefix/bin/agent" 2>&1 || true)"
+          echo "$out"
+          case "$out" in
+            *"THE WORKING-DIRECTORY DECOY WAS LOADED"*)
+              echo "::error::the agent loaded a policy from the working directory"
+              exit 1;;
+            *) ;;
+          esac

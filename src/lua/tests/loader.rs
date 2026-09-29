@@ -296,10 +296,22 @@ fn a_lua_directory_in_the_working_directory_is_never_the_tree() {
     let found = lua_dir_in(None, Some(dir.join("bin/agent")));
     std::env::set_current_dir(&before).expect("back");
 
+    // **Resolve before comparing.** The fallback this forbids is the bare
+    // relative path `lua`, so comparing it to the absolute decoy path passes
+    // whether or not the fallback is present — the first version of this test did
+    // exactly that and caught nothing. Anchoring the found path to the directory
+    // that was current at the time is what makes the two comparable.
+    let resolved = if found.is_absolute() {
+        found.clone()
+    } else {
+        dir.join(&found)
+    };
     assert_ne!(
-        found,
-        dir.join("lua"),
-        "a tree in the working directory must not be picked up: found {found:?}"
+        resolved.canonicalize().ok(),
+        dir.join("lua").canonicalize().ok(),
+        "a tree in the working directory must not be picked up: the lookup \
+         returned {found:?}, which from {} is the decoy",
+        dir.display()
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
