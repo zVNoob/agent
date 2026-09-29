@@ -9,7 +9,7 @@
 #
 # These live in `seccomp`, not in the tokio readiness adapter that used to hold
 # them: the shipped design drives a sandbox cooperatively as a Lua coroutine
-# (see `src/lua.rs`, `ToolRun`), so the timer the starvation hit is the loop's.
+# (see `src/lua/run.rs`, `ToolRun`), so the timer the starvation hit is the loop's.
 #
 # Usage: scripts/kill-test-loop.sh [N]      (default N=5)
 set -euo pipefail

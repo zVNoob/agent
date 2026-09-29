@@ -342,9 +342,10 @@ local ask = require("ask")
 --- nothing — the loop only remembers that something is outstanding, because the
 --- design assumption was that every ask arrives through `panel:ask` and puts up
 --- its own dialog. So these tools asked a question nobody could see: the agent
---- sat waiting, the input hint still read "Enter sends", and `y` would have
---- answered something invisible. Handing the panel down puts the dialog inside
---- the box that raised it, which is also where the answer belongs.
+--- sat waiting with the input line showing nothing about a pending verdict, and
+--- `y` would have answered something invisible. Handing the panel down puts the
+--- dialog inside the box that raised it, which is also where the answer
+--- belongs.
 ---
 --- Every tool here passes its own panel, so every question here is a dialog
 --- inside the box that raised it. That was not always so: `read_file` and

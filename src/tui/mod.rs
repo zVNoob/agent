@@ -10,13 +10,14 @@
 //! input box below it that grows (and wraps) as you type, capped so the
 //! panel keeps most of the screen, and a one-line status bar along the bottom.
 //! That bar is [`crate::status`] — the row is reserved whether or not there is
-//! anything to say, so the transcript does not jump when something first is —
-//! and it is where grammar progress and Lua's `print` are re-pointed, since a
-//! full-screen terminal has nowhere else for either to go.
+//! anything to say, so the transcript does not jump the first time the bar has
+//! something to say — and it is where grammar progress and Lua's `print` are
+//! re-pointed, since a full-screen terminal has nowhere else for either to go.
 //!
-//! Rendering is on-demand (every event
-//! redraws); the event loop itself lives elsewhere so the TUI can later sit
-//! in the same tokio reactor as the sandboxes (see `src/bin/chat.rs`).
+//! Rendering is on-demand: every event redraws, and an idle session redraws
+//! nothing. The event loop that drives this is not here — it is `src/main.rs`,
+//! on the same current-thread tokio reactor as the sandboxes and the HTTP
+//! tasks, which is why a tool can be mid-flight and the screen still live.
 
 mod highlight;
 mod panel;
@@ -74,7 +75,8 @@ pub struct App {
     submitted: Option<String>,
     /// The bottom status bar. A private, empty line by default, so a `chat.rs`
     /// demo draws a blank row and a test can assert on its own text; the agent
-    /// hands it [`crate::status::line`] via [`App::set_status`].
+    /// hands it [`status_line`](crate::status::status_line) via
+    /// [`App::set_status`].
     status: StatusLine,
 }
 
@@ -165,7 +167,11 @@ pub enum Action {
     Interrupt,
     /// Toggle markup concealment. `Alt+c`.
     Conceal,
-    /// Scroll the transcript one notch. `j`/`k`, the arrows, the wheel.
+    /// Scroll the transcript one notch. `j`/`k` and the arrows, when the config
+    /// binds them. The wheel is *not* this action — `App::handle_mouse` scrolls
+    /// the panel directly, because a wheel notch is a gesture rather than a
+    /// command and routing it through a binding table would make it
+    /// rebindable.
     ScrollUp,
     ScrollDown,
     /// Jump to the start or end of the transcript. `Home`/`End`.

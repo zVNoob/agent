@@ -244,10 +244,10 @@
 //! `agent.panel(title, opts)` returns a handle for driving TUI transcript
 //! panels (`:append`/`:set` text, `:highlight` styled byte regions,
 //! `:clear_regions`) — the primitives underneath are the `agent.api.panel_*`
-//! entry points above. Emitted ops buffer in the round's
-//! [`PanelSink`] and the TUI applies them; with no
-//! sink (headless) they are no-ops. Panels render through the same pipelines
-//! as every other message, so the UI stays the familiar one.
+//! entry points, listed in `src/lua/bridge.rs`. Emitted ops buffer in the
+//! round's [`PanelSink`] and the TUI applies them; with no sink (headless) they
+//! are no-ops. Panels render through the same pipelines as every other message,
+//! so the UI stays the familiar one.
 //!
 //! `agent.split_panel(title, panes)` is the sibling for multi-region panels:
 //! one titled box holds several sub-panels, each with its own text and
@@ -256,8 +256,8 @@
 //! for a Lua `apply_patch`: before/after code renders side-by-side with
 //! tree-sitter running on each pane's own clean text (a unified diff could
 //! never do that — the grammar would choke on its `+`/`-` prefixes).
-//! Underneath this is [`PanelOp::Split`] +
-//! the `_panel_pane_*` primitives, mirroring the single-body `agent.panel`.
+//! Underneath this is [`PanelOp::Split`] plus the `agent.api.panel_pane_*`
+//! primitives, mirroring the single-body `agent.panel`.
 //!
 //! Rust consumers get the same thing in one shot, and it is all Lua: `agent.bash`
 //! (`lua/lib/bash.lua`) runs a sandboxed `bash -c "cmdline"` under a Lua policy

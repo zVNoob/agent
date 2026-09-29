@@ -50,7 +50,6 @@ fn tool_allowed(name: &str, args: &str) -> (serde_json::Value, Vec<String>) {
     call_tool_asking(name, args, AskAnswer::Allow)
 }
 
-/// A fresh LuaJIT VM with the `agent` namespace installed.
 /// One sandboxed run's outcome, as a test sees it: the result table
 /// `agent.bash` returns, decoded. The tool layer (`lua/bash_tool.lua`)
 /// shapes this into the MCP reply the model reads; the tests using this are
@@ -128,6 +127,7 @@ fn run_bash(
     })
 }
 
+/// A fresh LuaJIT VM with the `agent` namespace installed.
 fn vm() -> mlua::Lua {
     new_vm().expect("agent VM")
 }
@@ -441,8 +441,8 @@ fn run_policy_bash_except(
 }
 
 /// The shell the tests below drive *is* the shipped one: `lua/policy.lua` is
-/// the default sandbox policy, so `require("bash_tool")` already runs under
-/// the four gates and there is nothing to install. Asserted here so a change
+/// the default sandbox policy, so `require("bash_tool")` already runs under all
+/// thirteen gated syscalls and there is nothing to install. Asserted here so a change
 /// to the default fails loudly at the point the tests start rather than as a
 /// baffling "asked nothing".
 fn assert_default_shell(lua: &mlua::Lua) {
@@ -466,31 +466,6 @@ fn assert_default_shell(lua: &mlua::Lua) {
     assert_eq!(gates, MASK, "the default policy's mask is exactly this set");
 }
 
-/// The mask is the whole policy: these thirteen syscalls are the ones the
-/// shipped policy decides, and nothing else. A policy that named fewer would silently
-/// `unlinkat` is gated on **write** trust, so `rm` asks — and a path trusted
-/// only for reading is not enough to delete it. The contents are never read
-/// to answer, so the question is about the name and nothing leaks about what
-/// Creating a name nothing holds is **not** a question. Nothing is there to
-/// disturb, and a prompt per created file is how a user learns to stop
-/// reading prompts and start pressing `a`.
-///
-/// The path is then write-trusted, so the edits that follow a create are one
-/// decision rather than one per write. That is the "trust it for writing"
-/// half, and this asserts both: the create is silent, *and* the write that
-/// follows it is. The answer is set to deny throughout, so a silent case is
-/// The system tree is trusted at startup **for reading only**, which is what
-/// makes it safe: a cold command stops asking about libc, the dynamic linker
-/// and the locale files, and every write under there still asks.
-///
-/// The second half is the one that matters and the one a careless grant would
-/// lose, so it is asserted rather than assumed. `/usr` and `/lib` are read
-/// silently; writing *into* them is a question, and so is creating a name
-/// there — the "a create needs no ask" rule is about names nothing holds,
-/// The `/dev` entries that carry nothing are granted: read for the lot, and
-/// write for `/dev/null` alone, because `> /dev/null` is the commonest
-/// redirect there is and asking about it every time is noise.
-///
 /// What the drawing path puts in the transcript, read back off the sink as
 /// one string — `Create` contributes its title, everything else its text.
 fn drawn(sink: &crate::panels::PanelSink) -> String {

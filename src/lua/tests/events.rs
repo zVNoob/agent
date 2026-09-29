@@ -315,16 +315,14 @@ use super::*;
 
     #[test]
     fn trigger_queues_run_turn_commands_on_the_bound_channel() {
-        // One test owns the process-wide trigger channel (OnceLock): assert
-        // the unbound behavior first, then bind and exercise all three
-        // The channel is process-global, and three tests have something to say
-        // about it — so claim it for the whole body rather than binding and
+        // The channel is process-global and two tests have something to say
+        // about it, so claim it for the whole body rather than binding and
         // hoping to be the one that got there first. The guard also proves the
         // slot was free, since it unbinds before binding.
         let loop_channel = claim_trigger_channel();
         assert!(loop_channel.is_empty(), "a claimed channel starts empty");
 
-        // argument shapes.
+        // All three shapes a trigger argument can take.
         let lua = vm();
         apply_config_source(&lua, "").expect("driver");
 

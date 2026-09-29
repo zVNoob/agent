@@ -112,7 +112,9 @@ use super::*;
         assert!(!cwd_resolution_ok("renameat", 3, both_fds), "target, behind an fd");
     }
 
-    /// let a connect — or a `rm` — through, so the set is pinned exactly.
+    /// The shipped policy's mask, checked against the real table rather than
+    /// against a transcription of it: a policy that named fewer would silently
+    /// let a connect — or an `rm`, or a `chmod` — through.
     #[test]
     fn the_default_policy_traps_exactly_thirteen_syscalls() {
         assert_default_shell(&shipped_vm());

@@ -179,9 +179,9 @@ agent.mcps.bash = require("bash_tool")  -- >>> the sandboxed shell
 -- A tool that asks should ask on its own panel — `p:ask("…", true)`. A bare
 -- `agent.ask` / `coroutine.yield` reaches the loop, which remembers that
 -- something is outstanding so a key press can be read as a verdict, and draws
--- *nothing*: the agent sits waiting with the input hint still reading "Enter
--- sends", and `y` would answer something invisible. Every fs tool asks this way,
--- so every fs question is a dialog inside the box that raised it.
+-- *nothing*: the agent sits waiting with the input line showing nothing about a
+-- pending verdict, and `y` would answer something invisible. Every fs tool asks
+-- this way, so every fs question is a dialog inside the box that raised it.
 --
 -- The rule this leaves you: a tool that wants to be seen draws itself, and a
 -- tool that wants to be quiet is quiet. Both are legitimate. Note that *quiet*
@@ -317,19 +317,19 @@ agent.mode.set("coding")   -- >>> the mode the agent starts in
 --
 -- A cold command asks once per shared library it loads and once per locale file
 -- — dozens of questions before it does any work, which is how a user learns to
--- press `a` without reading. The system tree is granted **for reading only**:
+-- press `a` without reading. The system tree is granted **for reading only** —
+-- so with `agent.ask.trust_readonly`, and *not* the plain `trust`:
 --
---   agent.ask.trust("/lib")     -- -> /usr/lib on a merged-/usr system
---   agent.ask.trust("/usr")     -- libraries, binaries, locale, docs
---   agent.ask.trust("/etc/ld.so.cache")
+--   agent.ask.trust_readonly("/lib")         -- -> /usr/lib on a merged-/usr system
+--   agent.ask.trust_readonly("/usr")         -- libraries, binaries, locale, docs
+--   agent.ask.trust_readonly("/etc/ld.so.cache")
 --
--- These go in with `agent.ask.trust_readonly`, which is a *third* table rather
--- than the general one. "You may look here" and "you may make things here" are
--- different promises, and the system tree is only ever the first: a grant that
--- let the agent quietly create a file under `/usr` would not be a read-only
--- grant at all. Keeping them apart is also what lets a *working directory* stay
--- a plain `trust` and keep creating quietly, which is the point of a working
--- directory.
+-- `trust_readonly` is its own table rather than the general one. "You may look
+-- here" and "you may make things here" are different promises, and the system
+-- tree is only ever the first: a grant that let the agent quietly create a file
+-- under `/usr` would not be a read-only grant at all. Keeping them apart is also
+-- what lets a *working directory* stay a plain `trust` and keep creating
+-- quietly, which is the point of a working directory.
 --
 -- So: every read under `/usr` and `/lib` is silent, and every write, create,
 -- delete and move there still asks. `/etc/ld.so.cache` and `/proc/self/maps` earn
@@ -551,8 +551,10 @@ end)
 -- key keeps its default meaning. A name is a shorthand, not the limit — see
 -- "a binding can type" below. The actions are:
 --
+--   "newline"     insert a newline in the input line
 --   "send"        submit the input line
 --   "quit"        leave
+--   "interrupt"   stop the running tool
 --   "conceal"     toggle markup concealment
 --   "scroll_up" / "scroll_down"    scroll the transcript
 --   "top" / "bottom"               jump to the start or end

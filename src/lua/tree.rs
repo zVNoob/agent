@@ -25,12 +25,9 @@ use mlua::{Lua, Table};
 // `require("fs")` finds `lua/fs.lua`, `require("net.http")` finds
 // `lua/lib/net/http.lua` (dots are directories), and `require("net")` finds
 // `lua/lib/net/init.lua`. Only `lib/` is auto-required at setup; a top-level
-// module is pulled in by whoever wants it (the entry script requires `driver`
-// and `api`, a user config requires what it registers — e.g.
-// `agent.mcps.fs = require("fs")`). The still-embedded chunks stay reachable
-// the same way through `package.preload` (see [`driver_module`]), which is how
-// `lua/init.lua` gets `agent.bash` today and how every embedded chunk gets
-// deleted later without touching a single call site.
+// module is pulled in by whoever wants it (the entry script requires what it
+// registers — e.g. `agent.mcps.fs = require("fs")` — and so does a user config
+// that adds a connection of its own).
 //
 // Because every lib module is auto-required, a lib module publishes itself by
 // assigning to the `agent` table — `lua/lib/utils.lua` ends with

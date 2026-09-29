@@ -40,7 +40,7 @@ return {
       { "cmdline", "string", "the command line, run as `bash -c`" },
       { "mask", "table|nil", "syscall names to trap; nil traps nothing" },
     },
-    returns = "handle (userdata) for step/decide/diag/kill/write/close_stdin",
+    returns = "handle (userdata) for step/decide/kill/write/close_stdin",
     see = "agent.bash",
   },
 

@@ -1384,10 +1384,6 @@ impl Sandbox {
         }
     }
 
-    /// Drive this one sandbox to completion, handing asks to `on_ask` and
-    /// forwarding every event to `on_event`. This is [`Supervisor::drive`]
-    /// specialized to a single sandbox: one `poll(2)` over this sandbox's
-    /// live fds, blocking when there's nothing to do, then stepping it.
     /// Act on a pending interrupt request, if there is one; returns whether one
     /// fired.
     ///
@@ -1408,6 +1404,10 @@ impl Sandbox {
         true
     }
 
+    /// Drive this one sandbox to completion, handing asks to `on_ask` and
+    /// forwarding every event to `on_event`. This is [`Supervisor::drive`]
+    /// specialized to a single sandbox: one `poll(2)` over this sandbox's live
+    /// fds, blocking when there is nothing to do, then stepping it.
     pub fn pump<A, E>(&mut self, mut on_ask: A, mut on_event: E) -> Result<SandboxResult>
     where
         A: FnMut(&Syscall) -> Verdict,

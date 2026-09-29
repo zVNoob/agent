@@ -35,7 +35,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 
 /// Bytes needed only in test builds: the fake HTTP server helpers below are
-/// shared with `src/lua.rs` tests.
+/// shared with the `src/lua/tests/` suite.
 #[cfg(test)]
 use std::io::{Read, Write};
 
@@ -726,9 +726,11 @@ fn lua_sse_close(_: &Lua, handle: i64) -> mlua::Result<bool> {
 }
 
 /// `agent.api.sleep(ms)` — block the current Lua thread for `ms` milliseconds.
-/// Internal: the *public* timer is `coroutine.yield({ __agent_await = "timeout", ms = ms, fn)` (driver.lua),
-/// whose non-reactor fallback lands here — a real thread sleep, the old
-/// pump cadence. The reactor-driven coroutine bridge *never* reaches this.
+///
+/// Internal. The *public* timer is `agent.on_timeout(ms, fn)`
+/// (`lua/lib/on_timeout.lua`), which on a reactor-driven coroutine suspends it
+/// and on anything else falls through to this — a real thread sleep, which is
+/// the old pump cadence. The reactor path never reaches here.
 fn lua_sleep(_: &Lua, ms: i64) -> mlua::Result<()> {
     if ms > 0 {
         std::thread::sleep(Duration::from_millis(ms as u64));
@@ -740,9 +742,9 @@ fn lua_sleep(_: &Lua, ms: i64) -> mlua::Result<()> {
 /// the bridge table (`agent.api`): `json_encode(value) -> text`,
 /// `json_decode(text) -> value`, `http_req` / `http_step` / `http_close`,
 /// `sse_open` / `sse_step` / `sse_close`, and `sleep(ms)` — the internal
-/// thread-sleep fallback for the public `coroutine.yield({ __agent_await = "timeout", ms = ms, fn)` timer (see
-/// driver.lua). Each is annotated in `lua/api.lua`; the loader refuses a VM
-/// whose annotations and this table disagree.
+/// thread-sleep fallback for the public `agent.on_timeout` timer. Each is
+/// annotated in `lua/api.lua`; the loader refuses a VM whose annotations and
+/// this table disagree.
 pub fn install_bridge(lua: &Lua, api: &Table) -> mlua::Result<()> {
     api.set("json_encode", lua.create_function(lua_json_encode)?)?;
     api.set("json_decode", lua.create_function(lua_json_decode)?)?;

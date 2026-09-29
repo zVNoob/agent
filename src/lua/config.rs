@@ -85,9 +85,10 @@ use super::vm::{AskAnswer, AskHandler, new_vm_with_ask_from, user_config};
 // The runtime machinery for the Lua configuration — the built-in defaults,
 // which a user's copy then edits — lives in the entry script
 // `lua/init.lua`, which [`load_init`] runs on every VM (so it is always present
-// by the time anything reads `agent.llm`). It requires the driver itself
-// (`require("driver")`) for the `agent.bash` / `agent.memory` half of the
-// namespace; the `agent.*` namespace itself comes from `lua/lib/`. Its
+// by the time anything reads `agent.llm`). It defines the `agent.memory`
+// half of the namespace itself and requires the connections it registers;
+// `agent.bash` and the rest of the `agent.*` namespace come from `lua/lib/`,
+// auto-required before it runs. Its
 // assignments are `or`-guarded, so re-loading never clobbers user values — which
 // is also why a config assigns `agent.llm.<field>` rather than replacing the
 // table: the keys it does not mention (`memory`) have to survive.

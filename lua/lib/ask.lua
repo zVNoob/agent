@@ -124,7 +124,11 @@ local function sc_path(sys)
 end
 
 -- ==========================================================================
--- Trust: two tables, one set of rules
+-- Trust: four tables, one set of rules
+--
+-- `general` and `write` are grants; `readonly` is a narrower grant; `blocked` is
+-- the negative that the other three composable with. The rules below apply to
+-- whichever table an entry is in — what differs is only what an entry *means*.
 --
 -- `path -> { path = <absolute>, dir = <bool> }`. A *file* entry matches that one
 -- path; a *dir* entry matches that path **and every file inside it** — so a file
@@ -144,7 +148,7 @@ end
 -- "trusted at all?", `is_write_trusted` asks "writable?".
 --
 -- The tables live on the agent's own VM, and a tool call runs *on* that VM — a
--- Lua coroutine the event loop steps, `ToolRun` in `src/lua.rs` — so a path
+-- Lua coroutine the event loop steps, `ToolRun` in `src/lua/run.rs` — so a path
 -- trusted while answering one question is remembered by every later call. They
 -- are still per *process*, not per session: they do not outlive the agent, and
 -- `/reload` does not clear them (it reloads the config on the same VM).
@@ -667,7 +671,8 @@ end
 -- a narrower question than "may I be here".
 --
 -- Must be called from inside a coroutine: one `agent.bash` creates for a policy
--- callback, and one `ToolRun` (src/lua.rs) for a tool callback. Anywhere else the
+-- callback, and one `ToolRun` (`src/lua/run.rs`) for a tool callback. Anywhere else
+-- the
 -- yield is refused and this says so.
 --
 -- `panel` is where the question is *drawn*, and it is the whole difference
@@ -676,9 +681,10 @@ end
 -- verdict — and the loop draws nothing, because the design assumption was that
 -- every ask arrives through `panel:ask` and puts its own dialog up. An ask
 -- without a panel therefore asks a question nobody can see: the agent sits
--- waiting, the input hint still reads "Enter sends", and `y` would answer
--- something invisible. That is what the four file tools did, and the shell does
--- not, because `bash_tool.lua` hands `s:run` a handler that asks on its panel.
+-- waiting, the input line carries nothing saying a verdict is what is wanted,
+-- and `y` would answer something invisible. That is what the four file tools
+-- did, and the shell does not, because `bash_tool.lua` hands `s:run` a handler
+-- that asks on its panel.
 local function raise_ask(ask, panel)
   -- A panel that cannot host a dialog (no `ask`) is not a reason to skip the
   -- question — fall through to the bare yield, which is still better than

@@ -6,8 +6,9 @@
 //! runtime-loaded markdown grammar (fenced bash/json and inline formatting
 //! injected), producing styled byte segments — and the concealed marker
 //! ranges — cached on the [`Message`]. Three rendering pipelines consume
-//! them: the original [`TurnPanel::build_lines`] (clips/wraps the segments
-//! against the raw text, untouched), the dedicated [`ChatRenderer`], which
+//! them: the raw path ([`TurnPanel::build_lines_slice`], which clips and wraps
+//! the segments against the raw text, untouched), the dedicated
+//! [`ChatRenderer`], which
 //! when markup conceal is on renders the *display* text (markers hidden)
 //! with the same styles, and the [`BorderedRenderer`], a composition
 //! "subclass" of the base path that frames opted-in messages in a titled
@@ -141,8 +142,8 @@ pub struct Message {
 /// The dedicated chat renderer. With markup conceal enabled (the default) it
 /// renders each message's *display* text (the message minus its concealed
 /// marker ranges) with the cached [`Segment`] styles, so `# Plan` shows as
-/// `Plan` and `` `code` `` as `code`. The original segment path
-/// ([`TurnPanel::build_lines`]) is untouched and handles the off state, so
+/// `Plan` and `` `code` `` as `code`. The raw segment path
+/// ([`TurnPanel::build_lines_slice`]) is untouched and handles the off state, so
 /// the toggle switches between two independent pipelines.
 #[derive(Debug)]
 pub struct ChatRenderer {
@@ -1304,11 +1305,6 @@ fn prompt_hit(prompt: &str, offset: usize) -> Option<char> {
         .map(|(_, _, key)| key)
 }
 
-/// The key prompt drawn as the dialog's title: the user answers the pending
-/// permission ask with `y` (allow) or `n` (deny) while the sandbox keeps the
-/// asking syscall frozen — and with `a` as well when the question had something
-/// to remember, which is the only case where "always" is an answer the agent
-/// can act on rather than a promise it cannot keep.
 /// The dialog's top border, carrying the key prompt in its title.
 ///
 /// The bracketed letters are underlined, because they are clickable as well as
@@ -1343,6 +1339,11 @@ fn overlay_title(prompt: &str, inner: usize, style: Style) -> Line<'static> {
     frame_spans(spans, style)
 }
 
+/// The key prompt drawn as the dialog's title: the user answers the pending
+/// permission ask with `y` (allow) or `n` (deny) while the sandbox keeps the
+/// asking syscall frozen — and with `a` as well when the question had something
+/// to remember, which is the only case where "always" is an answer the agent
+/// can act on rather than a promise it cannot keep.
 fn overlay_prompt(always: bool) -> String {
     if always {
         "[y]es \u{00B7} [n]o \u{00B7} [a]lways".to_string()

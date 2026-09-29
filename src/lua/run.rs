@@ -198,9 +198,6 @@ pub(super) fn decode_tool_ask(yielded: mlua::Value) -> Result<ToolStep, String> 
 /// registry holds no such tool. A tool object is a callable table: it carries a
 /// `callback` function (what `agent.utils.tool` builds; `agent.mcp` produced ones
 /// fall back to their `__call` metamethod, which routes through the connection).
-/// The callable behind an advertised name, or `None` when the registry holds no
-/// such tool.
-///
 pub(super) fn lookup_tool(lua: &Lua, name: &str) -> Result<Option<mlua::Function>, String> {
     let agent: Table = lua
         .globals()

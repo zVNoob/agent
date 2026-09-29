@@ -4,16 +4,16 @@
 //! there). This binary owns the parts that need a real terminal:
 //!   - raw mode + alternate screen,
 //!   - a background task translating crossterm events into an unbounded
-//!     channel (same shape as the future agent integration, where this
-//!     channel becomes a `select!` branch in the shared tokio reactor),
+//!     channel (the same shape the agent's own loop uses, where this channel
+//!     is a `select!` branch alongside the sandbox and HTTP tasks),
 //!   - the on-demand redraw loop: no frame-rate timer, we repaint only when
 //!     an event arrives, so an idle chat burns no CPU.
 //!
-//! Keys: type to edit the input (it grows/wraps as needed), Enter sends,
-//! Alt+Enter inserts a newline, `q`/Esc/Ctrl+C quit, and `j`/`k`/arrows
-//! scroll the transcript while the input line is empty (Home/End jump to
-//! the top/bottom). Alt+c toggles markup concealment, Alt+t pushes a demo
-//! tool call, and clicking a tool-call box collapses/expands it.
+//! Keys: this is the *bare* TUI, so it has no Lua and no `BIND` table. Only the
+//! two keys Rust keeps work — `Ctrl+d` leaves and `Ctrl+c` interrupts (which
+//! here does nothing, see the loop below) — and everything else is a character
+//! or a backspace. The full table, and the reason it is Lua's business, is in
+//! `src/tui/mod.rs` and `lua/init.lua` §8.
 
 use agent::grammars::Catalog;
 use agent::tui::{App, Effect, MarkdownHighlighter, Role};
@@ -71,9 +71,9 @@ async fn main() -> Result<()> {
     app.set_highlight(MarkdownHighlighter::from_catalog(&catalog));
     app.push(
         Role::Assistant,
-        "chat TUI ready — type a message below. \
-         j/k or arrows scroll while the input is empty, Home/End jump, \
-         Enter sends, q quits."
+        "chat TUI ready. This binary is the bare TUI: Ctrl+d leaves, and every \
+         other key is a character. Run `cargo run` for the agent, which is the \
+         same screen with a Lua binding table behind it."
             .into(),
     );
 

@@ -34,7 +34,6 @@ use super::usage::install_usage;
 ///
 pub(super) const STDLIB: mlua::StdLib = mlua::StdLib::ALL_SAFE;
 
-/// A fresh LuaJIT VM with the `agent` namespace pre-installed.
 /// A VM's panel-sink slot, published into the VM's globals so Rust can reach it
 /// again by VM. It carries no methods: the only thing anyone does with it is
 /// read and write the slot it holds, which [`install_sink`] and
@@ -62,6 +61,7 @@ pub fn clear_sink(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+/// A fresh LuaJIT VM with the `agent` namespace pre-installed.
 pub fn new_vm() -> mlua::Result<Lua> {
     new_vm_with_sink(None)
 }

@@ -1,5 +1,5 @@
 //! A minimal MCP stdio server — the reference implementation for exercising
-//! the Lua MCP client (`agent.mcp` in `src/lua.rs`) and the JSON text
+//! the Lua MCP client (`agent.mcp` in `src/lua/`) and the JSON text
 //! boundary (`src/mcp.rs`).
 //!
 //! Speaks the MCP stdio transport (JSON-RPC 2.0, one message per line) and
@@ -13,7 +13,8 @@
 //!
 //! ```lua
 //! -- func: send request_json to the server, feed every completed reply line
-//! -- into on_streaming_response_json (see src/lua.rs for the full contract)
+//! -- into on_streaming_response_json (see `src/lua/mod.rs` for the full
+//! -- contract)
 //! agent.mcps.demo = agent.mcp("demo", function(request_json, on_streaming_response_json)
 //!   -- ... spawn "target/debug/mcp_fake" with agent.bash, forward each
 //!   -- stdout line (framed as a full JSON-RPC message) into the callback ...

@@ -5,8 +5,9 @@
 //!
 //! The loaded markdown grammar parses each message body; its injection query
 //! pulls in `markdown_inline` (inline formatting), the fenced-block language
-//! from the fence's info string, and html/yaml/toml. Only the first two and
-//! `json` are preloaded ([`INJECTED`]); a language with no configuration is
+//! from the fence's info string, and html/yaml/toml. Of the languages it can
+//! name, only `markdown_inline`, `bash` and `json` are preloaded
+//! ([`INJECTED`]); a language with no configuration is
 //! skipped by the injection callback and *named* on the way past
 //! ([`MarkdownHighlighter::take_wanted`]), so the loop can fetch it and apply it
 //! mid-conversation ([`MarkdownHighlighter::add_language`]).
@@ -1250,14 +1251,17 @@ mod tests {
         assert_eq!(
             INJECTED,
             &["markdown_inline", "bash", "json"],
-            "the injectable set; `main.rs`'s GRAMMARS must stay the same four"
+            "the injectable set. `main.rs`'s GRAMMARS is this plus `markdown`, \
+             which is the *host* layer rather than an injection — so the two are \
+             GRAMMARS == INJECTED + markdown, not equal."
         );
         // Spelled out, because the point of the test is the *absences*: these are
         // real languages with real grammars in the registry, and the only thing
         // not preloading them costs is a one-off fetch the first time one turns
-        // up. Add one here *and* to GRAMMARS in main.rs to pay that cost up
-        // front instead — the two lists must agree, or a grammar is fetched at
-        // every startup and never used.
+        // up. Preloading one means adding it here *and* to GRAMMARS in main.rs —
+        // and adding it to GRAMMARS alone is the easy mistake, because the
+        // grammar is then downloaded and compiled at every startup and never
+        // used for anything.
         for not_preloaded in ["rust", "cpp", "lua", "python", "go"] {
             assert!(
                 !INJECTED.contains(&not_preloaded),
@@ -1268,17 +1272,6 @@ mod tests {
         }
     }
 
-    /// What an un-injected block actually looks like, which is not what this file
-    /// used to claim.
-    ///
-    /// The old claim was "the code inside it is unstyled", and it was wrong in a
-    /// way worth recording: the markdown grammar captures a fenced block whole —
-    /// `markup.raw.block` — whether or not its language is injected, and the theme
-    /// paints a `raw` capture light green. So an un-injected block is a *flat*
-    /// colour, not plain text. It reads as code, and it is the same colour as the
-    /// fence, but there is no structure inside it. That is a better failure than
-    /// plain text would be and a worse one to diagnose.
-    ///
     /// The capture-name merge, which is the whole of what adding a language costs
     /// every other layer.
     ///

@@ -304,10 +304,11 @@ use crate::testutil::scratch_dir;
         assert!(asked[0].contains("want to access"), "{:?}", asked[0]);
     }
 
-    /// list that came back empty is an object with no keys rather than an array
-    /// with no elements. Asserting on `as_array()` alone would read that as a
-    /// missing field, which is how the first run of this test failed on a tool
-    /// that had worked.
+    /// The names an MCP result listed, from a value that may be a list or an
+    /// object: a list that came back empty is an object with no keys rather than
+    /// an array with no elements. Asserting on `as_array()` alone would read
+    /// that as a missing field, which is how the first run of this test failed
+    /// on a tool that had worked.
     fn entries(v: &serde_json::Value) -> Vec<String> {
         if let Some(a) = v.as_array() {
             return a

@@ -162,9 +162,11 @@ use super::*;
             assert_eq!(ask(spec).as_deref(), want, "{spec} is bound to {want:?}");
         }
 
-        // `alt+enter` is a *call*, not a name: it queues an input edit and answers
-        // nothing. That is why the action list has one fewer entry than the table
-        // has rows, and why there is no `newline` action to return.
+        // `alt+enter` is a *call*, not a name: it queues an input edit and
+        // answers nothing. The table has a `newline` row because `Action::Newline`
+        // exists, but this config deliberately spells it as the call — a chord
+        // bound to `input_insert("\n")` can insert anything, not only a
+        // newline, and the op is the honest spelling of what it does.
         //
         // The edit reaches the loop over a process-global channel, so the channel
         // is claimed for the body and what the handler queued is checked: that is

@@ -1,4 +1,5 @@
-//! The agent binary: chat TUI front end + LLM client + a test tool executor.
+//! The agent binary: the chat TUI, the event loop, and the tool rounds that
+//! connect them.
 //!
 //! This milestone wires the LLM client into the TUI:
 //!   - type a message, press Enter, and the model's streamed answer renders
@@ -8,15 +9,18 @@
 //!     calls keep their framed, click-collapsible boxes; both streamed
 //!     blocks follow the markup-conceal toggle like plain messages, so Alt+c
 //!     hides markers inside them too),
-//!   - when the model requests a tool, the agent runs it (the `bash` tool
-//!     executes through the seccomp sandbox under a Lua syscall policy in
-//!     `tools`; the sandbox becomes interruptible in the next milestone) and
-//!     renders the call + result in a click-collapsible box,
+//!   - when the model requests a tool, the agent runs it as a Lua coroutine on
+//!     the config VM (`ToolRun`) — the `bash` tool reaches the seccomp sandbox
+//!     through `agent.bash`, under the Lua policy in `lua/policy.lua` — and
+//!     `Ctrl+c` interrupts that run through a per-run flag, not a signal;
 //!   - the result is fed back as a `tool` message and the continuation is
 //!     streamed, up to [`MAX_TOOL_ROUNDS`] chained rounds per user turn.
 //!
 //! Key semantics: Enter mid-turn is ignored (the typed text stays in the
-//! input and submits once the current turn ends); Ctrl+C / q / Esc quit.
+//! input and submits once the current turn ends). `Ctrl+d` leaves and `Ctrl+c`
+//! interrupts the running tool; every other key — `Enter`, `Esc`, `q`, the
+//! scroll keys — is bound in Lua, because a keybinding table that Rust could
+//! override would make config unreachable (see `src/tui/mod.rs`).
 //! `/reload` re-reads the user config (`~/.config/agent/init.lua`) — endpoint,
 //! system prompt, `agent.mcps` tools — without restarting; `/save` flushes the
 //! conversation log to disk and reports where it went. Nothing else is a local
@@ -488,8 +492,10 @@ fn record_verdict(app: &mut App, choice: AskChoice) -> agent::lua::AskAnswer {
 /// treating it as one would remember a path the asking side never offered.
 ///
 /// Returns `None` for any other key: while a question is on screen it is the
-/// only thing that responds (Ctrl+C and Esc still quit), so a keystroke is never
-/// mistaken for input text.
+/// only thing that responds, so a keystroke is never mistaken for input text.
+/// The loop's own keys are still live — `Ctrl+c` (stop the command asking) and
+/// `Ctrl+d` (leave) — and a Lua key handler is deliberately *not* consulted
+/// here, so a table cannot redirect a verdict.
 fn ask_choice(code: KeyCode, always: bool) -> Option<AskChoice> {
     match code {
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(AskChoice::Yes),
@@ -674,13 +680,6 @@ fn tool_defs(vm: &mlua::Lua) -> Result<Vec<agent::api::ToolDef>> {
     ))
 }
 
-/// Whether a tool call may run: only a name this request actually offered.
-///
-/// A tool is called by name against the *live* registry, so "not advertised"
-/// is not by itself "not callable" — a mode that replaced `agent.mcps`, an
-/// unregistered tool, or an old tool call replayed out of the history would
-/// each find a working tool by name. The request's own tool list is the gate,
-/// so what the model was shown is exactly what it can run.
 /// What the loop knows about grammars it has been asked for.
 ///
 /// Its own type because the rules are the interesting part and the loop body is a
@@ -751,9 +750,13 @@ enum GrammarOutcome {
     Failed(String, String),
 }
 
-/// The dispatch gate: a tool call runs only if this request offered that name.
-/// A mode that swapped the registry, a tool nobody registered, and an old call
-/// replayed out of the history all land here.
+/// Whether a tool call may run: only a name this request actually offered.
+///
+/// A tool is called by name against the *live* registry, so "not advertised"
+/// is not by itself "not callable" — a mode that replaced `agent.mcps`, an
+/// unregistered tool, or an old tool call replayed out of the history would
+/// each find a working tool by name. The request's own tool list is the gate,
+/// so what the model was shown is exactly what it can run.
 fn may_run(name: &str, offered: &std::collections::HashSet<String>) -> Result<(), String> {
     if offered.contains(name) {
         Ok(())

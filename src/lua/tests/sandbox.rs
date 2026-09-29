@@ -719,8 +719,9 @@ use crate::testutil::scratch_dir;
 
     #[test]
     fn lua_bash_runs_a_command_under_an_allow_policy() {
-        // `lua::bash` — Rust's one-shot wrapper over agent.bash — runs a
-        // sandboxed command and reports the captured output and exit status.
+        // `run_bash` (the helper above) — a one-shot drive of `agent.bash` —
+        // runs a sandboxed command and reports the captured output and exit
+        // status.
         // ALLOW_ALL is a bare expression, so it is wrapped in `return`.
         // ALLOW_ALL names no syscalls → empty mask → nothing intercepted:
         // a pure-builtin echo reports zero intercepts yet still runs (its

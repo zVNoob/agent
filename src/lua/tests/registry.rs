@@ -12,7 +12,7 @@ use crate::testutil::unique_path;
     /// So the two sets are compared, both ways. (`lua/api.lua` is checked
     /// separately, and more strictly, by the loader's drift check at startup: it
     /// is prose the bridge validates. This one is the editor's view of the same
-    /// 33, and it is cheap to keep honest.)
+    /// 36, and it is cheap to keep honest.)
     #[test]
     fn the_lua_ls_annotations_cover_exactly_the_bridge() {
         let lua = new_vm().expect("vm");

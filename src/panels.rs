@@ -1,13 +1,15 @@
 //! The Lua → TUI panel op stream.
 //!
-//! Lua code running inside the `agent` namespace (a sandbox policy, an MCP
-//! tool handler, …) cannot touch the terminal directly — `tools::execute`
-//! and `lua::bash` are pure functions, and the VM may one day run off the
-//! main thread. Instead the `agent.api.panel_*` primitives push [`PanelOp`]
-//! records into a [`PanelSink`]; the TUI drains the sink (once per tool
-//! round in synchronous runs, once per frame once runs go async) and applies
-//! the ops to its [`TurnPanel`](crate::tui::TurnPanel). With no sink
-//! (headless runs, tests) panel calls are graceful no-ops.
+//! Lua code running inside the `agent` namespace — a sandbox policy, a tool
+//! handler, an MCP client — cannot touch the terminal: it is a coroutine the
+//! event loop steps, and it has no business owning a screen. So the
+//! `agent.api.panel_*` primitives push [`PanelOp`] records into a [`PanelSink`],
+//! and the TUI drains that sink once per frame and applies the ops to its
+//! [`TurnPanel`](crate::tui::TurnPanel). With no sink (headless runs, the
+//! tests) a panel call is a graceful no-op.
+//!
+//! There is exactly one producer: the `agent.api.panel_*` bridge. Nothing in
+//! Rust emits a [`PanelOp`] directly, which is what keeps the id space single.
 //!
 //! Besides the single-body ops (`Create`/`Set`/…), a panel can be *split*:
 //! [`PanelOp::Split`] frames several [`PaneInit`] regions in one box, each
@@ -115,12 +117,14 @@ pub struct PaneInit {
     pub lang: Option<String>,
 }
 
-/// An order-preserving, thread-safe buffer of [`PanelOp`]s, plus the round's
-/// panel-id allocator — both producers (policy/tool Lua via `agent.api.panel_*`
-/// and `tools::execute`'s Rust side) draw ids from the same sink, so a Lua
-/// panel and a Rust-emitted panel in one round can never collide. Cheap to
-/// clone (an `Arc`); the TUI is the single consumer ([`PanelSink::drain`]),
-/// and the Lua VM / tool executors are the producers ([`PanelSink::push`]).
+/// An order-preserving, thread-safe buffer of [`PanelOp`]s, plus the panel-id
+/// allocator. Ids are drawn here rather than per-producer because they are
+/// scoped to the transcript's id→message map, which outlives a single tool
+/// round: a counter that restarted each round would hand round two's first
+/// panel an id round one had already used, and that panel's content would be
+/// appended to the wrong message. Cheap to clone (an `Arc`); the TUI is the
+/// single consumer ([`PanelSink::drain`]), and the Lua bridge is the only
+/// producer ([`PanelSink::push`]).
 #[derive(Debug, Clone)]
 pub struct PanelSink(Arc<Mutex<SinkState>>);
 

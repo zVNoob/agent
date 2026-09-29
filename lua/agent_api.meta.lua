@@ -4,7 +4,7 @@
 -- bridge, the Rust primitives every Lua module is built on.
 --
 -- `agent.api` is not a Lua file: Rust installs it as a **locked** table at VM
--- setup (`src/lua.rs`, `install_api`), and the loader refuses to start if its
+-- setup (`src/lua/bridge.rs`, `install_api`), and the loader refuses to start if its
 -- contents and `lua/api.lua` disagree. So there is nothing for LuaLS to read
 -- from the module itself, and every `agent.api.step(h)` in the tree is an
 -- unknown global to a language server without this file. It is the type view of

@@ -79,9 +79,6 @@ use super::*;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A tree without an entry script is a load-time error naming the file it
-    /// wanted (the tree ships with the binary, so a missing one is a broken
-    /// install, not something to paper over with an empty default).
     /// The two tool shapes the live TUI run could not reach, because the local
     /// model narrates a tool call as prose instead of emitting one: a tool that
     /// draws nothing, and a tool that fails.
@@ -158,6 +155,9 @@ use super::*;
         );
     }
 
+    /// A tree without an entry script is a load-time error naming the file it
+    /// wanted (the tree ships with the binary, so a missing one is a broken
+    /// install, not something to paper over with an empty default).
     #[test]
     fn a_tree_without_an_entry_script_fails_by_name() {
         let dir = fixture("no-init");

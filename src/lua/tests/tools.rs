@@ -587,9 +587,6 @@ use crate::testutil::scratch_dir;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A one-line file gets "1 line", not "1 lines". Caught by looking at a
-    /// live panel rather than by any test: the first run of this said "1 lines"
-    /// and it was the sort of thing a reader stops trusting the rest of the box
     /// The permission question is drawn, as a dialog, inside the panel of the
     /// tool that raised it.
     ///
@@ -599,7 +596,8 @@ use crate::testutil::scratch_dir;
     /// the loop drew *nothing* — its own comment claimed the question was
     /// already on screen, which is true only of an ask that came through
     /// `panel:ask`. So `read` and `write_file` sat waiting on a question
-    /// nobody could see, with the input hint still reading "Enter sends".
+    /// nobody could see, with nothing in the input line saying a verdict was
+    /// what the next keystroke wanted.
     #[test]
     fn a_file_tools_question_is_a_dialog_on_its_own_panel() {
         let dir = scratch_dir("agent-fs-askpanel");
@@ -759,6 +757,9 @@ use crate::testutil::scratch_dir;
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// A one-line file gets "1 line", not "1 lines". Caught by looking at a
+    /// live panel rather than by any test: the first run of this said "1 lines",
+    /// and it was the sort of thing a reader stops trusting the rest of the box
     /// over.
     #[test]
     fn a_one_line_file_is_captioned_in_the_singular() {
