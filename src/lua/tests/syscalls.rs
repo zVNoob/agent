@@ -26,6 +26,11 @@ fn the_pathname_and_dirfd_tables_match_the_kernel_signatures() {
         ("renameat2", &[1, 3]),
         ("linkat", &[1, 3]),
         ("symlinkat", &[0, 2]),
+        // The plain forms: two names, both relative to the cwd. These are the
+        // ones issued — `ln -s` calls `symlink`, not `symlinkat` — and a missing
+        // entry here is a table that decodes a pointer as a string.
+        ("link", &[0, 1]),
+        ("symlink", &[0, 1]),
         ("execveat", &[1]),
         ("newfstatat", &[1]),
         ("readlinkat", &[1]),

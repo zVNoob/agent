@@ -3,7 +3,7 @@
 **A coding agent in your terminal, where the sandbox asks you instead of deciding for you.**
 
 A streaming TUI over any OpenAI-compatible endpoint — with a seccomp sandbox that
-intercepts twenty-seven syscalls and puts each one to you with its arguments
+intercepts thirty-one syscalls and puts each one to you with its arguments
 decoded out of the frozen process, file tools, and every layer above the API
 written in Lua. Including the tools, the sandbox policy, the permission prompts,
 and the modes.
@@ -107,7 +107,7 @@ plumbing are all still wired together.
 | | |
 |---|---|
 | **Streaming TUI** | turn stream, tool-drawn panels, a permission dialog at the bottom of the panel that raised it, a one-line status bar, `/reload`, `/save` |
-| **A seccomp sandbox that asks** | twenty-seven syscalls intercepted; reads, writes, deletes and moves are questions about a *path*, and a move is two of them — plus the gates that would otherwise walk past every one of those paths, above all `io_uring` |
+| **A seccomp sandbox that asks** | thirty-one syscalls intercepted; reads, writes, deletes and moves are questions about a *path*, and a move is two of them — plus the gates that would otherwise walk past every one of those paths, above all `io_uring` |
 | **Lua for everything above the API** | 36 locked bridge primitives, nine auto-required library modules, a mode system, an ask protocol with three answers, the sandbox policy, the tools |
 | **One thread** | one OS thread, a current-thread tokio runtime, no worker pool — tool calls, event handlers and HTTP are coroutines the event loop steps |
 | **Runtime syntax highlighting** | tree-sitter grammars fetched from a registry, compiled with your `cc`, and `dlopen`'d — and applied to text already on screen, mid-conversation |
@@ -138,7 +138,7 @@ plumbing are all still wired together.
             ▼
   ┌────────────────────┐      ┌──────────────────────────────────┐
   │  lua/lib/bash.lua  │─────▶│ seccomp user-notify on a fork()  │
-  │  + lua/policy.lua │      │  27 syscalls → ask → verdict     │
+  │  + lua/policy.lua │      │  31 syscalls → ask → verdict     │
   └────────────────────┘      └──────────────────────────────────┘
             │                              │
             └──────────► PanelSink ◄──────┘
@@ -483,10 +483,10 @@ intercepted, decoded, and put to you before it runs.
 
 ```
 # files and endpoints — a question about a path, a host, a port
-openat  unlinkat  renameat  renameat2  chmod  fchmodat
+openat  unlinkat  renameat  renameat2  chmod  fchmodat  fchmod
 setxattr  lsetxattr  removexattr  lremovexattr
-connect  bind  sendto
-name_to_handle_at
+connect  bind  sendto  name_to_handle_at
+link  linkat  symlink  symlinkat
 
 # capabilities — a question about the syscall itself, and nothing to remember
 io_uring_setup  io_uring_enter  io_uring_register
@@ -498,12 +498,15 @@ pkey_alloc  pkey_mprotect  pkey_free
 - **Anything not named in the policy is not intercepted at all.** The policy's
   keys *are* the mask, so a syscall nobody named runs straight through the kernel
   under its default (allow) and never reaches a callback. Each of the
-  twenty-seven is a decision, and the absences are decisions too: `mkdirat` and
-  `rmdir` are left out on purpose, while `linkat` and `symlinkat` are a **real
-  gap** rather than a decision, and say so in `lua/policy.lua`. The mask is not
-  a checklist that stays true — the kernel adds syscalls every release and each
-  new one arrives *ungated*, which is the one thing to remember about a list
-  like this.
+  thirty-one is a decision. `mkdirat` and `rmdir` are left out on purpose. The
+  mask is not a checklist that stays true: the kernel adds syscalls every
+  release, and each new one arrives *ungated*.
+
+  The subtler half is that a gate can be correct and still catch nothing, because
+  the program issues a *different* syscall than the one you named. `ln -s` calls
+  `symlink()`, not `symlinkat()`; glibc's `rename()` is `renameat2`. Both pairs
+  are gated here, and `lua/policy.lua` argues why for each — it is the single
+  most useful thing to know when adding a gate.
 - **`agent.http` and `agent.mcp` are not syscalls** — see
   [Security model](#security-model).
 - **A denied syscall kills the tracee.** That is the enforcement, and it is
@@ -629,7 +632,7 @@ make fmt           # cargo fmt
 `verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
 fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
 `src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
-the check that the sandbox is still there at all. The suite is 391 library tests
+the check that the sandbox is still there at all. The suite is 394 library tests
 and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
 compiler (`-- --ignored` runs them).
 
@@ -652,16 +655,19 @@ Work in progress, and honest about the edges:
   around the gates that are there — which is what the capability gates above are
   for — and it has been extended to twenty-seven on that basis. Audit it when the
   kernel moves, not when something breaks.
-- **`linkat` and `symlinkat` are ungated.** A real gap in the policy, not a
-  decision — the sandbox engine resolves the paths, the policy just does not ask.
-- **`fchmod` is ungated**, and cannot be asked about: it names a descriptor, not
-  a path, and a question needs something to name. Reaching it means the process
-  already holds an open descriptor — which cost read or write trust when it
-  opened it. So read-trust on a path currently implies being able to make that
-  file executable, via `fchmod`. The path-based `fchmodat` *is* gated; closing
-  this would need the engine to resolve an fd to a path through
-  `/proc/<pid>/fd`, which is real work and a design decision rather than a policy
-  key.
+- **`link`/`linkat` and `symlink`/`symlinkat` are gated**, and had to be found by
+  running `ln` under the sandbox: the first version of this fix named only the
+  `*at` pair and caught nothing, because on x86-64 `ln -s` issues `symlink()` and
+  never `symlinkat()`. A hard link into a trusted directory is the sharpest hole
+  the sandbox had, because a hard link has no target for the resolver to chase:
+  the read looks like a read of a file in the working directory, which is
+  trusted, and the secret arrives with no question. The gate is at creation,
+  which is the only place it can be.
+- **`fchmod` is gated**, by reading the descriptor back through
+  `/proc/<pid>/fd`, so the question names the real file. Read-trust on a path no
+  longer implies being able to make that file executable. When the descriptor is
+  not a file — a pipe, a socket — there is no path to name and it is asked as a
+  plain yes/no rather than waved through.
 - **Grammars are fetched and compiled at runtime**, which means a first run on a
   cold cache needs a network and a working `cc`.
 - **`cargo install` does not work, and cannot.** The tree is loose files, so

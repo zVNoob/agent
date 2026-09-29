@@ -424,6 +424,32 @@ function M.path(sys, n)
   return M.paths(sys)[n]
 end
 
+--- The path an open descriptor names, for the syscalls that identify a file only
+--- by descriptor: `sc.fd_path(sys, 1)` is the file `fchmod` is about, read back
+--- through `/proc/<pid>/fd/<n>` by the engine.
+---
+--- `nil` for everything that is not a path — a pipe, a socket, an already-closed
+--- slot — and `nil` for a syscall with no descriptor argument at all. That is a
+--- real answer rather than a missing one: `fchmod` on a pipe is `EBADF`, there is
+--- no file, and a policy that wants to ask about the call has to ask about the
+--- *call* rather than about a path that does not exist.
+function M.fd_path(sys, n)
+  n = n or 1
+  if type(n) ~= "number" or n < 1 or n % 1 ~= 0 then
+    error("agent.seccomp.fd_path: n must be a positive integer, got " ..
+          tostring(n), 2)
+  end
+  if type(sys) ~= "table" then
+    error("agent.seccomp.fd_path: expected the syscall table, got " ..
+          type(sys), 2)
+  end
+  local fds = sys.fd
+  if type(fds) ~= "table" then return nil end
+  local text = fds[n]
+  if type(text) ~= "string" or text == "" then return nil end
+  return text
+end
+
 --- The endpoint the syscall names, decoded out of the caller's memory by the
 --- engine: `{ family = "inet"|"inet6"|"unix"|"other", ip = string|nil,
 --- port = number|nil, path = string|nil }`. `nil` when the syscall names no

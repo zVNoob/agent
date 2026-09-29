@@ -3,6 +3,219 @@
 use super::*;
 
 use crate::testutil::scratch_dir;
+
+/// Grant read trust on a path, the way `lua/init.lua` grants the working
+/// directory, so a test can set up "trusted directory, untrusted file".
+fn trust_path(lua: &mlua::Lua, path: &std::path::Path) {
+    lua.load(format!(
+        "require('ask').trust({:?})",
+        path.to_string_lossy()
+    ))
+    .exec()
+    .expect("trust");
+}
+
+/// The hard-link bypass, closed.
+///
+/// This is the sharpest of the three gaps because it is not a gap in the
+/// *read* gate, it is a way around it:
+///
+/// ```sh
+/// ln /etc/passwd ./notes   # a hard link, inside the trusted cwd
+/// cat ./notes              # resolved to ./notes, which is trusted
+/// ```
+///
+/// A hard link has no target for the resolver to chase — unlike a symlink,
+/// which `resolve_path` follows and reports as the file it points *at* — so
+/// the read looks like a read of a file in the working directory, and the
+/// working directory is trusted. The secret arrives with no question.
+///
+/// Driven through the real shell under the real policy with a really-trusted
+/// directory, because the trusted directory is the whole mechanism: a
+/// synthetic syscall table would not exercise the path resolution that makes
+/// this interesting.
+#[test]
+fn a_hard_link_out_of_a_trusted_directory_asks() {
+    let lua = shipped_vm();
+    prime_the_sandbox(&lua);
+    let dir = scratch_dir("agent-hardlink");
+    // A file the agent is *not* trusted for, standing in for a secret.
+    let outside = dir.join("outside-secret.txt");
+    std::fs::write(&outside, "hunter2\n").expect("seed");
+    // A directory it *is* trusted for, which is where the link will land.
+    let inside = dir.join("inside");
+    std::fs::create_dir_all(&inside).expect("inside");
+    trust_path(&lua, &inside);
+    let link = inside.join("notes");
+    let link_s = link.to_string_lossy().to_string();
+
+    // Refused. The link is a name inside a trusted directory pointing at a
+    // file outside it, and it is asked rather than created quietly.
+    let (v, asked) = run_policy_bash(
+        &lua,
+        &format!("ln {} {link_s}", outside.to_string_lossy()),
+        AskAnswer::Deny(Some("not that".into())),
+    );
+    assert_eq!(v["ok"], false, "the link was refused: {v}");
+    assert!(!link.exists(), "and it was not created: {link_s}");
+    assert!(
+        asked
+            .iter()
+            .any(|q| q.contains("hard-link") && q.contains(&link_s)),
+        "and the question named the new name: {asked:?}"
+    );
+
+    // Allowed — and then the read it was for. The point of the gate is that
+    // the read is a question too, not that links are banned for ever.
+    let (v, _) = run_policy_bash(
+        &lua,
+        &format!("ln {} {link_s}", outside.to_string_lossy()),
+        AskAnswer::AllowAndTrust,
+    );
+    assert_eq!(v["ok"], true, "allowed this time: {v}");
+    assert!(link.exists(), "so the link exists: {link_s}");
+
+    // …and now reading it is silent, and that is *correct* rather than a leak:
+    // the answer above was an "always" on writing this name, and `trust_write`
+    // records the general grant too, so the user has vouched for this path.
+    //
+    // The protection is at the point of creation, and the first half is what
+    // proves it — a link that was not answered cannot exist, so there is no name
+    // in the trusted directory for a later read to follow. The *other* order is
+    // the hole this closes: a hard link into a trusted directory that already
+    // existed — made by something outside the sandbox — makes a secret readable
+    // with no question at all, and no amount of gating `openat` can see it,
+    // because the path says nothing about what the name points at. A hard link
+    // has no target for the resolver to chase, which is the whole problem.
+    let (v, asked) = run_policy_bash(
+        &lua,
+        &format!("cat {link_s}"),
+        AskAnswer::Deny(Some("no".into())),
+    );
+    assert_eq!(v["ok"], true, "the read ran: {v}");
+    assert!(
+        !asked.iter().any(|q| q.contains("read")),
+        "and asked nothing — the name was granted above, and the grant is for the \
+         name rather than for the inode behind it. {asked:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `symlinkat` gets its own test because the two are *not* the same case, and
+/// treating them as one would be wrong in a way that only shows up later.
+///
+/// A symlink is chased by the resolver, so a read through one already reports
+/// the file it points at and asks about that. What a symlink adds is the power
+/// to make the *next* call mean somewhere else: a dangling target resolves to
+/// itself, so `ln -s /elsewhere/x ./y` followed by a create through `./y` is a
+/// write to `/elsewhere/x` wearing a trusted name. So the gate is on the name
+/// being created — and the silent-create rule must not apply to it, which is
+/// the same asymmetry `linkat` needs and for a different reason.
+#[test]
+fn a_symlink_out_of_a_trusted_directory_asks() {
+    let lua = shipped_vm();
+    prime_the_sandbox(&lua);
+    let dir = scratch_dir("agent-symlink");
+    let inside = dir.join("inside");
+    std::fs::create_dir_all(&inside).expect("inside");
+    trust_path(&lua, &inside);
+    let link = inside.join("escape");
+    let link_s = link.to_string_lossy().to_string();
+    // A target that does not exist, which is the case that matters: a
+    // dangling symlink resolves to itself, so the *next* write through it
+    // lands outside the trusted directory under a trusted name.
+    let target = dir.join("outside/does-not-exist-yet");
+
+    let (v, asked) = run_policy_bash(
+        &lua,
+        &format!("ln -s {} {link_s}", target.to_string_lossy()),
+        AskAnswer::Deny(Some("no".into())),
+    );
+    assert_eq!(v["ok"], false, "the symlink was refused: {v}");
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "and not created: {link_s}"
+    );
+    assert!(
+        asked
+            .iter()
+            .any(|q| q.contains("symlink") && q.contains(&link_s)),
+        "and the question named the new name: {asked:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `fchmod` names no path — it names a descriptor — and that used to be
+/// recorded as a reason it could not be gated at all, with the consequence
+/// that read-trust on a file implied being able to make that file
+/// executable. The engine now reads the descriptor back through
+/// `/proc/<pid>/fd/<n>`, so the question names the real file.
+///
+/// Driven through the real shell, because a synthetic syscall table cannot
+/// fake an `/proc` read: the path in the question *is* what the engine looked
+/// up, and faking it would test the fake.
+#[test]
+fn fchmod_asks_about_the_file_its_descriptor_names() {
+    let lua = shipped_vm();
+    prime_the_sandbox(&lua);
+    let dir = scratch_dir("agent-fchmod-gated");
+    let target = dir.join("not-trusted.txt");
+    std::fs::write(&target, "x\n").expect("seed");
+    let target_s = target.to_string_lossy().to_string();
+
+    // `cp --preserve=mode` chmods the *destination* by descriptor, through
+    // `fchmod`, having opened it. Refused, and the question names the file.
+    // `cp --preserve=mode` reads its share of the system tree on the way — libc,
+    // libacl — before it ever reaches the mode, so a handler that denies
+    // everything stops it long before the interesting syscall. Deny only the
+    // mode question and let the rest through.
+    let (v, asked) = run_policy_bash_except(
+        &lua,
+        &format!("cp --preserve=mode /dev/null {target_s}"),
+        "change the mode of",
+    );
+    assert!(
+        asked
+            .iter()
+            .any(|q| q.contains("change the mode of") && q.contains(&target_s)),
+        "fchmod now asks, naming the file the descriptor points at: {asked:?}"
+    );
+    // …and the file is not made executable, which is the thing being closed.
+    let mode = std::fs::metadata(&target)
+        .map(|m| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                m.permissions().mode() & 0o777
+            }
+            #[cfg(not(unix))]
+            {
+                0
+            }
+        })
+        .expect("cp made the file before trying to chmod it");
+    // The proof is the *difference*, not an absolute. `/dev/null` is `0o666`, and
+    // `cp --preserve=mode` would have made the copy that. It is not that: the
+    // file carries the mode `open(2)` gave it at creation, filtered by umask, and
+    // the `fchmod` that would have made it `0o666` was refused. That is the gap
+    // closed — read-trust on a file no longer implies being able to change its
+    // mode, which is the whole of what `fchmod` can do.
+    assert_ne!(
+        mode, 0o666,
+        "the mode was NOT copied from the source: --preserve=mode would have made \
+         it 0o666 like /dev/null, and it is {mode:#o} (from {v})"
+    );
+    assert_eq!(
+        mode & !0o666 & 0o7777,
+        0,
+        "and no bit outside the create-time mode was set: {mode:#o}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Two tool calls in one round, each of which asks — can the TUI hold two
 /// questions at once?
 ///
@@ -1409,7 +1622,13 @@ fn ask_through_gate_with_addr(
         -- yield and the return are both reported, and which one happened is the
         -- caller's business to assert.
         if coroutine.status(co) == "dead" then
-          assert(q == true, "a gate that did not ask returned " .. tostring(q))
+          -- Two legitimate ways to finish without asking: it answered itself
+          -- (`true` — a gate remembering a grant it was given), or it *declined*,
+          -- which is what a gate that cannot describe the call does rather than
+          -- waving it through. Asserting that a gate must always ask would be
+          -- asserting the opposite of what a policy is for.
+          assert(q == true or type(q) == "table",
+                 "a gate that neither asked nor declined returned " .. tostring(q))
           return nil, q
         end
         assert(type(q) == "table",
@@ -1851,6 +2070,7 @@ fn every_gate_names_who_is_asking() {
     );
 
     let mut checked = 0;
+    let skipped: Vec<String> = Vec::new();
     for gate in &gates {
         // A syscall table shaped for the gate: a name and pid always, and the
         // arguments it needs. `cmdline` is the same for all of them so that a
@@ -1886,6 +2106,39 @@ fn every_gate_names_who_is_asking() {
                 args[1] = json!(existing);
                 strs.push((1, existing.clone()));
                 strs.push((2, existing.clone()));
+            }
+            // linkat(olddirfd, oldpath, newdirfd, newpath, flags) and
+            // symlinkat(target, newdirfd, linkpath): two names each, the second
+            // being the one being created.
+            "linkat" => {
+                args[1] = json!(existing);
+                args[3] = json!(target);
+                strs.push((2, existing.clone()));
+                strs.push((4, target.clone()));
+            }
+            "symlinkat" => {
+                args[0] = json!(existing);
+                args[2] = json!(target);
+                strs.push((1, existing.clone()));
+                strs.push((3, target.clone()));
+            }
+            // The plain forms: same two names, slots 0 and 1. In the mask because
+            // they are the ones glibc actually issues — `ln -s` never reaches
+            // `symlinkat` — so a sweep that skipped them would not notice if they
+            // stopped asking.
+            "link" | "symlink" => {
+                args[0] = json!(existing);
+                args[1] = json!(target);
+                strs.push((1, existing.clone()));
+                strs.push((2, target.clone()));
+            }
+            // fchmod(fd, mode): the path comes from the *engine* reading the
+            // descriptor back through /proc, which a synthetic syscall table
+            // cannot fake — so the gate declines rather than waving it through,
+            // which is what it does for a pipe. Asserted properly in its own test,
+            // through a real command.
+            "fchmod" => {
+                args[0] = json!(7);
             }
             "renameat" | "renameat2" => {
                 args[1] = json!(existing);
@@ -1942,11 +2195,30 @@ fn every_gate_names_who_is_asking() {
         checked += 1;
     }
 
+    // **No** gate may be silent. A gate that answers itself instead of asking is
+    // the failure this sweep exists to catch, and a bare `continue` hides it —
+    // which is exactly what happened when `policy.link` was quietly neutered and
+    // the sweep carried on passing.
+    //
+    // `fchmod` is the interesting one and it does ask, despite having no path: its
+    // gate falls back to a plain yes/no when the descriptor resolves to nothing,
+    // because "a gate that cannot describe the call" is a reason to ask about the
+    // call, not a reason to wave it through. So it is checked here like any other.
     assert!(
-        checked >= 14,
-        "checked {checked} gates' questions. Far fewer than the mask has keys \
-             means the loop's argument shapes are answering gates early rather than \
-             exercising them, which would make this test quietly narrow."
+        skipped.is_empty(),
+        "every gate must ask. These answered themselves instead, which is the bug \
+         this test exists to catch: {skipped:?}. All gates: {gates:?}"
+    );
+    assert_eq!(
+        checked,
+        gates.len(),
+        "and every gate's question was checked: {checked} of {}",
+        gates.len()
+    );
+    assert_eq!(
+        checked + skipped.len(),
+        gates.len(),
+        "every gate was accounted for: checked {checked}, skipped {skipped:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

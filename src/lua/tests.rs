@@ -529,7 +529,7 @@ fn fixture(name: &str) -> PathBuf {
 /// that walks past all three — through, so the set is pinned exactly; and it is
 /// a list rather than a count, so that adding a gate is a visible edit here and
 /// not a silent one.
-const MASK: &str = "bind,bpf,chmod,connect,fchmodat,io_uring_enter,io_uring_register,io_uring_setup,lremovexattr,lsetxattr,memfd_create,name_to_handle_at,open_by_handle_at,openat,pidfd_getfd,pkey_alloc,pkey_free,pkey_mprotect,process_vm_readv,process_vm_writev,removexattr,renameat,renameat2,sendto,setxattr,unlinkat,userfaultfd";
+const MASK: &str = "bind,bpf,chmod,connect,fchmod,fchmodat,io_uring_enter,io_uring_register,io_uring_setup,link,linkat,lremovexattr,lsetxattr,memfd_create,name_to_handle_at,open_by_handle_at,openat,pidfd_getfd,pkey_alloc,pkey_free,pkey_mprotect,process_vm_readv,process_vm_writev,removexattr,renameat,renameat2,sendto,setxattr,symlink,symlinkat,unlinkat,userfaultfd";
 
 /// Drive an `EventRun` to completion by answering every wait the way the
 /// reactor would (its timer fired), counting the cooperative suspensions.

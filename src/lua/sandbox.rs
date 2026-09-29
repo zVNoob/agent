@@ -277,6 +277,19 @@ pub(super) fn syscall_into_table(lua: &Lua, s: &seccomp::Syscall) -> mlua::Resul
         }
     }
     t.set("str", strs)?;
+    // `sys.fd`: open descriptors resolved back to paths, 1-based and aligned
+    // with `args` like `str` — the syscalls in `FD_FOR_PATH`, and only those.
+    // Sparse and position-keyed exactly as `str` is, and a `nil` for a slot that
+    // is a pipe, a socket, or an fd the tracee has already closed.
+    let fds = lua.create_table()?;
+    if let Some(positions) = fd_positions(&name) {
+        for &p in positions {
+            if let Some(text) = read_fd_path(s.pid, s.args[p]) {
+                fds.raw_set((p as i64) + 1, text)?;
+            }
+        }
+    }
+    t.set("fd", fds)?;
     Ok(t)
 }
 
@@ -320,6 +333,13 @@ pub(super) const CSTRING_ARGS: &[(&str, &[usize])] = &[
     ("link", &[0, 1]),
     // linkat(olddirfd, oldpath, newdirfd, newpath, flags): the same shape.
     ("linkat", &[1, 3]),
+    // link(oldpath, newpath) and symlink(target, linkpath): the plain forms,
+    // both relative to the cwd. **These are the ones that are actually called.**
+    // See the note in `lua/policy.lua`: glibc's `symlink()` is the `symlink`
+    // syscall on x86-64, and `ln -s` reaches `symlinkat` not at all, so a policy
+    // that names only the `*at` pair gates a syscall nothing issues.
+    ("link", &[0, 1]),
+    ("symlink", &[0, 1]),
     ("symlink", &[0, 1]),
     // symlinkat(target, newdirfd, linkpath): the strings are 0 and 2.
     ("symlinkat", &[0, 2]),
@@ -476,6 +496,14 @@ pub(super) fn endpoint_into_lua(
     Ok(Some(t))
 }
 
+/// The `args` slots that hold an open descriptor to resolve to a path, 0-based.
+pub(super) fn fd_positions(name: &str) -> Option<&'static [usize]> {
+    FD_FOR_PATH
+        .iter()
+        .find(|(sys, _)| *sys == name)
+        .map(|(_, slots)| *slots)
+}
+
 pub(super) fn cstring_positions(name: &str) -> Option<&'static [usize]> {
     CSTRING_ARGS
         .iter()
@@ -525,6 +553,40 @@ pub(super) fn read_cstr(pid: i32, addr: u64, cap: usize) -> Option<String> {
 
 pub(super) fn tracee_cwd(pid: i32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// The syscalls whose only name for a file is an **open descriptor**, and so need
+/// `/proc/<pid>/fd/<n>` read back to a path before a question about it can name
+/// one. 0-based slots, aligned with `args` like [`CSTRING_ARGS`].
+///
+/// [`fchmod`] is the one that matters, and it is the one the policy has carried a
+/// note about: the argument form has no path, so the old answer was that
+/// `fchmod` could not be asked about at all, and read-trust on a file implied
+/// being able to make it executable. That was a *gap* dressed as a decision. The
+/// engine can resolve an fd — the tracee is our own child, so its `fd` directory
+/// is readable — and this table is the whole of what it takes.
+pub(super) const FD_FOR_PATH: &[(&str, &[usize])] = &[("fchmod", &[0])];
+
+/// Read a tracee's open descriptor back to the path it names, via
+/// `/proc/<pid>/fd/<fd>`.
+///
+/// `None` for everything that is not a path: a pipe is `pipe:[12345]`, a socket
+/// `socket:[9876]`, an unopened or already-closed slot has nothing at all. Those
+/// are the cases a caller has to handle rather than paper over, because the honest
+/// answer for `fchmod(pipe_fd, …)` is "there is no file here" — the kernel will
+/// return EBADF — and a question naming `pipe:[12345]` as a path would be
+/// nonsense.
+///
+/// The link is read from *our* `/proc`, which is safe: the tracee is a child this
+/// process forked, and the alternative — asking the tracee to tell us where its
+/// own fd points — would be a syscall to interrupt on a hot path, which is the
+/// thing this project decided against when it chose not to scan io_uring rings.
+pub(super) fn read_fd_path(pid: i32, fd: u64) -> Option<String> {
+    let target = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
+    let path = target.to_string_lossy().into_owned();
+    // `/proc/self/fd` gives an absolute path for anything with one, and a
+    // bracketed pseudo-path for everything else. Only the former is a path.
+    path.starts_with('/').then_some(path)
 }
 
 /// The `args` slot holding the *directory fd* each path argument of a syscall

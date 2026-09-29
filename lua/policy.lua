@@ -130,10 +130,7 @@
 -- Note what is *not* in the mask on the filesystem side: `mkdirat` and `rmdir`.
 -- A new directory is therefore created without a question (which is what the
 -- rule above would conclude anyway), and `rm -r` reaches the gate through
--- `unlinkat` on each name, one question per name. `linkat` and `symlinkat` are
--- absent too, and are a real gap rather than a decision: a sandboxed command can
--- hard-link or symlink inside a directory you have trusted. They are the next
--- thing to add if you want them, and the shape is the `unlinkat` callback above.
+-- `unlinkat` on each name, one question per name.
 --
 -- Everything *not* named above is not intercepted at all — it runs straight
 -- through the kernel under its default (allow). So read this as what it is: a
@@ -474,6 +471,98 @@ end
 -- and the retry is silent.
 policy.renameat = ask_rename
 policy.renameat2 = ask_rename
+
+-- A name that points at something else. Both of these create a path inside a
+-- directory you trusted, and the thing it points at is wherever the caller liked:
+--
+--   ln /etc/shadow ./notes
+--
+-- is a hard link, and a hard link has no target for the resolver to chase. So
+-- `sc.path` on the resulting `./notes` returns `./notes` — inside the trusted
+-- working directory, silent — and a read through it is a read of `/etc/shadow`
+-- that never asks. That is not a gap in the read gate, it is a way around it, and
+-- it is why `linkat` is asked at all.
+--
+-- The question is on the **new** name, and on write trust: the target is where
+-- something is being made, which is the same thing an overwrite asks about. The
+-- source is asked on read trust as well, because taking a link to a file is a
+-- read of it in every sense that matters here.
+--
+-- Note what these do *not* get: the "creating a name nothing holds is silent"
+-- rule above, which is right for `openat` and wrong here. Creating
+-- `./notes` is harmless only when what lands there is the file you asked for;
+-- here the content is chosen by the caller, and a silent create is precisely the
+-- bypass. So this always asks.
+local function ask_link(sys, verb)
+  local from, to = sc.path(sys, 1), sc.path(sys, 2)
+  if type(to) ~= "string" or to == "" then
+    return ask.deny("the new name could not be read, so there is nothing to ask about")
+  end
+  if type(from) == "string" and from ~= "" then
+    local read = ask.of(ask.ask_trust_read(
+      from, "The process want to " .. verb .. " " .. from .. ", which names " ..
+            to .. " as well" .. by(sys)))
+    if not read then
+      return ask.deny("reading " .. from .. " was not allowed")
+    end
+  end
+  return ask.ask_trust_write(
+    to, "The process want to " .. verb .. " " .. to .. " pointing at " ..
+        tostring(from) .. by(sys))
+end
+
+policy.linkat = function(sys) return ask_link(sys, "hard-link") end
+-- `symlinkat(target, newdirfd, linkpath)`: the strings are 0 and 2, so the
+-- engine resolves the *first* one as the target and the second as the new name.
+-- The target is not asked on read trust — it need not exist, and a symlink to a
+-- path that is not there yet is ordinary — so only the new name is asked. Reading
+-- *through* the link is still gated, because the resolver chases symlinks and
+-- reports where they go rather than what they are called.
+policy.symlinkat = function(sys) return ask_link(sys, "symlink") end
+
+-- **And the plain forms, which are the ones actually issued.** This is the same
+-- trap as `renameat`/`renameat2` one screen up, and it is worth stating as a
+-- trap because it is *already half-set here*: gating `symlinkat` alone looks
+-- completely correct and gates a syscall nothing calls. On x86-64 glibc's
+-- `symlink()` is the `symlink` syscall; `symlinkat` is what 32-bit x86 has
+-- instead, where `symlink` does not exist. So `ln -s` reaches `symlink` and
+-- never `symlinkat`, and a policy that named only the `*at` form would have left
+-- every symlink ungated while reading as though it closed them.
+--
+-- Found by running `ln -s` under the sandbox and asking `strace` what it
+-- actually called, which is the only way to have found it: `strace` reports
+-- `symlink("/etc/passwd", "./escape")` and not one `symlinkat`.
+--
+-- Both spellings are gated, for the same reason both `rename` spellings are.
+policy.link = policy.linkat
+policy.symlink = policy.symlinkat
+
+-- `fchmod(fd, mode)`: the descriptor form of the gate above, and the last of the
+-- three. It names no path in its arguments, but the tracee is our own child, so
+-- the engine reads the path back through `/proc/<pid>/fd/<n>` (`sc.fd_path`) and
+-- the question names the real file. That closes the last of the three: read-trust
+-- on a path no longer implies being able to make that file executable.
+--
+-- An fd that is not a path — a pipe, a socket, a slot already closed — has nothing
+-- to ask about, and the kernel's own answer would be `EBADF`. It is asked as a
+-- plain yes/no rather than waved through, because a policy that cannot describe a
+-- call is still a call.
+local function ask_fchmod(sys)
+  local path = sc.fd_path(sys, 1)
+  if type(path) == "string" and path ~= "" then
+    return ask.ask_trust_write(
+      path, "The process want to change the mode of " .. path .. by(sys))
+  end
+  local q = ask.for_syscall(
+    sys,
+    "to change the mode of a file it holds open by descriptor, naming no path, " ..
+    "and the descriptor is not one this system can read a path from")
+  q.path = nil
+  q.always = false
+  return ask.ask(q)
+end
+
+policy.fchmod = ask_fchmod
 
 -- One gate per capability, curried rather than called: `capability_gate(name,
 -- what)` closes over `name` and over its own `accepted` flag, and returns the
