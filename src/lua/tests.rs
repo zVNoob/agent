@@ -350,12 +350,37 @@ fn prime_the_sandbox(lua: &mlua::Lua) {
     }
 }
 
-/// Did any of the questions name `needle`? A command's own reads are not the
-/// only ones: `bash` also opens locale and NSS data, and it does some of
-/// that lazily — an error message is what triggers the locale load — so a
-/// count is fragile where "was this asked" is not.
-fn asked_about(asked: &[String], needle: &str) -> bool {
-    asked.iter().any(|q| q.contains(needle))
+/// Did any of the questions ask to `verb` this `subject`?
+///
+/// Matching the question's *subject* rather than a substring anywhere in it, and
+/// that is a change this helper exists to make. A command's own reads are not the
+/// only ones — `bash` also opens locale and NSS data, and it does some of that
+/// lazily, an error message being what triggers the locale load — so a count is
+/// fragile where "was this asked" is not. But since every question now names the
+/// asker's command line, a bare substring for a path is satisfied by *any*
+/// question the run raised, because the command line is the command the test ran.
+/// A positive assertion written that way passes even if the gate stopped asking,
+/// which is the one thing it must never do.
+///
+/// So the match is on the part before the asker's `(pid N)`, and takes the verb
+/// with the subject: "read /x" is a different question from "overwrite /x", and
+/// only the first is evidence that the read was asked about.
+fn asked_subject(asked: &[String], verb: &str, subject: &str) -> bool {
+    asked.iter().any(|q| {
+        let question = q.split(" (pid ").next().unwrap_or(q);
+        question.contains(&format!("{verb} {subject}"))
+    })
+}
+
+/// Whether a question names `port` as its endpoint, in the part before the
+/// asker's command line. The command an endpoint test runs is
+/// `exec 3<>/dev/tcp/127.0.0.1/<port>`, so the port appears in *every* question
+/// that run raises — including the ones a test asserts did not happen.
+fn asked_port(asked: &[String], port: u16) -> bool {
+    asked.iter().any(|q| {
+        let question = q.split(" (pid ").next().unwrap_or(q);
+        question.contains(&format!("port {port}"))
+    })
 }
 
 /// An ask handler that says yes to everything. The default policy asks about

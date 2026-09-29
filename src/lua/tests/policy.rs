@@ -223,7 +223,13 @@ use crate::testutil::scratch_dir;
             AskAnswer::Deny(Some("denied by user".to_string())),
         );
         assert_eq!(v["ok"], false, "a refused write is not ok: {v}");
-        assert!(asked_about(&asked, &other), "and it was asked: {asked:?}");
+        // Matched on the subject: the command line quoted in every question is
+        // `echo nope > <other>`, so a bare substring match would be satisfied by
+        // the asker's own command line and would pass even if nothing had asked.
+        assert!(
+            asked_subject(&asked, "write", &other),
+            "and it was asked: {asked:?}"
+        );
         assert!(
             v["error"].as_str().unwrap_or("").contains("denied by user"),
             "and carries the reason: {v}"
@@ -263,10 +269,24 @@ use crate::testutil::scratch_dir;
             q.contains("127.0.0.1") && q.contains("localhost"),
             "the question names the host and its address: {q:?}"
         );
+        // The port is printed once by the question itself and never folded into
+        // the address beside it. Measured on the part before the asker is
+        // appended, because the command line legitimately contains the same
+        // `/dev/tcp/127.0.0.1/<port>` — that is the point of quoting it.
+        let question = q.split(" (pid ").next().expect("non-empty");
         assert_eq!(
-            q.matches(&port.to_string()).count(),
+            question.matches(&port.to_string()).count(),
             1,
-            "and the port exactly once, not folded into the address too: {q:?}"
+            "and the port exactly once in the question, not folded into the \
+             address too: {q:?}"
+        );
+        // The asker is named. Not decoration: `connect` is asked about a host,
+        // and every gate that reached the same host would ask the same question
+        // — so without the asker there is nothing on screen to tell an `ssh` from
+        // the build the user started.
+        assert!(
+            q.contains(" (pid ") && q.contains(" [bash -c exec 3<>"),
+            "and names the asking process and its command line: {q:?}"
         );
         assert!(
             q.contains("at port"),
@@ -1267,15 +1287,34 @@ use crate::testutil::scratch_dir;
         paths: &[(usize, &str)],
         verdict: &str,
     ) -> (Option<mlua::Table>, mlua::Value) {
+        ask_through_gate_with_addr(lua, run, gate, sys, paths, &[], verdict)
+    }
+
+    /// [`ask_through_gate`], plus a decoded endpoint for the address gates.
+    ///
+    /// `sys.addr` is passed as a JSON *string* and built in Lua for the same
+    /// reason `sys.str` is: both are keyed by argument slot, and a JSON object
+    /// has string keys, so `sc.addr` and `sc.paths` — which both read numeric
+    /// keys — would see nothing.
+    fn ask_through_gate_with_addr(
+        lua: &mlua::Lua,
+        run: i64,
+        gate: &str,
+        sys: &serde_json::Value,
+        paths: &[(usize, &str)],
+        addrs: &[(usize, &str)],
+        verdict: &str,
+    ) -> (Option<mlua::Table>, mlua::Value) {
         // The syscall table arrives as JSON text and is decoded by the same
         // bridge primitive the Lua side decodes MCP replies with, rather than
         // being spliced into the chunk: a JSON object is not a Lua table, and
         // writing it out by hand here would be a second, drifting copy of the
         // shape `src/lua/sandbox.rs` builds.
         let str = serde_json::to_string(&paths.to_vec()).expect("path list");
+        let addr = serde_json::to_string(&addrs.to_vec()).expect("addr list");
         lua.load(
             r#"
-        local gate_name, run, sys_json, str_json, verdict_src = ...
+        local gate_name, run, sys_json, str_json, addr_json, verdict_src = ...
         -- One policy table per run, kept here rather than reloaded each call so
         -- that two calls in the same run really do share it. `new()` is what
         -- `bash_tool.lua` calls; the registry is only standing in for the fact
@@ -1294,6 +1333,10 @@ use crate::testutil::scratch_dir;
         sys.str = sys.str or {}
         for _, entry in ipairs(agent.api.json_decode(str_json)) do
           sys.str[entry[1]] = entry[2]
+        end
+        sys.addr = sys.addr or {}
+        for _, entry in ipairs(agent.api.json_decode(addr_json)) do
+          sys.addr[entry[1]] = agent.api.json_decode(entry[2])
         end
         -- `verdict_src` is Lua source, so that a call site can say what the user
         -- pressed — `true`, `agent.deny("…")`, or an allow-and-remember table —
@@ -1324,6 +1367,7 @@ use crate::testutil::scratch_dir;
             run,
             sys.to_string(),
             str,
+            addr,
             verdict,
         ))
         .expect("gate ran")
@@ -1699,3 +1743,186 @@ use crate::testutil::scratch_dir;
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Every gate this file ships names who is asking, and this checks that for
+    /// all of them rather than for the one a given test happened to exercise.
+    ///
+    /// The reason to want the whole list: the asker is appended by hand at each
+    /// question, so a new gate — or a new branch on an existing one — is silent
+    /// until someone notices. That is the same failure as a stale count in a
+    /// comment, and it is caught here by construction rather than by review.
+    ///
+    /// Driven through the same coroutine helper as the capability gates, with a
+    /// synthetic syscall table so the *name* is a name and not `/bin/sh`. Each
+    /// question is checked for the pid and the command line independently, since
+    /// the command line is dropped when `/proc` cannot be read and the pid is not.
+    #[test]
+    fn every_gate_names_who_is_asking() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+
+        // The gates, with whatever each one needs to reach a question. Paths
+        // point at a file that exists, so the "creating a new name is not a
+        // question" rule does not quietly answer on their behalf; the address
+        // gates need an endpoint to decode.
+        let dir = scratch_dir("agent-asker");
+        let existing = dir.join("taken.txt");
+        std::fs::write(&existing, "x\n").expect("seed");
+        let existing = existing.to_string_lossy().to_string();
+        let target = dir.join("other.txt").to_string_lossy().to_string();
+        let addr = json!({ "family": "inet", "ip": "93.184.216.34", "port": 443 });
+
+        let gates: Vec<String> = lua
+            .load(
+                r#"
+        local policy = require("policy").new()
+        local names = {}
+        for name in pairs(policy) do names[#names + 1] = name end
+        table.sort(names)
+        return table.concat(names, "\n")
+    "#,
+            )
+            .eval::<String>()
+            .expect("gate names")
+            .lines()
+            .map(str::to_string)
+            .collect();
+
+        assert!(
+            !gates.is_empty(),
+            "the shipped policy has gates; an empty list would pass this vacuously"
+        );
+
+        let mut checked = 0;
+        for gate in &gates {
+            // A syscall table shaped for the gate: a name and pid always, and the
+            // arguments it needs. `cmdline` is the same for all of them so that a
+            // failure names the gate that forgot rather than an ambiguous string.
+            let mut args = vec![json!(0); 6];
+            let mut strs: Vec<(usize, String)> = vec![];
+            let mut addr_slot = None;
+            match gate.as_str() {
+                // openat(dirfd, path, flags, …): slot 1 is the path, slot 2 flags.
+                // A write flag, so the write branch is the one that asks.
+                "openat" => {
+                    args[1] = json!(existing);
+                    args[2] = json!(1); // O_WRONLY
+                    strs.push((2, existing.clone()));
+                }
+                // …-at family: the path is slot 1, flags (where present) slot 2.
+                "unlinkat" | "chmod" | "setxattr" | "removexattr" => {
+                    args[1] = json!(existing);
+                    args[2] = json!(0);
+                    strs.push((2, existing.clone()));
+                    if gate.ends_with("xattr") {
+                        args[1] = json!(existing);
+                        args[2] = json!(existing); // the attribute name
+                        strs.push((3, existing.clone()));
+                    }
+                }
+                "fchmodat" => {
+                    args[1] = json!(existing);
+                    strs.push((2, existing.clone()));
+                }
+                "lsetxattr" | "lremovexattr" => {
+                    args[0] = json!(existing);
+                    args[1] = json!(existing);
+                    strs.push((1, existing.clone()));
+                    strs.push((2, existing.clone()));
+                }
+                "renameat" | "renameat2" => {
+                    args[1] = json!(existing);
+                    args[3] = json!(target);
+                    strs.push((2, existing.clone()));
+                    strs.push((4, target.clone()));
+                }
+                "name_to_handle_at" => {
+                    args[1] = json!(existing);
+                    strs.push((2, target.clone()));
+                }
+                "connect" | "sendto" => {
+                    args[1] = json!(0x1000);
+                    addr_slot = Some(2);
+                }
+                "bind" => {
+                    args[1] = json!(0x1000);
+                    addr_slot = Some(2);
+                }
+                _ => {
+                    // The capability gates, and anything added later: no
+                    // arguments are decoded, which is itself part of the design.
+                }
+            }
+
+            let sys = json!({
+                "name": gate,
+                "pid": 31337,
+                "cmdline": "cargo build --release",
+                "args": args,
+            });
+
+            let refs: Vec<(usize, &str)> =
+                strs.iter().map(|(slot, t)| (*slot, t.as_str())).collect();
+            let endpoint = addr.to_string();
+            let addrs: Vec<(usize, &str)> = addr_slot
+                .map(|slot| vec![(slot, endpoint.as_str())])
+                .unwrap_or_default();
+            let (q, _) = ask_through_gate_with_addr(&lua, 41, gate, &sys, &refs, &addrs, "true");
+            let Some(q) = q else {
+                // A gate that answered itself has no question to check. The
+                // working directory is trusted, so a path inside it would be
+                // silent — and that is correct behaviour, not a missing asker.
+                continue;
+            };
+            let description: String = q.get("description").expect("a description");
+            assert!(
+                description.contains("(pid 31337)"),
+                "{gate} does not name the pid that is asking: {description:?}"
+            );
+            assert!(
+                description.contains("[cargo build --release]"),
+                "{gate} does not name the command line of the asker: {description:?}"
+            );
+            checked += 1;
+        }
+
+        assert!(
+            checked >= 14,
+            "checked {checked} gates' questions. Far fewer than the mask has keys \
+             means the loop's argument shapes are answering gates early rather than \
+             exercising them, which would make this test quietly narrow."
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When `/proc` cannot be read the command line is dropped rather than
+    /// printed empty, and the pid is still there. A question reading
+    /// `... (pid 42) []` looks like an answer field the user left blank rather
+    /// than a process that has already exited.
+    #[test]
+    fn an_asker_with_no_command_line_names_only_its_pid() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+
+        let sys = json!({
+            "name": "bpf",
+            "pid": 42,
+            "cmdline": "",
+            "args": [0, 0, 0, 0, 0, 0],
+        });
+        let (q, _) = ask_through_gate(&lua, 42, "bpf", &sys, &[], "true");
+        let description: String = q
+            .expect("the gate asked")
+            .get("description")
+            .expect("a description");
+        assert!(
+            description.contains("(pid 42)"),
+            "the pid survives a process that cannot be read: {description:?}"
+        );
+        assert!(
+            !description.contains("[]"),
+            "and no empty brackets where the command line would be: {description:?}"
+        );
+    }
+

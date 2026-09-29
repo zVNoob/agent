@@ -167,21 +167,24 @@ use super::*;
         let cmd = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
 
         // A plain yes is for that one call: the endpoint is asked again.
+        // Matched on the port *in the question proper*, before the asker's
+        // command line: the command is `exec 3<>/dev/tcp/127.0.0.1/<port>`, so a
+        // bare needle for the port is now in every question this run raises.
         let (v, asked) = run_policy_bash(&lua, &cmd, AskAnswer::Allow);
-        assert!(asked_about(&asked, &port.to_string()), "asked: {asked:?} {v}");
+        assert!(asked_port(&asked, port), "asked: {asked:?} {v}");
         let (v, asked) = run_policy_bash(&lua, &cmd, AskAnswer::Allow);
         assert!(
-            asked_about(&asked, &port.to_string()),
+            asked_port(&asked, port),
             "a plain yes is not remembered: {asked:?} {v}"
         );
 
         // "always" records host:port, and the next call does not ask about it at
         // all — even though the answer it would have got is a denial.
         let (v, asked) = run_policy_bash(&lua, &cmd, AskAnswer::AllowAndTrust);
-        assert!(asked_about(&asked, &port.to_string()), "asked once: {asked:?} {v}");
+        assert!(asked_port(&asked, port), "asked once: {asked:?} {v}");
         let (v, asked) = run_policy_bash(&lua, &cmd, AskAnswer::Deny(None));
         assert!(
-            !asked_about(&asked, &port.to_string()),
+            !asked_port(&asked, port),
             "the remembered endpoint is silent: {asked:?} {v}"
         );
 
@@ -198,7 +201,7 @@ use super::*;
             AskAnswer::Allow,
         );
         assert!(
-            asked_about(&asked, &other.to_string()),
+            asked_port(&asked, other),
             "another port still asks: {asked:?} {v}"
         );
 
@@ -218,7 +221,7 @@ use super::*;
         assert!(forgotten, "the endpoint was trusted");
         let (v, asked) = run_policy_bash(&lua, &cmd, AskAnswer::Allow);
         assert!(
-            asked_about(&asked, &port.to_string()),
+            asked_port(&asked, port),
             "a forgotten endpoint asks again: {asked:?} {v}"
         );
     }
@@ -257,8 +260,14 @@ use super::*;
         let (v, asked) =
             run_policy_bash(&lua, &format!("cat {cwd}/lua/init.lua"), AskAnswer::Allow);
         assert_eq!(v["ok"], true, "the read ran: {v}");
+        // Matched on the *subject* of the question, not the substring: since
+        // every question now quotes the asker's command line, and this command
+        // line is `cat …/init.lua`, a bare "init.lua" needle also matches the
+        // loader's questions about `/usr/lib/libtinfo.so.6`. Those are real
+        // questions about real paths outside the cwd — what must not happen is a
+        // question *about this file*.
         assert!(
-            !asked_about(&asked, "init.lua"),
+            !asked.iter().any(|q| q.contains(&format!("read {cwd}/lua/init.lua ("))),
             "a read inside the trusted cwd asks nothing: {asked:?}"
         );
         let outside_path = std::env::temp_dir().join("agent-cwd-trust-probe.txt");
@@ -270,7 +279,7 @@ use super::*;
         );
         assert_eq!(v["ok"], true, "the outside read ran: {v}");
         assert!(
-            asked_about(&asked, &outside_path.to_string_lossy()),
+            asked_subject(&asked, "read", &outside_path.to_string_lossy()),
             "and the same read outside the cwd is asked: {asked:?}"
         );
         let _ = std::fs::remove_file(&outside_path);

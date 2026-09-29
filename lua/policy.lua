@@ -16,7 +16,9 @@
 -- pid cannot inherit anything.
 --
 -- The syscall-name keys are the interception mask, so the mask here is exactly
--- what this file names and nothing more:
+-- what this file names and nothing more. The wording below is the question each
+-- one asks, eliding the trailing `(pid N) [command line]` that `by` appends to
+-- all of them — see the note on it below for why that is not decoration:
 --
 --   openat   the process want to read/write {path} ({flags})
 --            A read and a write are two questions, not one: a read asks
@@ -228,13 +230,47 @@ local function server_key(addr)
   return host, addr.port
 end
 
+--- Who is asking, in the shape `ask.for_syscall` already uses: the pid, then the
+--- process's own `/proc` command line if it has one.
+---
+--- Every question in this file ends with this, and the reason is that a question
+--- naming only a path is not answerable on its own. `/tmp/build.log` is a file
+--- the agent is expected to touch; something else asking for it is a different
+--- question entirely, and the answer to one is not the answer to the other. The
+--- pid identifies *which* process, and the command line is what a human reads to
+--- tell a `make` from a `curl` from a process that renamed itself to look like
+--- one of them.
+---
+--- The command line is omitted rather than emptied when `/proc` could not be
+--- read — the process exited, or it is not ours — because a question reading
+--- `[]` at the end looks like an empty field rather than a missing one.
+---
+--- Deliberately string manipulation here rather than inside `agent.ask`: the ask
+--- helpers take a finished sentence, and this file is what knows a question came
+--- from a syscall. Teaching the helpers about `sys` would put a dependency on the
+--- syscall table into the module that answers *every* question, including the
+--- ones with no syscall behind them at all — `fs.read` asks, and there is no
+--- `sys` to name. The cost is that each question has to remember to append this,
+--- which is the thing the test at the end of this file is for.
+local function by(sys)
+  local tail = string.format("(pid %d)", sys.pid or 0)
+  local cmdline = sys.cmdline
+  if type(cmdline) == "string" and cmdline ~= "" then
+    tail = tail .. " [" .. cmdline .. "]"
+  end
+  return " " .. tail
+end
+
 --- The question a *reach* raises, worded for the syscall doing it: "access" for
 --- `connect`, "send to" for `sendto`. The address and the port are named
---- separately, so neither is printed twice.
-local function reach_question(what, addr)
+--- separately, so neither is printed twice, and the asker is named last so the
+--- part the user is deciding on comes first.
+local function reach_question(what, addr, sys)
   return "The process want to " .. what .. " " .. sc.describes_addr(addr) ..
-         " at port " .. tostring(sc.port_of(nil, addr) or "?")
+         " at port " .. tostring(sc.port_of(nil, addr) or "?") ..
+         by(sys)
 end
+
 
 
 --- A fresh policy table: one closure per gate, per run.
@@ -292,9 +328,10 @@ policy.openat = function(sys)
     return ask.ask_trust_write(
       path,
       "The process want to write " .. tostring(path) .. " (" ..
-      sc.describes("openat", flags) .. ")")
+      sc.describes("openat", flags) .. ")" .. by(sys))
   end
-  return ask.ask_trust_read(path, "The process want to read " .. tostring(path))
+  return ask.ask_trust_read(
+    path, "The process want to read " .. tostring(path) .. by(sys))
 end
 
 -- Reaching for an endpoint. The ask records the host (and port) in the
@@ -302,7 +339,7 @@ end
 policy.connect = function(sys)
   local addr = sc.addr(sys)
   local host, port = server_key(addr)
-  return ask.ask_server(host, port, reach_question("access", addr))
+  return ask.ask_server(host, port, reach_question("access", addr, sys))
 end
 
 -- Opening a port. Same table, same reasoning: a port vouched for once is a port
@@ -313,7 +350,7 @@ policy.bind = function(sys)
   return ask.ask_server(
     host, port,
     "The process want to open port " .. tostring(sc.port_of(nil, addr) or "?") ..
-    " on " .. sc.describes_addr(addr))
+    " on " .. sc.describes_addr(addr) .. by(sys))
 end
 
 -- Changing a file's mode. Metadata rather than content, but it is a permission
@@ -328,7 +365,8 @@ end
 local function ask_change_mode(sys)
   local path = sc.path(sys)
   return ask.ask_trust_write(
-    path, "The process want to change the mode of " .. tostring(path))
+    path,
+    "The process want to change the mode of " .. tostring(path) .. by(sys))
 end
 
 policy.chmod = ask_change_mode
@@ -353,7 +391,7 @@ local function ask_xattr(sys, verb)
     path,
     "The process want to " .. verb .. " the " ..
     (type(name) == "string" and name or "extended attributes") ..
-    " of " .. tostring(path))
+    " of " .. tostring(path) .. by(sys))
 end
 
 policy.setxattr = function(sys) return ask_xattr(sys, "set") end
@@ -365,7 +403,7 @@ policy.lremovexattr = function(sys) return ask_xattr(sys, "remove") end
 policy.sendto = function(sys)
   local addr = sc.addr(sys)
   local host, port = server_key(addr)
-  return ask.ask_server(host, port, reach_question("send to", addr))
+  return ask.ask_server(host, port, reach_question("send to", addr, sys))
 end
 
 -- Deleting a name. Gated on **write** trust in the path, not read: unlinking is
@@ -380,7 +418,7 @@ end
 policy.unlinkat = function(sys)
   local path = sc.path(sys)
   return ask.ask_trust_write(
-    path, "The process want to delete " .. tostring(path))
+    path, "The process want to delete " .. tostring(path) .. by(sys))
 end
 
 -- Moving a name. Two questions, because a rename is two things at once: the
@@ -402,7 +440,8 @@ local function ask_rename(sys)
   end
   local moved = ask.of(
     ask.ask_trust_write(
-      from, "The process want to move " .. from .. " to " .. tostring(to)))
+      from,
+      "The process want to move " .. from .. " to " .. tostring(to) .. by(sys)))
   if not moved then
     return ask.deny("the move of " .. from .. " was not allowed")
   end
@@ -412,7 +451,9 @@ local function ask_rename(sys)
       existing:close()
       local overwrote = ask.of(
         ask.ask_trust_write(
-          to, "The process want to overwrite " .. to .. " by moving " .. from))
+          to,
+          "The process want to overwrite " .. to .. " by moving " .. from ..
+          by(sys)))
       if not overwrote then
         return ask.deny("overwriting " .. to .. " was not allowed")
       end
@@ -523,7 +564,7 @@ policy.name_to_handle_at = function(sys)
   return ask.ask_trust_read(
     path,
     "The process want to take an opaque handle for " .. tostring(path) ..
-    ", which can then be opened without naming it again")
+    ", which can then be opened without naming it again" .. by(sys))
 end
 
 -- Everything else that reaches past the filesystem: no arguments worth reading,

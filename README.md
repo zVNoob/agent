@@ -359,6 +359,25 @@ in the transcript and nothing accumulates while you think. Your answer goes on t
 status bar — `allowed`, `allowed, and remembered`, or `denied` — because one line
 cannot pile up.
 
+Every question from a sandboxed command also names **who is asking** — the pid,
+and the process's own `/proc` command line:
+
+```
+┌─ [y]es · [n]o · [a]lways ──────────────────────────┐
+│ The process want to write /etc/cron.d/agent (O_WRONLY│
+│ |O_CREAT) (pid 41337) [make -C /srv/app install]     │
+└─────────────────────────────────────────────────────┘
+```
+
+That is not decoration. A question naming only a path is not answerable on its
+own: `/tmp/build.log` is a file the agent is expected to touch, and something
+else asking for it is a different question entirely — and an answer to one is not
+the answer to the other. The pid says *which* process; the command line is what
+you read to tell a `make` from a `curl` from a process that has renamed itself
+to look like one of them. When `/proc` cannot be read the line is dropped and the
+pid is shown alone, because `[]` reads as a field you left blank rather than a
+process that has already exited.
+
 `[a]lways` is offered only when the answer is one the agent can act on: a question
 with a path or an endpoint to remember offers it, and one without does not. Only
 `always` is remembered, as path trust or as a trustworthy-server entry, kept in
@@ -580,7 +599,7 @@ cargo test && ./scripts/verify-sandbox.sh
 `verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
 fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
 `src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
-the check that the sandbox is still there at all. The suite is 385 library tests
+the check that the sandbox is still there at all. The suite is 387 library tests
 and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
 compiler (`-- --ignored` runs them).
 
