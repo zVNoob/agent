@@ -15,11 +15,18 @@
 //!
 //! ```text
 //! [user] <prompt>
+//! [reasoning] <streamed reasoning>          (stderr; only if the model has any)
 //! <streamed model content>
 //! [tool-call] bash {"cmdline":"..."}
 //! [tool-result] {"stdout":"...","exit_code":0,...}
 //! [done]
 //! ```
+//!
+//! The labels are once per item, never inside one: reasoning in particular
+//! streams a token at a time, and a label repeated per token is a label a script
+//! has to strip out of the middle of a field. Reasoning goes to stderr, so
+//! stdout stays exactly "the model, its tool calls, and their results" and can be
+//! piped somewhere on its own.
 //!
 //! Config: `~/.config/agent/init.lua` (the LLM endpoint and the system prompt,
 //! the same Lua configuration the TUI reads); the `AGENT_BASE_URL` / `AGENT_MODEL` /
@@ -97,20 +104,52 @@ fn config_from_lua_or_env() -> (api::ChatConfig, String, agent::lua::MemoryConfi
     }
 }
 
+/// Put SIGPIPE back to its default disposition.
+///
+/// Rust ignores it, which turns the most ordinary thing anyone does with a
+/// command-line tool — `agent_probe | head` — into a panic on the way out:
+/// `head` exits, our next `println!` gets EPIPE, and the process dies with
+/// "failed printing to stdout: Broken pipe" instead of finishing the work it was
+/// asked to do. The default disposition is a silent exit, which is what every
+/// other tool in a pipeline does and what a script reading our exit status
+/// expects.
+///
+/// `unsafe` because `signal` is `signal`; this is the documented idiom and there
+/// is no safe wrapper, since the whole point is to change a process-global the
+/// runtime set on our behalf.
+fn restore_sigpipe() {
+    // SAFETY: `signal` with SIG_DFL is async-signal-safe and is called here,
+    // before any other thread this binary starts exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    restore_sigpipe();
     let (config, system_prompt, memcfg) = config_from_lua_or_env();
     // The config VM the tool registry and the `turn_completed` handlers share —
     // mlua VMs cannot cross threads, so it is created here on this thread. Its
     // sink is where a handler's `agent.panel` ops land, exactly as the TUI's
     // round sink collects them; the probe prints them at `[done]`.
     let event_sink = agent::panels::PanelSink::default();
-    let vm = agent::lua::new_agent_vm(Some(&event_sink))
-        .map(|(vm, _)| vm)
-        .unwrap_or_else(|e| {
+    let vm = match agent::lua::new_agent_vm(Some(&event_sink)) {
+        Ok((vm, _)) => vm,
+        Err(e) => {
+            // The user config is *optional* — the probe is a dev harness and the
+            // endpoint can come from the environment instead — so a config that
+            // will not load is a warning, not the end. A tree that will not load
+            // is not optional at all: there is no tool registry without it and
+            // nothing this binary does would work, so it propagates and `main`
+            // prints it. Reported rather than panicked, because the difference
+            // between "your Lua tree is missing, here are the four places we
+            // looked" and "thread 'main' panicked" is the whole value of a good
+            // error message.
             eprintln!("[probe] warning: Lua config unavailable ({e}); no tools advertised");
-            agent::lua::new_vm().expect("a bare agent VM")
-        });
+            agent::lua::new_vm().map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+    };
 
     // Open the conversation log exactly like the TUI (path + on/off from
     // `agent.llm.memory`) so the probe archives each finished turn and any
@@ -191,6 +230,14 @@ async fn main() -> Result<()> {
             };
             let mut builder = api::TurnBuilder::new();
             let mut failed: Option<String> = None;
+            // One label per *block*, not per delta. Reasoning arrives a token at
+            // a time, so printing the label with each one turned a readable line
+            // into `[reasoning] The[reasoning]  user[reasoning]  wants[reasoning] `,
+            // which is the opposite of what this output is for: the file header
+            // promises a machine-readable stream, and a label repeated inside the
+            // payload is a label a script has to strip from the middle of a
+            // field.
+            let mut reasoning_open = false;
             while let Some(ev) = stream.next().await {
                 let ev = match ev {
                     Ok(e) => e,
@@ -201,16 +248,27 @@ async fn main() -> Result<()> {
                 };
                 match &ev {
                     api::TurnEvent::Content(d) => {
+                        if reasoning_open {
+                            reasoning_open = false;
+                            eprintln!();
+                        }
                         print!("{d}");
                         let _ = std::io::stdout().flush();
                     }
                     api::TurnEvent::Reasoning(d) => {
-                        eprint!("[reasoning] {d}");
+                        if !reasoning_open {
+                            reasoning_open = true;
+                            eprint!("[reasoning] ");
+                        }
+                        eprint!("{d}");
                         let _ = std::io::stderr().flush();
                     }
                     _ => {}
                 }
                 builder.apply(ev);
+            }
+            if reasoning_open {
+                eprintln!();
             }
             println!();
             let _ = std::io::stdout().flush();

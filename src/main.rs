@@ -95,6 +95,17 @@ const MOUSE_OFF: &str = "\x1b[?1000l\x1b[?1006l";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // Rust ignores SIGPIPE, which turns `agent | head` into a panic on the way
+    // out — the caller has gone and the tool dies with "failed printing to
+    // stdout" instead of finishing. The default disposition is a silent exit,
+    // which is what every other tool in a pipeline does. `unsafe` because
+    // `signal` is `signal`; called before any other thread exists.
+    //
+    // SAFETY: `signal` with SIG_DFL is async-signal-safe, and this runs before
+    // the runtime starts any thread of ours.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // Configuration lives in Lua (~/.config/agent/init.lua, if it exists):
     // the LLM endpoint (base_url / model / api_key — formerly AGENT_BASE_URL /
     // AGENT_MODEL / AGENT_API_KEY), the system prompt, and the tools

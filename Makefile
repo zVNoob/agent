@@ -23,12 +23,23 @@ CARGO_FLAGS ?= --locked
 # `PACKAGE` in src/lua/tree.rs.
 PACKAGE := agent
 
-.PHONY: all build test gate lint fmt fmt-check clippy install uninstall clean
+.PHONY: all build run probe test gate lint fmt fmt-check clippy install uninstall clean
 
 all: build
 
 build:
 	$(CARGO) build --release
+
+# Run a release build against the *working tree* rather than an installed copy.
+# A release binary only ever reads the tree it was installed with (see
+# src/lua/tree.rs), so `cargo build --release && ./target/release/agent` inside a
+# checkout has no `share/` to find — which is correct, and annoying. These targets
+# are the one-liner for it.
+run: build
+	AGENT_LUA_DIR=$(CURDIR)/lua $(CARGO) run --release --bin agent
+
+probe: build
+	AGENT_LUA_DIR=$(CURDIR)/lua $(CARGO) run --release --bin agent_probe -- $(ARGS)
 
 test:
 	$(CARGO) test

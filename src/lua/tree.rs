@@ -147,6 +147,21 @@ pub(super) fn missing_tree_message(candidates: &[(&'static str, PathBuf)]) -> St
         "\nSet $AGENT_LUA_DIR to the directory holding init.lua to override all \
          of them.",
     );
+    // …and, if this is a machine that has the source tree, say so. A release
+    // build run out of a checkout is a completely ordinary thing to do
+    // (`cargo build --release && ./target/release/agent`) and the install paths
+    // above will all be misses, which reads as a broken install rather than as
+    // "you are in the wrong directory". Naming the checkout — as something to
+    // point the variable at, not as something searched — is the difference
+    // between a message someone can act on and one they have to reason about.
+    let built_from = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua");
+    if built_from.join("init.lua").is_file() {
+        msg.push_str(&format!(
+            "\nThis machine has the source tree; `AGENT_LUA_DIR={}` will use it, \
+             and `make run` is that with the other arguments filled in.",
+            built_from.display()
+        ));
+    }
     msg
 }
 
