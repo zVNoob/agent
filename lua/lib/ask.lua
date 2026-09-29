@@ -156,68 +156,6 @@ end
 -- `/reload` does not clear them (it reloads the config on the same VM).
 -- ==========================================================================
 
--- ==========================================================================
--- Capabilities: the one grant that is scoped rather than remembered
---
--- The tables above record "this *thing* is fine" — a path, a host — and outlive
--- the run because the thing they name outlives it. A capability has no thing:
--- `io_uring_enter` is the same syscall whoever calls it, and the only reason to
--- let it through once and not again is that the command in front of you is
--- still the same command. So these are keyed on `run` — the sandbox's own id,
--- the same for a whole tree however it forks, and never reused — and a grant
--- ends when that run does.
---
--- The alternative, a table that outlives the run, was the obvious first cut and
--- is the thing this design exists to avoid. "This program may reach any file"
--- is not a decision anyone makes about a *program*: the next `bash` is a
--- different program that would inherit it silently, and the user would have no
--- way to see that it had. Scoped, the question comes back on the next command,
--- which is the honest frequency for a grant that broad.
---
--- `run` is required rather than defaulted. A grant with no scope is exactly the
--- leak above, so an unscoped one is an error instead of a wider default — and
--- the policy gates have `sys.run` to hand.
--- ==========================================================================
-local capabilities = {}   -- run -> { capability -> true }
-
---- Record that `name` was accepted for `run`, so the gate asking about it can
---- answer itself for the rest of that run and not one moment longer.
-function M.trust_capability(name, run)
-  if type(name) ~= "string" or name == "" then
-    error("agent.ask.trust_capability: name must be a non-empty string", 2)
-  end
-  if run == nil then
-    error("agent.ask.trust_capability: a capability grant needs the run it " ..
-          "belongs to — there is no unscoped form, because a grant that outlived " ..
-          "the command would be inherited by the next one silently", 2)
-  end
-  local for_run = capabilities[run]
-  if not for_run then
-    for_run = {}
-    capabilities[run] = for_run
-  end
-  for_run[name] = true
-end
-
---- Whether `name` has already been accepted in `run`. The first half of
---- `M.trust_capability`, and the only thing a capability gate reads.
-function M.capability_granted(name, run)
-  local for_run = capabilities[run]
-  return for_run ~= nil and for_run[name] == true
-end
-
---- Take one back. Nothing asks, so this exists for the other side: a config
---- that wants a capability off for a run it does not control, and for tests.
-function M.forget_capability(name, run)
-  local for_run = capabilities[run]
-  if for_run then for_run[name] = nil end
-end
-
---- Every capability granted, keyed by run — for `forget_all`, and so a config
---- can see what the session has accepted rather than having to guess.
-function M.capabilities()
-  return capabilities
-end
 local trust_tables = {
   general = {},
   write = {},
@@ -603,14 +541,16 @@ function M.trusted_readonly_paths()
 end
 
 --- Forget everything, all four tables (a test hook, and an escape hatch).
---- Empty every path table and every capability. The capability table is keyed
---- by run, and a run that is still going would otherwise keep answering for
---- itself after this — which is the one thing "forget everything" must not do.
+--- Empty every path table.
+---
+--- A gate that remembers in a closure is *not* reached from here, and that is
+--- deliberate: its memory dies with the policy table it lives in, which is per
+--- run, so there is nothing left to clear once the run is over. A grant that
+--- outlived its question would be the leak this design exists to prevent.
 function M.forget_all()
   for _, into in pairs(trust_tables) do
     for key in pairs(into) do into[key] = nil end
   end
-  for key in pairs(capabilities) do capabilities[key] = nil end
 end
 
 -- The verdict wire shape. `agent.deny` (lua/lib/bash.lua) owns it; this is the
@@ -716,12 +656,18 @@ end
 -- the rest of the run — *longer* than the run, since the file outlives it. Set
 -- `a.always = false` on the returned table to ask a plain yes/no question.
 --
--- A grant with a shorter life than the run sets `a.always` to the text it wants
--- drawn after the `[a]` instead of `true` — `"lways this run"` — and fills in
--- `a.capability` and `a.run` so there is something to record and somewhere to
--- record it. `lua/policy.lua`'s `capability_gate` is the worked example; the
--- point of the string is that a narrower answer does not claim to be an
--- `always`, so the dialog says what it actually does.
+-- A grant with a shorter life than the path tables does it differently, and
+-- this is where both halves are visible:
+--
+--   * `a.always` becomes the *text* drawn after the `[a]` rather than `true`, so
+--     the dialog says what the answer actually does — `"lways this run"` rather
+--     than a plain `lways` the grant cannot keep;
+--   * `a.remember` is a function the asking side supplies, and choosing the
+--     third answer calls it. That is how a capability is remembered at all: the
+--     path tables hold paths, so a grant that is not about a path brings its own
+--     memory, and the closure holding it is the asking side's own.
+--
+-- `lua/policy.lua`'s `capability_gate` is the worked example.
 function M.for_syscall(sys, what, detail)
   if type(sys) ~= "table" or type(sys.name) ~= "string" then
     error("agent.ask.for_syscall: expected the syscall table", 2)
@@ -962,18 +908,24 @@ function M.ask(what, extra, panel)
   -- the asking side is the only one that knows *what* was asked about — so the
   -- remembering happens here, where the ask table still has it.
   --
-  -- Two things can be remembered, and they are remembered differently on
-  -- purpose. A **path** outlives the run that vouched for it, because the file
-  -- does too, so it goes in the path tables and is offered a plain `always`. A
-  -- **capability** has no path to keep — there is nothing specific about it —
-  -- so it is scoped to `ask.run` instead, and the dialog says so where the user
-  -- can see it. A verdict that says to trust an ask with neither is just an
-  -- allow, and is recorded nowhere.
+  -- "Always allow this": the answer carries the instruction to remember, and the
+  -- asking side is the only one that knows *what* was asked about — so the
+  -- remembering happens here, where the ask table still has it. Two shapes of
+  -- memory, and the split is the point:
+  --
+  --   * a **path** outlives the run that vouched for it, because the file does
+  --     too, so it goes in the path tables and is matched by every later call;
+  --   * anything else — a capability — has nothing to put in a table, so the
+  --     ask carries its own `remember` function and the closure that owns it
+  --     does the remembering. `M.ask` does not need to know how.
+  --
+  -- A verdict that says to remember an ask offering neither is just an allow:
+  -- there was nothing to record it against, so recording it would be a fiction.
   if type(verdict) == "table" and verdict.trust then
     if ask.path then
       pcall(M.trust, ask.path)
-    elseif ask.capability and ask.run ~= nil then
-      pcall(M.trust_capability, ask.capability, ask.run)
+    elseif type(ask.remember) == "function" then
+      pcall(ask.remember)
     end
   end
   local allowed, reason = M.of(verdict, ask.description)

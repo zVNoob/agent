@@ -491,7 +491,7 @@ reading the list above for, because each one closes a route around all the other
   memory, the kernel itself. None of them has an argument worth decoding, so
   each is one line in `lua/policy.lua` and one plain question.
 
-Capability questions can be remembered, but only for the sandbox run they were
+Capability questions can be remembered, but only for the command they were
 accepted in — so their third answer is not `always` but **`lways this run`**, and
 that is what the dialog draws:
 
@@ -513,10 +513,18 @@ to anything: kept past the run, it would be inherited silently by the next
 command, which is a different program. A per-run grant costs you one question
 per command instead of one per syscall, and cannot leak past the thing you read.
 
-The id a grant is keyed on is a counter, not the process's pid: one value per
-sandbox for its whole life, never reused. Pids are recycled, so a grant keyed on
-one would outlive the run that made it and be picked up by whatever the kernel
-hands that number to next.
+**There is no id anywhere in that.** `lua/policy.lua` exports a constructor
+rather than a policy, and `bash_tool.lua` calls it once per command:
+
+```lua
+agent.bash(args.cmdline, require("policy").new(), { … })
+```
+
+Each call builds a fresh table of fresh closures. A gate's memory is an upvalue,
+and the next command has no reference to this table — so the grant is not
+*scoped* to a run, it is unreachable from any other. Nothing identifies a run
+for a stale grant to be confused with a live one, which is also why a recycled
+pid cannot inherit anything: there is no key to recycle.
 
 `memfd_secret` is the near miss, and is deliberately **not** gated: glibc uses it
 for the per-thread guard pages behind `MALLOC_TUNABLE_*`, and a gate that fires on
@@ -572,7 +580,7 @@ cargo test && ./scripts/verify-sandbox.sh
 `verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
 fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
 `src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
-the check that the sandbox is still there at all. The suite is 384 library tests
+the check that the sandbox is still there at all. The suite is 383 library tests
 and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
 compiler (`-- --ignored` runs them).
 

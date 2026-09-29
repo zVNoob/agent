@@ -454,7 +454,7 @@ fn assert_default_shell(lua: &mlua::Lua) {
     let gates: String = lua
         .load(
             r#"
-        local policy = require("policy")
+        local policy = require("policy").new()
         local names = {}
         for name in pairs(policy) do names[#names + 1] = name end
         table.sort(names)

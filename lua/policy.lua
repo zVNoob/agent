@@ -1,8 +1,19 @@
 -- policy.lua — the default sandbox policy behind the shipped `bash` tool.
 --
--- Returned by `require("policy")`, and the whole reason a shell run is something
--- the user agreed to rather than something it just did: **every** file it opens
--- and **every** endpoint it reaches is **asked** first.
+-- `require("policy").new()` returns a policy: a table of `syscall name ->
+-- callback`, and the whole reason a shell run is something the user agreed to
+-- rather than something it just did. **Every** file it opens and **every**
+-- endpoint it reaches is **asked** first.
+--
+-- **A policy is built per run, not per process, and that is what makes its
+-- memory per run.** `.new()` is called once for each `agent.bash` invocation and
+-- hands back a fresh table of fresh closures; the previous run's table is
+-- dropped when it returns. A gate that remembers therefore needs nothing to
+-- scope its memory — no run id, no pid, no key it could get wrong. Its memory is
+-- an upvalue, and an upvalue is unreachable from the next run because the next
+-- run never sees this table again. There is no identifier anywhere in the design
+-- for a stale grant to be confused with a live one, which is also why a recycled
+-- pid cannot inherit anything.
 --
 -- The syscall-name keys are the interception mask, so the mask here is exactly
 -- what this file names and nothing more:
@@ -150,16 +161,16 @@
 -- The rest ask about a **capability**: the syscall is itself what is being
 -- vouched for, and there is no path, host or port in it for a table to hold. So
 -- `always` is not a flag there but a *string* — `lways this run` — and it is
--- exactly what it says. The grant is keyed on the sandbox's own id, is the same
--- for a whole tree however it forks, and ends when that run does.
+-- exactly what it says. The grant is an upvalue of that gate's closure, which
+-- every worker in the tree shares and no other command can reach.
 --
--- That scope is the design rather than a limitation, and the wider alternative
--- was the obvious first cut: a capability table that outlived the run would
--- answer the *next* command's `io_uring_enter` with no question at all, and
--- "this program may reach any file" is not a decision anyone makes about a
--- *program* — the next `bash` is a different program that would inherit it
--- invisibly. Scoped, the question comes back once per command rather than once
--- per syscall, which is the honest frequency for a grant that broad.
+-- That lifetime is the design rather than a limitation, and the wider
+-- alternative was the obvious first cut: a capability table that outlived the
+-- run would answer the *next* command's `io_uring_enter` with no question at
+-- all, and "this program may reach any file" is not a decision anyone makes
+-- about a *program* — the next `bash` is a different program that would inherit
+-- it invisibly. A closure costs one question per command rather than one per
+-- syscall, and carries no key that could go stale.
 --
 -- Where a capability names *another process* — `pidfd_getfd`,
 -- `process_vm_readv`, `process_vm_writev` — its pid is deliberately left out of
@@ -172,14 +183,18 @@
 --
 -- A file question is remembered by the path tables in `agent.ask`
 -- (`ask_trust_read` / `ask_trust_write`); a network question by the
--- trustworthy-server table (`ask_server`): a host, or one `host:port`. A
--- capability question is remembered by neither — it is keyed on the run and
--- dies with it, so it is the one answer here that does not outlive the
--- question. Separate
+-- trustworthy-server table (`ask_server`): a host, or one `host:port`. Separate
 -- tables on purpose — a trusted file is not a trusted peer, and forgetting one
 -- must never forget the other. A plain `yes` is for that one operation; only
--- `always` is recorded, and both tables live on the agent's own VM, so a grant
--- outlives the call that made it.
+-- the third answer is recorded, and both tables live on the agent's own VM, so
+-- such a grant outlives the call that made it.
+--
+-- A **capability** question is remembered by neither, and this is the one answer
+-- here that does not outlive the question. It has no path or host to put in a
+-- table, so the gate brings its own `remember` closure and the recording happens
+-- there. The gate is a closure of a table this file builds per run, so the grant
+-- dies with the policy — and since nothing else holds a reference to that table,
+-- "dies with" is not a rule anyone has to enforce.
 --
 -- ## The other two seams
 --
@@ -196,6 +211,11 @@
 -- shell in `agent.mcps`, and that is what lets a mode drop it. Both modules are
 -- read at call time, not load time, so the `require`s here are order-independent.
 local sc, ask = require("seccomp"), require("ask")
+
+-- The module table. It exports exactly one thing, `new`, and it exports the
+-- *constructor* rather than a policy — see its doc below for why that is the
+-- whole scoping mechanism.
+local M = {}
 
 --- The trust key for an endpoint: the name the user was shown, or the address
 --- when it has none. An endpoint the engine could not read at all is keyed by a
@@ -217,6 +237,19 @@ local function reach_question(what, addr)
 end
 
 
+--- A fresh policy table: one closure per gate, per run.
+---
+--- Everything below is inside this function, and that placement is the design
+--- rather than an accident of style. A `local` at module level would be created
+--- once per *process* and shared by every command, so any state a gate closed
+--- over would belong to every run and not to the one that asked — the exact
+--- failure this refactor exists to remove. As it stands, a gate's memory is born
+--- with the run and dies with it.
+---
+--- The gates are returned rather than registered on `agent`, because this file
+--- is a module and not a lib-module (see the `lib/` convention): it is passed
+--- per call to `agent.bash`, which is what lets a mode drop the shell entirely.
+function M.new()
 local policy = {}
 
 -- Every open is asked, read or write — with one exception, below. The tty probe
@@ -401,37 +434,46 @@ end
 policy.renameat = ask_rename
 policy.renameat2 = ask_rename
 
--- One gate per capability, and a *closure* rather than a shared helper call,
--- because the thing each gate has to remember is keyed by its own name: the
--- accepted set is a two-level table, and a closure is what keeps each gate
--- reading only its own row of it. Nothing here is global to the policy table
--- either — `require("policy")` hands the same table to every call, so any state
--- captured at load time would be shared by every command, which is exactly what
--- a per-run grant must not be.
+-- One gate per capability, curried rather than called: `capability_gate(name,
+-- what)` closes over `name` and over its own `accepted` flag, and returns the
+-- callback the mask ends up holding. Currying is what scopes the memory. The
+-- closure is created inside `M.new`, so it belongs to one run: `accepted` is an
+-- upvalue of a function the next run has no reference to.
+--
+-- Nothing identifies a run anywhere in this, which is the point. The earlier
+-- shape keyed the accepted set on a sandbox id and needed the id to be unique
+-- and unrecyclable — a property of the *engine* that the policy had to trust.
+-- Here there is no key at all, so there is no way for one run's grant to be read
+-- as another's, whether the run is the next command or a different process
+-- entirely. The memory is not scoped; it is simply unreachable.
 --
 -- The loop, and why each step is there:
 --
---   1. already accepted in *this* run? Then the gate answers itself. This is
---      the whole of what the grant is for: a program that opens one ring should
---      be asked once about it, not once per `io_uring_enter` for the rest of the
---      command. `sys.run` is the sandbox's own id, so the next command asks
---      again — the grant is scoped to the thing the user actually looked at.
+--   1. already accepted in this run? Then the gate answers itself, which is the
+--      whole of what the grant is for: a program that opens one ring should be
+--      asked once about it, not once per `io_uring_enter` for the rest of the
+--      command — and every worker in the tree shares this one closure, so a
+--      server's workers do not each bring their own question.
 --   2. otherwise build the question. `for_syscall` fills the description; `path`
---      is *dropped*, because `ask` short-circuits to `true` on a trusted path
---      and a grant about a file must not answer a question about a capability
---      (set here rather than left to the engine's pathname table staying right).
---   3. `always` is a string rather than a flag, and the string is what the
---      dialog draws after the `[a]`. "always" would be a lie: a capability
---      grant cannot outlive the run, so it says `lways this run` and the user
---      reads the scope at the moment they choose it.
+--      is *dropped*, because `ask` short-circuits to `true` on a trusted path and
+--      a grant about a file must not answer a question about a capability (set
+--      here rather than left to the engine's pathname table staying right).
+--   3. `always` is a string rather than a flag, and the string is what the dialog
+--      draws after the `[a]`. "always" would be a lie: this grant cannot outlive
+--      the run, so it says `lways this run` and the user reads the limit at the
+--      moment they choose it.
 local function capability_gate(name, what)
+  local accepted = false
   return function(sys)
-    if ask.capability_granted(name, sys.run) then return true end
+    if accepted then return true end
     local q = ask.for_syscall(sys, what)
     q.path = nil
     q.always = "lways this run"
-    q.capability = name
-    q.run = sys.run
+    -- The memory, and the only copy of it: `ask` calls this when — and only
+    -- when — the user pressed the third answer, so a plain `y` still asks again.
+    -- `name` is not read here, which is deliberate: the closure is one per gate,
+    -- so it cannot record another gate's answer by construction.
+    q.remember = function() accepted = true end
     return ask.ask(q)
   end
 end
@@ -506,3 +548,6 @@ for name, what in pairs({
 end
 
 return policy
+end
+
+return M

@@ -65,7 +65,12 @@ local function run(args)
   -- the full command either way, in the transcript of the model's own call.
   local title = str.normalize_ws(args.cmdline)
   local p = agent.panel(title, { boxed = true, conceal_box = false })
-  local s = agent.bash(args.cmdline, require("policy"), {
+  -- `.new()` per call, not `require("policy")` itself: a policy is built for
+  -- this run and thrown away with it, so a gate that remembers anything
+  -- remembers it in a closure this call owns. Handing `require` straight to
+  -- `agent.bash` would share one table — and one table's closures — across every
+  -- command, which is the leak `policy.lua`'s constructor exists to prevent.
+  local s = agent.bash(args.cmdline, require("policy").new(), {
     on_stdout = function(chunk)
       -- A panel append is a bridge call; a tool that loses its panel must not
       -- take the run down with it, so the append is guarded.

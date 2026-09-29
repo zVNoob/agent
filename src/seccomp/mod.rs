@@ -104,7 +104,7 @@ use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -194,15 +194,6 @@ pub struct Syscall {
     pub pid: i32,
     pub nr: i32,
     pub args: [u64; 6],
-    /// Which sandbox this call arrived in — one id for the whole tree, assigned
-    /// at [`Sandbox::spawn`] and never reused.
-    ///
-    /// This is the identity a policy scopes per-run state to. The root pid is
-    /// the obvious candidate and the wrong one: pids are recycled, so a grant
-    /// keyed on one outlives the run that made it and is silently inherited by
-    /// whatever the kernel hands that number to next. A counter cannot be
-    /// recycled, so a grant keyed on this ends where the run does.
-    pub run: u64,
 }
 
 impl Syscall {
@@ -312,11 +303,6 @@ static LIVE_RUN: Mutex<Option<InterruptHandle>> = Mutex::new(None);
 /// what makes it safe to fire on every press without first checking whether a
 /// tool happens to be live. Any run that starts later is unaffected: it brings
 /// its own flag.
-/// The next sandbox run id. Monotonic and process-global, so two live sandboxes
-/// never share one and no id is ever handed out twice — see [`Syscall::run`]
-/// for why that is the property the whole scoping scheme rests on.
-static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
-
 pub fn request_interrupt() {
     if let Some(handle) = LIVE_RUN.lock().ok().and_then(|slot| slot.clone()) {
         handle.interrupt();
@@ -385,9 +371,6 @@ pub struct Sandbox {
     /// (non-empty only while the pipe buffer is full).
     input: Vec<u8>,
     child: libc::pid_t,
-    /// This run's id, handed to every [`Syscall`] the tree makes. See
-    /// [`Syscall::run`]: unlike `child` it is not recycled.
-    run: u64,
     /// Every pid observed in the tree so far: the root [`Sandbox::spawn`]
     /// child plus every process that has made a syscall since. fork/clone
     /// children announce themselves via their first post-fork syscall (see
@@ -897,7 +880,6 @@ impl Sandbox {
             stdin_closed: false,
             input: Vec::new(),
             child: pid,
-            run: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
             pids: [pid].into_iter().collect(),
             forks: 0,
             interrupted: false,
@@ -1691,7 +1673,6 @@ impl Sandbox {
             pid: caller_pid,
             nr: notif.data.nr,
             args: notif.data.args,
-            run: self.run,
         };
         let verdict = (self.decider)(&syscall);
         match verdict {
@@ -2878,80 +2859,4 @@ mod tests {
         }
         assert!(gone, "dropping a live sandbox must kill its whole tree");
     }
-
-    /// The run id is what a policy scopes per-run state to, so its two halves
-    /// are the whole contract: one id for a whole tree however it forks, and a
-    /// different one per run, never repeated.
-    ///
-    /// The fork half is the reason `Syscall::run` is not the root pid read at
-    /// the call site. A worker's `pid` differs from the root's, so keying on
-    /// `s.pid` would give every worker its own grant — and the question would
-    /// come back on each new worker, which is the flood the scope exists to
-    /// stop. Keying on the root has the same shape of problem in the other
-    /// direction: it is stable within a run, which is right, but pids are
-    /// recycled *between* runs, so a grant keyed on one outlives the run that
-    /// made it and is inherited silently by whatever the kernel hands that
-    /// number to next. The counter is the identity that has neither defect.
-    #[test]
-    fn a_run_id_is_one_per_tree_and_never_reused() {
-        // Distinct runs, distinct ids.
-        let a = Sandbox::spawn("/bin/true", &[], |_| Verdict::Allow, &[]).expect("run a");
-        let b = Sandbox::spawn("/bin/true", &[], |_| Verdict::Allow, &[]).expect("run b");
-        assert_ne!(
-            a.run, b.run,
-            "two runs never share an id, or a grant in one would silence the other"
-        );
-        drop((a, b));
-
-        // …and a run's own id does not move while it is alive, which is what
-        // makes it usable as a key at all.
-        let mut sb = Sandbox::spawn("/bin/true", &[], |_| Verdict::Allow, &[]).expect("run c");
-        let first = sb.run;
-        sb.pump(|_ask| Verdict::Allow, |_| {}).expect("run completes");
-        assert_eq!(
-            sb.run, first,
-            "a run's id is fixed for its life; a policy holding it as a key is \
-             holding something that stays valid"
-        );
-    }
-
-    /// A syscall carries its run's id to the policy, which is the whole of what
-    /// makes a per-run grant possible — and the id is the *root's*, so a worker
-    /// reports the same one its parent does.
-    #[test]
-    fn every_syscall_reports_its_run_id() {
-        let seen: Arc<Mutex<Vec<(libc::pid_t, u64)>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorder = Arc::clone(&seen);
-        let mut sb = Sandbox::spawn(
-            "/bin/true",
-            &[],
-            move |s: &Syscall| {
-                recorder.lock().expect("seen").push((s.pid, s.run));
-                Verdict::Allow
-            },
-            // `execve` is named because an empty mask traps nothing but the fork
-            // family, and the run then makes no syscall the decider ever sees —
-            // which is the point of the default-allow design and the reason this
-            // test has to ask for one.
-            &[syscall_nr("execve").expect("execve is known")],
-        )
-        .expect("run");
-        let run = sb.run;
-        sb.pump(|_ask| Verdict::Allow, |_| {}).expect("run completes");
-
-        // The decider is `'static`, so the log is behind an `Arc` rather than a
-        // borrow — the test outlives nothing here, but the closure would.
-        let seen = seen.lock().expect("seen").clone();
-        assert!(
-            !seen.is_empty(),
-            "`/bin/true` makes syscalls, so there is something to report a run for"
-        );
-        for (pid, reported) in &seen {
-            assert_eq!(
-                *reported, run,
-                "syscall from pid {pid} reported run {reported}, not its own run {run}"
-            );
-        }
-    }
-
 }
