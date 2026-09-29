@@ -580,7 +580,7 @@ cargo test && ./scripts/verify-sandbox.sh
 `verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
 fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
 `src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
-the check that the sandbox is still there at all. The suite is 383 library tests
+the check that the sandbox is still there at all. The suite is 385 library tests
 and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
 compiler (`-- --ignored` runs them).
 

@@ -541,11 +541,10 @@ function M.trusted_readonly_paths()
 end
 
 --- Forget everything, all four tables (a test hook, and an escape hatch).
---- Empty every path table.
 ---
 --- A gate that remembers in a closure is *not* reached from here, and that is
---- deliberate: its memory dies with the policy table it lives in, which is per
---- run, so there is nothing left to clear once the run is over. A grant that
+--- deliberate: its memory dies with the policy table it lives in, which is built
+--- per run, so there is nothing left to clear once the run is over. A grant that
 --- outlived its question would be the leak this design exists to prevent.
 function M.forget_all()
   for _, into in pairs(trust_tables) do
@@ -904,10 +903,6 @@ function M.ask(what, extra, panel)
   -- counts — it implies the general trust that `trust_write` also records.
   if ask.path and M.is_trusted(ask.path) then return true end
   local verdict = raise_ask(ask, panel)
-  -- "Always allow this": the answer carries the instruction to remember, and
-  -- the asking side is the only one that knows *what* was asked about — so the
-  -- remembering happens here, where the ask table still has it.
-  --
   -- "Always allow this": the answer carries the instruction to remember, and the
   -- asking side is the only one that knows *what* was asked about — so the
   -- remembering happens here, where the ask table still has it. Two shapes of

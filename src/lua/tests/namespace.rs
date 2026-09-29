@@ -995,3 +995,98 @@ use crate::testutil::unique_path;
             problem.unwrap_or_default()
         );
     }
+
+    /// `forget_all` still empties **every** path table, and `blocked` is the one
+    /// that matters most: it is the negative the other three compose with, so a
+    /// `forget_all` that emptied only the grants would leave a block standing on
+    /// its own — the one entry that can refuse a path the user has since
+    /// forgotten trusting.
+    ///
+    /// This is here because `forget_all` changed: it no longer clears a
+    /// capability table, because a capability now lives in the policy's own
+    /// closure and dies with the run. Narrowing what a function reaches is
+    /// exactly the kind of edit that quietly loses a line of the old behaviour,
+    /// so the old coverage — which counted only `trusted_paths()` — is widened
+    /// here to all four.
+    #[test]
+    fn forget_all_empties_all_four_path_tables_and_not_only_the_first() {
+        let lua = vm();
+        let problem: Option<String> = lua
+            .load(
+                r#"
+            local ask = require("ask")
+            ask.trust("/opt/app")
+            ask.trust_write("/opt/scratch")
+            ask.trust_readonly("/usr")
+            ask.block("/opt/app/.env")
+            -- Everything is set; a `forget_all` that empties none of these is
+            -- the bug this pins.
+            if #ask.trusted_paths() == 0 then return "nothing was trusted" end
+            if #ask.trusted_write_paths() == 0 then return "nothing was trusted to write" end
+            if #ask.trusted_readonly_paths() == 0 then return "nothing was trusted readonly" end
+            if #ask.blocked_paths() == 0 then return "nothing was blocked" end
+
+            ask.forget_all()
+
+            if #ask.trusted_paths() ~= 0 then return "general: " .. #ask.trusted_paths() end
+            if #ask.trusted_write_paths() ~= 0 then return "write: " .. #ask.trusted_write_paths() end
+            if #ask.trusted_readonly_paths() ~= 0 then
+              return "readonly: " .. #ask.trusted_readonly_paths()
+            end
+            if #ask.blocked_paths() ~= 0 then return "blocked: " .. #ask.blocked_paths() end
+
+            -- And the tables are *usable* afterwards, not merely empty: a grant
+            -- taken back and re-given has to take, or `forget_all` left something
+            -- behind that answers no.
+            ask.trust("/opt/again")
+            if not ask.is_trusted("/opt/again") then return "cannot re-trust after forgetting" end
+            if ask.is_blocked("/opt/again") then return "blocked a fresh grant" end
+            ask.forget_all()
+            if ask.is_trusted("/opt/again") then return "forget_all did not clear the re-grant" end
+            return nil
+        "#,
+            )
+            .eval()
+            .expect("forget_all walk");
+        assert!(problem.is_none(), "forget_all: {}", problem.unwrap_or_default());
+    }
+
+    /// The server tables are a different structure from the path ones and are
+    /// emptied by a *different* function — `forget_all_servers`, not
+    /// `forget_all` — so "the path tables survived" says nothing about them.
+    /// Checked here for the same reason: `M.ask` changed, and the split between
+    /// what is remembered for a path and what for a peer is the split that change
+    /// was reasoning about.
+    #[test]
+    fn the_server_table_is_emptied_by_its_own_function_and_nothing_else() {
+        let lua = vm();
+        let problem: Option<String> = lua
+            .load(
+                r#"
+            local ask = require("ask")
+            ask.trust_server("example.com")
+            ask.trust_server("127.0.0.1", 8080)
+            ask.trust("/opt/app")
+            if #ask.trusted_servers() == 0 then return "nothing was trusted" end
+
+            -- `forget_all` is the *path* door: it must leave the peer table
+            -- alone, or "forget every file" would silently revoke an endpoint the
+            -- user answered about separately and expects to stay.
+            ask.forget_all()
+            if #ask.trusted_servers() == 0 then
+              return "forget_all took the servers with it"
+            end
+            if ask.is_trusted("/opt/app") then return "forget_all did not take the paths" end
+
+            ask.forget_all_servers()
+            if #ask.trusted_servers() ~= 0 then
+              return "forget_all_servers left " .. #ask.trusted_servers()
+            end
+            return nil
+        "#,
+            )
+            .eval()
+            .expect("server forget walk");
+        assert!(problem.is_none(), "servers: {}", problem.unwrap_or_default());
+    }
+
