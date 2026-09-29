@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full regression gate for the sandbox substrate (src/seccomp/), the Lua
-# policy bridge (src/lua.rs), the MCP client substrate (src/mcp.rs), and the
+# policy bridge (src/lua/), the MCP client substrate (src/mcp.rs), and the
 # Lua→TUI panel op stream (src/panels.rs) — the files touched by the "ready to
 # use" hardening: live output streaming, the interrupt/kill API, Ask-as-yield,
 # the `agent` namespace (agent.bash + agent.panel), and agent.mcp.
@@ -13,9 +13,10 @@
 # Usage: scripts/verify-sandbox.sh
 set -euo pipefail
 
-# seccomp is a module directory (seccomp/mod.rs + seccomp/arch/*.rs), so match
-# the path prefix rather than a single file.
-TOUCHED="src/seccomp/|lua\.rs|mcp\.rs|panels\.rs"
+# seccomp and lua are module *directories* (seccomp/mod.rs + seccomp/arch/*.rs,
+# and lua/mod.rs + lua/*.rs + lua/tests/*.rs), so match the path prefix rather
+# than a single file. `-r` on the instrumentation scan below for the same reason.
+TOUCHED="src/seccomp/|src/lua/|mcp\.rs|panels\.rs"
 
 echo "== 1/3 cargo test =="
 cargo test
@@ -32,9 +33,8 @@ fi
 rm -f "$CLIPPY_OUT"
 
 echo "== 3/3 instrumentation scan =="
-if grep -nE '\bDBG\b|RECV-ENTER|RECV-EXIT|std::mem::discriminant' \
-     src/seccomp/*.rs src/seccomp/arch/*.rs \
-     src/lua.rs src/mcp.rs src/panels.rs; then
+if grep -rnE '\bDBG\b|RECV-ENTER|RECV-EXIT|std::mem::discriminant' \
+     src/seccomp src/lua src/mcp.rs src/panels.rs; then
   echo "stray instrumentation found (above)" >&2
   exit 1
 fi

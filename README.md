@@ -16,7 +16,7 @@ modes.
 - A streaming TUI: turn stream, tool-drawn panels, a permission dialog at
   the bottom of the panel that raised it, a one-line status bar at the bottom,
   and `/reload`.
-- A Lua surface for all of it: 33 locked bridge primitives, auto-required
+- A Lua surface for all of it: 36 locked bridge primitives, auto-required
   library modules, a mode system, an ask protocol with three answers, and the
   sandbox policy.
 - A single-threaded process. One OS thread, a current-thread tokio runtime, no
@@ -54,22 +54,22 @@ Which means the boundary is worth stating precisely, because the name
   so it holds for every later call and survives `/reload`, but not a restart.
   `agent.ask.forget` and `forget_server` take any of it back at any time.
 - **The first run asks about every shared library, and it is a flood.** A cold
-  `/bin/cat /dev/null` asks **55 times** on this machine — 51 distinct paths,
-  spread over about two dozen directories. Most of it is not libraries: the
-  loader probing CPU-variant directories that do not exist, plus locale
-  catalogues. Trusting four paths in a config (`/usr/lib`, `/usr/share`,
-  `/etc/ld.so.cache`, `~/.rustup/toolchains`) brings the same command down to
-  **3** questions, and what is left is the command's own business. The working
-  directory is trusted at startup, which does not help, since the libraries do
-  not live there. See [Asks and trust](#asks-and-trust).
+  `/bin/cat /dev/null` asks dozens of times, once per file: the loader's cache
+  and map, every `DT_NEEDED` library, the locale catalogues, and the CPU-variant
+  directories it probes that do not exist. The shipped config grants
+  `trust_readonly` on `/lib`, `/lib64`, `/usr`, `/etc/ld.so.cache`,
+  `/proc/self/maps`, `/proc/filesystems` and the five harmless `/dev` entries
+  (plus `trust_write` on `/dev/null`), which is what brings that flood down to
+  the command's own business. The working directory is trusted at startup, which
+  does not help here, since the libraries do not live there. See
+  [Asks and trust](#asks-and-trust).
 - **Headless, there is no one to ask, so everything is denied.** The probe, the
   tests and any run with no ask handler get a sandboxed command that reaches
   nothing it was not already trusted for.
 
 Two smaller calls, both reversible and both ours to change on request: the policy
-traps `sendto` as well as the three syscalls it was originally asked for, because
-UDP has no handshake and leaving it out would make the `connect` gate trivially
-bypassable; that it traps `renameat2` as well as `renameat`, because glibc's
+traps `sendto` alongside the other twelve, because UDP has no handshake and
+leaving it out would make the `connect` gate trivially bypassable; that it traps `renameat2` as well as `renameat`, because glibc's
 `rename()` is `renameat2` now and gating only the other one would have left every
 real `mv` ungated while still looking right; and that the `"all"` mode sentinel
 currently has no shipped user, since `coding` names its registry instead.
@@ -82,6 +82,12 @@ cargo run --bin agent_probe            # one headless turn, sandbox smoke test
 cargo run --bin agent_probe -- "…"     # …or ask it something
 ./scripts/verify-sandbox.sh            # the gate
 ```
+
+Four more binaries exist for narrower jobs: `chat` (a terminal setup demo),
+`grammar_probe` (fetch the four grammars the TUI preloads, and parse with each),
+`mcp_fake` (a reference MCP server, which the MCP tests' in-process fake is
+modelled on), and `sandbox` (drive one sandboxed run directly, with no Lua in
+the way).
 
 The probe with no argument runs `echo hello-from-sandbox` through the shell, which
 is the quickest end-to-end check that the sandbox, the ask path and the panel
@@ -97,13 +103,10 @@ That starter file is written to be edited. The settings you will actually change
 are marked `>>>`, each with its documentation attached, and the sections below
 them explain how the rest fits together.
 
-For a one-off, the environment overrides the endpoint: `AGENT_BASE_URL`,
-`AGENT_MODEL`, `AGENT_API_KEY`.
-
-| variable | |
+| variable | read by |
 |---|---|
-| `AGENT_BASE_URL`, `AGENT_MODEL`, `AGENT_API_KEY` | the endpoint, when you would rather not write a config |
-| `AGENT_LUA_DIR` | load a different Lua tree entirely, instead of the `lua/` beside the executable |
+| `AGENT_LUA_DIR` | anything that builds a Lua VM — the TUI and `agent_probe`, not `chat`/`grammar_probe`/`mcp_fake`/`sandbox`, which have no Lua in them: load a different tree, instead of the `lua/` beside the executable (used only if it holds an `init.lua`, else `./lua`) |
+| `AGENT_BASE_URL`, `AGENT_MODEL`, `AGENT_API_KEY` | **only `agent_probe`**, and only when any one of them is set. A dev-harness override so an existing headless invocation keeps working; the TUI has no environment override at all, because the endpoint is Lua configuration. |
 
 ## The gate
 
@@ -111,24 +114,35 @@ For a one-off, the environment overrides the endpoint: `AGENT_BASE_URL`,
 cargo test && ./scripts/verify-sandbox.sh
 ```
 
-`verify-sandbox.sh` must print `verify-sandbox: OK`. It checks that the seccomp
-filter and the syscall tables have not drifted, and it is the check that the
-sandbox is still there at all. The suite is 298 library tests, 12 in the binary
-and 7 in the probe.
+`verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
+fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
+`src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It
+is the check that the sandbox is still there at all.
+The suite is 375 library tests and 14 in the `agent` binary, plus 4 that are
+`#[ignore]`d for want of the network or a C compiler (`-- --ignored` runs them).
 
 ## How it is put together
 
 The Rust side is the runtime: the chat client, the TUI, the seccomp engine, the
-MCP transports and the Lua bridge. Everything a user would want to change is Lua,
-and it is all in `lua/`:
+MCP transports and the Lua bridge. It is a library (`agent`) plus six thin
+binaries — the TUI is `src/main.rs`, and the rest are the probe and the four
+narrow tools listed above.
+
+| | |
+|---|---|
+| `src/lua/` | the `agent` namespace. `mod.rs` is the *contract* (what Lua may see and do); the modules beside it are the implementation, one layer each: `vm` (build a VM), `tree` (assemble it from the shipped `lua/`), `bridge` (the `agent.api` table and its lock), `sandbox` (the seccomp primitives and the `/proc` introspection), `config` (the `agent.llm` surface and the tool registry), `run` (a tool call and an event handler as coroutines the loop steps), `memory` and `usage` (the two small bindings). The tests are under `src/lua/tests/`, split by the shipped Lua surface they exercise rather than by module — nearly all of them build a real VM and drive it end to end, so the module boundary is not the seam they have. |
+| `src/api.rs` | the chat-completions client: tool definitions, request plumbing, SSE parsing, turn accounting. Shared by the TUI and the probe, so it is a library module rather than a copy per binary |
+| `src/tui/` | the screen shell (`mod.rs`) and the conversation component (`panel.rs`), plus the markdown highlighter (`highlight.rs`) |
+
+Everything a user would want to change is Lua, and it is all in `lua/`:
 
 | | |
 |---|---|
 | `lua/init.lua` | the starter configuration: the settings (`agent.llm`, the context window, the log), the tools, the modes, the trust grants and the automatic compaction — each documented where it is set, with the `>>>`-marked lines being the ones meant to be edited. Copied to `~/.config/agent/init.lua` on first run |
 | `lua/lib/*.lua` | library modules, auto-required in sorted order and cached; each publishes itself on `agent` (`agent.ask`, `agent.bash`, `agent.mode`, `agent.utils`, …) |
-| `lua/*.lua` | root modules, reached by name: `fs`, `bash_tool`, `policy`, `coding`, `compact`, `mcps` |
+| `lua/*.lua` | root modules, reached by name: `fs` (read, write_file, hand_to_user, apply_patch), `bash_tool`, `policy`, `coding`, `compact`, `mcps` |
 | `lua/api.lua` | the bridge's annotations, and what the loader checks at startup: a primitive without one, or one for a primitive that no longer exists, is a startup error |
-| `lua/agent_api.meta.lua` | the same 33 primitives as LuaLS types, for editors |
+| `lua/agent_api.meta.lua` | the same 36 primitives as LuaLS types, for editors |
 
 `lua/init.lua` and `~/.config/agent/init.lua` share a name on purpose — they
 are the same kind of thing, a chunk of Lua that configures the agent — and they
@@ -155,6 +169,12 @@ question *inside* that panel, so a question is never asked into the void. `fs.re
 covers both kinds of path — a file comes back numbered, a directory comes back as
 a listing — and shows only the resolved path, plus the one the model wrote when
 the two differ. `fs.write_file` shows the bytes it wrote, highlighted.
+
+`fs.apply_patch` is the fourth: a pure-Lua unified-diff engine, asked once for the
+file it is about to edit. It draws a *split* panel — the file before on the left,
+after on the right, each pane declaring the file's own language so tree-sitter can
+run on it. A unified diff could not do that: the grammar would choke on the `+`
+and `-` prefixes, which is the reason the split panel exists at all.
 
 `fs.hand_to_user` is the odd one out, and it exists because creating a file is
 silent by design: a new name records write-trust for itself, so a directory full
@@ -198,8 +218,8 @@ agent.on_event("key", function(k) return BIND[k.spec] end)   -- see lua/init.lua
 
 The handler is given `spec` (the chord as a table writes it — `alt+enter`,
 `ctrl+c`, `f5`), `char`, and the three modifier booleans, and returns an action
-name (`send`, `quit`, `interrupt`, `conceal`, `scroll_up`, `scroll_down`, `top`,
-`bottom`) or nothing, meaning the key keeps its default.
+name (`newline`, `send`, `quit`, `interrupt`, `conceal`, `scroll_up`,
+`scroll_down`, `top`, `bottom`) or nothing, meaning the key keeps its default.
 
 **Returning a name is a shorthand, not the limit.** A handler can also call
 `agent.api.input_insert(text)` (or `input_backspace` / `input_clear`) and change
@@ -298,16 +318,22 @@ what a dynamically-linked program reads before its own first line — the loader
 cache, its map of the process, and every `DT_NEEDED` library and locale message:
 
 ```lua
-agent.ask.trust_readonly("/usr")             -- libraries, binaries, locale, docs
-agent.ask.trust_readonly("/lib")             -- -> /usr/lib on a merged-/usr system
-agent.ask.trust_readonly("/etc/ld.so.cache") -- the loader's cache
-agent.ask.trust_readonly("/proc/self/maps")  -- read by the loader, every exec
-agent.ask.trust_readonly(os.getenv("HOME") .. "/.rustup/toolchains")
+-- lua/init.lua §6, verbatim in shape
+for _, ro in ipairs({
+  "/lib", "/lib64", "/usr",                 -- libraries, binaries, locale, docs
+  "/etc/ld.so.cache",                       -- the loader's own cache
+  "/proc/self/maps",                        -- read by the loader, every exec
+  "/proc/filesystems",                      -- glibc lists fs types, every exec
+}) do
+  agent.ask.trust_readonly(ro)
+end
+-- and the /dev entries that carry nothing, plus a write grant on /dev/null
 ```
 
-`trust_readonly` is a **third** table, not the general one, and the difference is
+`trust_readonly` is its own table, not the general one, and the difference is
 the point: "you may look here" and "you may make things here" are different
-promises, and a system directory is only ever the first. Every read under `/usr`
+promises, and a system directory is only ever the first. (There are four tables
+in all — `general`, `write`, `readonly`, `blocked`; see `lua/lib/ask.lua`.) Every read under `/usr`
 is silent; every write, **create**, delete and move there still asks. That last
 one is why it cannot be a plain `trust` — a create is otherwise silent by design,
 and a read-only grant that let the agent quietly drop a file into `/usr` would not
@@ -365,9 +391,11 @@ The mechanics, stated so there is nothing to discover later:
 
 - **Anything not named in the policy is not intercepted at all.** The policy's
   keys *are* the mask, so a syscall nobody named runs straight through the kernel
-  under its default (allow) and never reaches a callback. The policy is four
-  syscalls because those four are all anyone asked to gate — not because the
-  other ~300 were considered and cleared.
+  under its default (allow) and never reaches a callback. The shipped policy is
+  the [thirteen above](#what-is-here); each is a decision, and the absences are
+  decisions too — `mkdirat` and `rmdir` are left out on purpose, while
+  `linkat` and `symlinkat` are a real gap rather than a decision, and say so in
+  `lua/policy.lua`.
 - **`agent.http` and `agent.mcp` are not syscalls.** They are bridge primitives
   in the agent process, so no filter and no question stands between a tool and
   the network through them. Only a command inside a sandboxed run is gated.
