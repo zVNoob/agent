@@ -384,6 +384,13 @@ async fn sse_task(
 /// Incremental Server-Sent Events parser: buffers bytes, splits on newlines,
 /// and emits one [`SseEv::Event`] per blank line (a streamed `data:` value
 /// spanning several lines is joined with `\n`).
+///
+/// This is the *transport's* parser: it decodes the body of
+/// `agent.api.sse_open`. A request that turns out to answer with
+/// `content-type: text/event-stream` is parsed by `new_parser`/`parser_push` in
+/// `lua/lib/http.lua` instead, because the decision happens in Lua. Two
+/// implementations of one spec, in two languages, on the two sides of that
+/// decision — so a change to the spec's edges has to be made in both.
 #[derive(Default)]
 struct SseParser {
     buf: Vec<u8>,
@@ -589,12 +596,7 @@ fn lua_http_req(
 /// arrived. Popping a terminal event unregisters the handle.
 fn lua_http_step(lua: &Lua, handle: i64) -> mlua::Result<Option<Table>> {
     let t = http_transport();
-    let queue = t
-        .posts
-        .lock()
-        .unwrap()
-        .get(&handle)
-        .map(|s| s.queue.clone());
+    let queue = t.posts.lock().unwrap().get(&handle).map(|s| s.queue.clone());
     let Some(queue) = queue else {
         return Ok(None);
     };
@@ -615,31 +617,50 @@ fn lua_http_step(lua: &Lua, handle: i64) -> mlua::Result<Option<Table>> {
             tab.set("data", lua.create_string(data.as_str())?)?;
             Ok(Some(tab))
         }
+        // Terminal for both transports, and identical in shape: report it, and
+        // unregister so the handle cannot be stepped again. `http_step` and
+        // `sse_step` differ only in what they can *also* report.
         HttpEv::Done => {
+            drop(queue);
             t.posts.lock().unwrap().remove(&handle);
-            let tab = lua.create_table()?;
-            tab.set("kind", "done")?;
-            Ok(Some(tab))
+            terminal_event(lua, "done", None)
         }
         HttpEv::Error(message) => {
+            drop(queue);
             t.posts.lock().unwrap().remove(&handle);
-            let tab = lua.create_table()?;
-            tab.set("kind", "error")?;
-            tab.set("message", message)?;
-            Ok(Some(tab))
+            terminal_event(lua, "error", Some(message))
         }
     }
+}
+
+/// The two terminal events both routes share, rendered to Lua. One function
+/// rather than two: they are the same table apart from the `kind`, and a
+/// divergence here would be a bug neither route's test could see, since each
+/// tests its own.
+fn terminal_event(lua: &Lua, kind: &str, message: Option<String>) -> mlua::Result<Option<Table>> {
+    let tab = lua.create_table()?;
+    tab.set("kind", kind)?;
+    if let Some(message) = message {
+        tab.set("message", message)?;
+    }
+    Ok(Some(tab))
+}
+
+/// Abort a session and drop it from `sessions`, reporting whether it was there.
+///
+/// Both `http_close` and `sse_close` are this, against a different table.
+fn close_session<E>(sessions: &Mutex<HashMap<i64, Session<E>>>, handle: i64) -> mlua::Result<bool> {
+    let Some(session) = sessions.lock().unwrap().remove(&handle) else {
+        return Ok(false);
+    };
+    session.abort.store(true, Ordering::Relaxed);
+    Ok(true)
 }
 
 /// `agent.api.http_close(handle) -> bool` — abort the request and drop its
 /// queue. The background task unwinds on its next idle poll.
 fn lua_http_close(_: &Lua, handle: i64) -> mlua::Result<bool> {
-    let t = http_transport();
-    let Some(session) = t.posts.lock().unwrap().remove(&handle) else {
-        return Ok(false);
-    };
-    session.abort.store(true, Ordering::Relaxed);
-    Ok(true)
+    close_session(&http_transport().posts, handle)
 }
 
 /// `agent.api.sse_open(url, headers) -> handle` — open an SSE stream as a task
@@ -684,30 +705,24 @@ fn lua_sse_step(lua: &Lua, handle: i64) -> mlua::Result<Option<Table>> {
             tab.set("data", data)?;
             Ok(Some(tab))
         }
+        // The same two terminal tables the request route returns.
         SseEv::Done => {
+            drop(queue);
             t.sses.lock().unwrap().remove(&handle);
-            let tab = lua.create_table()?;
-            tab.set("kind", "done")?;
-            Ok(Some(tab))
+            terminal_event(lua, "done", None)
         }
         SseEv::Error(message) => {
+            drop(queue);
             t.sses.lock().unwrap().remove(&handle);
-            let tab = lua.create_table()?;
-            tab.set("kind", "error")?;
-            tab.set("message", message)?;
-            Ok(Some(tab))
+            terminal_event(lua, "error", Some(message))
         }
     }
 }
 
+
 /// `agent.api.sse_close(handle) -> bool` — abort the stream and drop its queue.
 fn lua_sse_close(_: &Lua, handle: i64) -> mlua::Result<bool> {
-    let t = http_transport();
-    let Some(session) = t.sses.lock().unwrap().remove(&handle) else {
-        return Ok(false);
-    };
-    session.abort.store(true, Ordering::Relaxed);
-    Ok(true)
+    close_session(&http_transport().sses, handle)
 }
 
 /// `agent.api.sleep(ms)` — block the current Lua thread for `ms` milliseconds.

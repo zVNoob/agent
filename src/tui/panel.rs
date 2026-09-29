@@ -1598,26 +1598,28 @@ fn display_text(msg: &Message) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-/// Wrap a message that conceals some markers: rows come from the *display*
-/// text (markers removed) with segment boundaries mapped through the conceal
-/// ranges. The row algorithm is identical to [`wrap_segments`], so heights
-/// match [`wrap_lines`] on the display text — what [`message_rows`] assumes.
-fn wrap_concealed(msg: &Message, width: usize) -> Vec<Vec<Span<'static>>> {
+/// The row algorithm every wrapper here shares: split on `\n`, chunk each
+/// paragraph into `width`-char rows, and hand each row's byte range to `clip`.
+///
+/// The one thing that varies between wrappers is what happens *inside* a row —
+/// a plain wrapper slices the string, a segment wrapper slices each segment, a
+/// concealing one maps the range through the conceal map first. Keeping the loop
+/// in one place is what makes "row text is byte-identical to [`wrap_lines`]"
+/// true by construction rather than by three copies agreeing.
+fn wrap_rows(text: &str, width: usize, clip: impl Fn(usize, usize) -> Vec<Span<'static>>) -> Vec<Vec<Span<'static>>> {
     if width == 0 {
         return vec![vec![]];
     }
-    let display = display_text(msg);
-    let disp = display.as_ref();
     // byte_at[i] = byte offset where char index i starts (chars + 1 entries).
-    let n = disp.chars().count();
+    let n = text.chars().count();
     let mut byte_at: Vec<usize> = Vec::with_capacity(n + 1);
     byte_at.push(0);
-    byte_at.extend(disp.char_indices().skip(1).map(|(b, _)| b));
-    byte_at.push(disp.len());
+    byte_at.extend(text.char_indices().skip(1).map(|(b, _)| b));
+    byte_at.push(text.len());
 
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
     let mut para_start = 0; // char index of the paragraph's first char
-    for para in disp.split('\n') {
+    for para in text.split('\n') {
         let para_chars = para.chars().count();
         if para_chars == 0 {
             rows.push(Vec::new());
@@ -1627,13 +1629,22 @@ fn wrap_concealed(msg: &Message, width: usize) -> Vec<Vec<Span<'static>>> {
         let mut rest = 0;
         while rest < para_chars {
             let take = width.min(para_chars - rest);
-            let (cs, ce) = (para_start + rest, para_start + rest + take);
-            rows.push(clip_concealed(disp, msg, byte_at[cs], byte_at[ce]));
+            rows.push(clip(byte_at[para_start + rest], byte_at[para_start + rest + take]));
             rest += take;
         }
         para_start += para_chars + 1;
     }
     rows
+}
+
+/// Wrap a message that conceals some markers: rows come from the *display*
+/// text (markers removed) with segment boundaries mapped through the conceal
+/// ranges. Heights therefore match [`wrap_lines`] on the display text, which is
+/// what [`message_rows`] assumes.
+fn wrap_concealed(msg: &Message, width: usize) -> Vec<Vec<Span<'static>>> {
+    let display = display_text(msg);
+    let disp = display.as_ref();
+    wrap_rows(disp, width, |bs, be| clip_concealed(disp, msg, bs, be))
 }
 
 /// One display-space row's spans: each cached segment clipped to the row's
@@ -1665,40 +1676,12 @@ fn to_display(conceal: &[(usize, usize)], src: usize) -> usize {
     src - hidden
 }
 
-/// Wrap styled segments exactly like [`wrap_lines`] wraps plain text: split
-/// on `\n`, chunk by `width` chars, and clip each segment to the row's byte
-/// range. Row text is byte-identical to `wrap_lines` — only span boundaries
-/// differ — so heights computed from plain wrapping stay correct.
+/// Wrap styled segments exactly like [`wrap_lines`] wraps plain text: the same
+/// rows, and within a row each segment clipped to the row's byte range. Row text
+/// is byte-identical to `wrap_lines` — only span boundaries differ — so heights
+/// computed from plain wrapping stay correct.
 fn wrap_segments(text: &str, segs: &[Segment], width: usize) -> Vec<Vec<Span<'static>>> {
-    if width == 0 {
-        return vec![vec![]];
-    }
-    // byte_at[i] = byte offset where char index i starts (chars + 1 entries).
-    let n = text.chars().count();
-    let mut byte_at: Vec<usize> = Vec::with_capacity(n + 1);
-    byte_at.push(0);
-    byte_at.extend(text.char_indices().skip(1).map(|(b, _)| b));
-    byte_at.push(text.len());
-
-    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut para_start = 0; // char index of the paragraph's first char
-    for para in text.split('\n') {
-        let para_chars = para.chars().count();
-        if para_chars == 0 {
-            rows.push(Vec::new());
-            para_start += 1;
-            continue;
-        }
-        let mut rest = 0;
-        while rest < para_chars {
-            let take = width.min(para_chars - rest);
-            let (cs, ce) = (para_start + rest, para_start + rest + take);
-            rows.push(clip_segments(text, segs, byte_at[cs], byte_at[ce]));
-            rest += take;
-        }
-        para_start += para_chars + 1;
-    }
-    rows
+    wrap_rows(text, width, |bs, be| clip_segments(text, segs, bs, be))
 }
 
 /// One row's spans: each segment clipped to the row's byte range.
