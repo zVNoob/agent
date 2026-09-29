@@ -1,6 +1,6 @@
 //! The syscall tables themselves: that the pathname/dirfd slot tables match
-//! the kernel's signatures, that the default mask is exactly thirteen entries,
-//! and that a rename target resolves against its own dirfd.
+//! the kernel's signatures, that the default mask is exactly [`MASK`], and that
+//! a rename target resolves against its own dirfd.
 use super::*;
 
     /// Every pathname a syscall names, checked against the kernel's own
@@ -114,10 +114,44 @@ use super::*;
 
     /// The shipped policy's mask, checked against the real table rather than
     /// against a transcription of it: a policy that named fewer would silently
-    /// let a connect — or an `rm`, or a `chmod` — through.
+    /// let a connect — or an `rm`, or a `chmod`, or an `io_uring_enter` that
+    /// reaches files without ever calling `openat` — through.
+    ///
+    /// Named after [`MASK`] rather than after a number, because the number is
+    /// the thing that goes stale: a gate added without updating this test's name
+    /// would still pass on the `assert_eq!` and leave a lie in the test list.
     #[test]
-    fn the_default_policy_traps_exactly_thirteen_syscalls() {
+    fn the_default_policy_traps_exactly_the_gates_the_mask_names() {
         assert_default_shell(&shipped_vm());
+    }
+
+    /// The one deliberate absence in [`cstring_positions`], and its partner,
+    /// pinned together so the pair cannot be "fixed" as one.
+    ///
+    /// `open_by_handle_at` takes a `path` that is a component hint of at most
+    /// 64 bytes and selects nothing: the file is chosen by the opaque
+    /// `file_handle` beside it. Reading the hint would make `sc.path(sys)`
+    /// return the last component of the target's real path, so the policy would
+    /// ask whether to read `/shadow` and the answer would be about a different
+    /// file — a name the user can check and a decision that is not theirs to
+    /// have made. So the call is gated and the question carries no path.
+    ///
+    /// `name_to_handle_at` is the other half of the same capability and the
+    /// opposite case: it takes a real path, and reading it is the whole point,
+    /// because the read trust the user gives is what makes the handle worth
+    /// anything.
+    #[test]
+    fn open_by_handle_at_names_no_path_and_its_partner_names_one() {
+        assert!(
+            cstring_positions("open_by_handle_at").is_none(),
+            "its `path` is a hint that selects nothing, so reading it would name \
+             the wrong file in a question the user is asked to answer"
+        );
+        assert_eq!(
+            cstring_positions("name_to_handle_at"),
+            Some(&[1usize][..]),
+            "its partner does take a real path, and that read is the gate"
+        );
     }
 
     /// A remembered endpoint goes quiet, and only for the endpoint that was

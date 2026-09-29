@@ -334,6 +334,16 @@ pub(super) const CSTRING_ARGS: &[(&str, &[usize])] = &[
     ("lremovexattr", &[0, 1]),
     ("inotify_add_watch", &[1]),
     ("name_to_handle_at", &[1]),
+    // `open_by_handle_at(dirfd, mount_fd, flags, path, handle, …)` is the one
+    // deliberate absence, and it is load-bearing: its `path` argument is a
+    // component hint of at most 64 bytes used to make errors readable, and the
+    // file actually opened is chosen by the opaque `file_handle`. Putting it in
+    // this table would make `sc.path(sys)` return the last component of the
+    // target's real path, so a policy asking about "the process want to read
+    // `/shadow`" would be confidently wrong — a name the user can check, for a
+    // decision about a different file. `lua/policy.lua` gates the call and asks
+    // with no path at all, which is the truth. Pinned by
+    // `open_by_handle_at_names_no_path_in_the_default_policy`.
 ];
 
 /// The `sys.addr` positions for a syscall name: the `struct sockaddr *` each one

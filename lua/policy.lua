@@ -72,6 +72,48 @@
 --            glibc's `rename()` is `renameat2` now, so `mv` never reaches
 --            `renameat`. One without the other would look right and do nothing.
 --
+--   io_uring_setup    the process want to create an io_uring event loop
+--   io_uring_enter    the process want to submit work to one
+--   io_uring_register the process want to register files or buffers with one
+--            The most consequential entries in this file, and the only ones
+--            added for what they *defeat* rather than for what they allow.
+--            `IORING_OP_OPENAT` and its siblings are submission-queue
+--            opcodes, not syscalls: a program that speaks the ring protocol can
+--            open, stat, unlink, rename, link and symlink without `openat`,
+--            `unlinkat` or `renameat` ever being called. So while
+--            `io_uring_enter` is ungated, every question this file asks about a
+--            file can be walked around by a program that cares to walk around
+--            it.
+--
+--            What is asked, and why it repeats, is in `ask_capability` below.
+--            Briefly: nothing is decoded, and there is no `always`.
+--
+--   open_by_handle_at the process want to open a file by an opaque handle
+--   name_to_handle_at the process want to take such a handle for {path}
+--            A second way to name a file that is not a path, so a second way
+--            past every table above. `open_by_handle_at` picks the file with an
+--            opaque `file_handle`; its `path` argument is a component hint of at
+--            most 64 bytes that decides nothing, which is why it is deliberately
+--            absent from the engine's pathname table — reading it would put a
+--            plausible and *wrong* name in the question. Its partner does name a
+--            real path, so it is asked on read trust like any other read; but a
+--            handle carries no path back, so trusting the taking does not
+--            silence the spending. See the two callbacks for why that asymmetry
+--            is the point rather than an oversight.
+--
+--   memfd_create / pidfd_getfd / process_vm_readv / process_vm_writev / bpf /
+--   userfaultfd / pkey_alloc / pkey_mprotect / pkey_free
+--            The same shape, one step further out: each is a way of reaching
+--            something the path tables cannot see at all — a file with no name, a
+--            descriptor owned by somebody else, another address space's memory,
+--            the kernel itself. None of them has an argument worth reading, so
+--            they are one table of one-liners at the bottom.
+--
+--            One deliberate omission: `memfd_secret` is **not** gated, because
+--            glibc uses it for the per-thread guard pages behind
+--            `MALLOC_TUNABLE_*`. A gate that fires on libc's own housekeeping is
+--            a gate that teaches the user to press `a`.
+--
 -- Note what is *not* in the mask on the filesystem side: `mkdirat` and `rmdir`.
 -- A new directory is therefore created without a question (which is what the
 -- rule above would conclude anyway), and `rm -r` reaches the gate through
@@ -97,6 +139,32 @@
 --
 -- What it does provide is a floor under every decision it *does* make: a denied
 -- syscall is refused by the kernel, not by this table's opinion.
+--
+-- ## Two kinds of question
+--
+-- Everything above except the last two groups is a question about a **thing** —
+-- a path, a host, a port — so it can be matched against a trust table, and an
+-- `always` has something to record. The rest ask about a **capability**: the
+-- syscall is itself what is being vouched for, and there is no path, host or
+-- port in it for a table to hold. Those are asked with `always = false`, which
+-- is what makes the dialog read `[y]es · [n]o` instead of
+-- `[y]es · [n]o · [a]lways`, and is why they come round again on the next call.
+--
+-- The repetition is the design rather than a shortfall. An `always` is a
+-- promise about a *specific* thing — this file, this host — and it is read back
+-- the next time that same thing comes up. For "this program may reach
+-- anything" there is nothing to be specific about, so the only honest options
+-- are to ask every time or to guess once and remember. Asking costs a prompt
+-- per call, paid only by programs that use these at all; guessing would be a
+-- grant the user made about a capability they could not name, made invisible
+-- from the next question onwards.
+--
+-- Where a capability names *another process* — `pidfd_getfd`,
+-- `process_vm_readv`, `process_vm_writev` — its pid is deliberately left out of
+-- the question. The tracee's own command line is already in it, and a second
+-- bare pid is a number nobody has vouched for: there is no table of trusted
+-- processes, so printing one would make the question look decidable when it is
+-- not. The capability is what is being asked about, and it is the whole of it.
 --
 -- ## What "always" remembers
 --
@@ -327,5 +395,104 @@ end
 -- and the retry is silent.
 policy.renameat = ask_rename
 policy.renameat2 = ask_rename
+
+-- A question about a **capability** rather than a thing: the syscall is what is
+-- being vouched for, and there is no path, host or port in it for a trust table
+-- to hold or an `always` to record. `for_syscall` builds the description — name,
+-- pid, and the tracee's own command line, so the user sees *who* is asking and
+-- not only what — and turning `always` off is the one edit, which is exactly
+-- the override `ask.for_syscall`'s own docs describe.
+--
+-- Everything routed here also repeats, because `always = false` leaves nothing
+-- behind to match against. That is the point, not a shortfall; see "Two kinds
+-- of question" in the header.
+local function ask_capability(sys, what)
+  local q = ask.for_syscall(sys, what)
+  -- The path is dropped as well as the flag, and not because there is none
+  -- here: `for_syscall` fills `path` from whatever the engine decoded, and
+  -- `ask` short-circuits to `true` when that path is already trusted. Leaving a
+  -- trusted path in the table would mean the gate answers itself from a grant
+  -- the user made about a *file*, so the invariant "a capability is never
+  -- answered by a path" would hold only for as long as the engine's pathname
+  -- table stays right. Set here instead, where it cannot drift.
+  q.path = nil
+  q.always = false
+  return ask.ask(q)
+end
+
+-- The ring. All three are asked, and none of them is decoded: the work is in
+-- the ring's own memory, not in the arguments, and reading a live ring on every
+-- `io_uring_enter` would put a cross-process memory read on the hot path of
+-- precisely the programs most likely to be driving one.
+--
+-- The wording carries the warning on purpose. Allowing a ring is not permission
+-- to do one thing — it is permission to do every file and endpoint operation in
+-- this file *without asking again*, which is the whole thing the rest of the
+-- policy is for. So the second clause is in the sentence rather than in a note
+-- below it: a user who read only the first words would not know what they had
+-- agreed to.
+policy.io_uring_setup = function(sys)
+  return ask_capability(
+    sys, "to create an io_uring event loop, which can then reach any file or " ..
+         "endpoint without asking about it")
+end
+
+policy.io_uring_enter = function(sys)
+  return ask_capability(
+    sys, "to submit work to an io_uring event loop, which can reach any file " ..
+         "or endpoint without asking about it")
+end
+
+policy.io_uring_register = function(sys)
+  return ask_capability(
+    sys, "to register files or buffers with an io_uring event loop, which can " ..
+         "then read and write them without asking about it")
+end
+
+-- Opening by handle. No path, so nothing for the tables above to hold; and its
+-- `path` argument is not read on purpose, because it is a hint that decides
+-- nothing and naming it would be worse than naming nothing.
+policy.open_by_handle_at = function(sys)
+  return ask_capability(
+    sys, "to open a file by an opaque handle, naming no path at all")
+end
+
+-- Taking the handle. This one *does* name a real path, so it is an ordinary
+-- read-trust question: the user is vouching for this file being read, the same
+-- promise `openat`'s read branch makes.
+--
+-- What that grant buys is narrower than it looks, and worth being plain about.
+-- Remembering the path silences *taking* handles for it and nothing more:
+-- spending one still asks, every time, because a `file_handle` carries no path
+-- back to check against the table above. So the two halves are deliberately not
+-- symmetrical — one is matchable and is matched, the other is not and is not.
+policy.name_to_handle_at = function(sys)
+  local path = sc.path(sys)
+  return ask.ask_trust_read(
+    path,
+    "The process want to take an opaque handle for " .. tostring(path) ..
+    ", which can then be opened without naming it again")
+end
+
+-- Everything else that reaches past the filesystem: no arguments worth reading,
+-- and no use in a shell. One table because the only thing that differs between
+-- them is the verb — which is also the honest summary of why each is here.
+for name, what in pairs({
+  memfd_create =
+    "to create a file in memory, which has no path and so sits outside every " ..
+    "trust table above",
+  pidfd_getfd =
+    "to take a file descriptor out of another process, and read whatever that " ..
+    "process can read",
+  process_vm_readv = "to read another process's memory",
+  process_vm_writev = "to write another process's memory",
+  bpf = "to load a program into the kernel",
+  userfaultfd = "to watch another process's page faults",
+  pkey_alloc = "to allocate a memory protection key",
+  pkey_mprotect = "to change the protection key on a mapping",
+  pkey_free = "to free a memory protection key",
+}) do
+  policy[name] = function(sys) return ask_capability(sys, what) end
+end
 
 return policy

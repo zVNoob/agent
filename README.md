@@ -3,10 +3,10 @@
 **A coding agent in your terminal, where the sandbox asks you instead of deciding for you.**
 
 A streaming TUI over any OpenAI-compatible endpoint — with a seccomp sandbox that
-intercepts thirteen syscalls and puts each one to you with its arguments decoded
-out of the frozen process, file tools, and every layer above the API written in
-Lua. Including the tools, the sandbox policy, the permission prompts, and the
-modes.
+intercepts twenty-seven syscalls and puts each one to you with its arguments
+decoded out of the frozen process, file tools, and every layer above the API
+written in Lua. Including the tools, the sandbox policy, the permission prompts,
+and the modes.
 
 ```
 ┌─ response ──────────────────────────────────────────────────────────────────┐
@@ -87,7 +87,7 @@ plumbing are all still wired together.
 | | |
 |---|---|
 | **Streaming TUI** | turn stream, tool-drawn panels, a permission dialog at the bottom of the panel that raised it, a one-line status bar, `/reload`, `/save` |
-| **A seccomp sandbox that asks** | thirteen syscalls intercepted; reads, writes, deletes, moves, permission changes and capability changes are all questions about a *path*, and a move is two of them |
+| **A seccomp sandbox that asks** | twenty-seven syscalls intercepted; reads, writes, deletes and moves are questions about a *path*, and a move is two of them — plus the gates that would otherwise walk past every one of those paths, above all `io_uring` |
 | **Lua for everything above the API** | 36 locked bridge primitives, nine auto-required library modules, a mode system, an ask protocol with three answers, the sandbox policy, the tools |
 | **One thread** | one OS thread, a current-thread tokio runtime, no worker pool — tool calls, event handlers and HTTP are coroutines the event loop steps |
 | **Runtime syntax highlighting** | tree-sitter grammars fetched from a registry, compiled with your `cc`, and `dlopen`'d — and applied to text already on screen, mid-conversation |
@@ -118,7 +118,7 @@ plumbing are all still wired together.
             ▼
   ┌────────────────────┐      ┌──────────────────────────────────┐
   │  lua/lib/bash.lua  │─────▶│ seccomp user-notify on a fork()  │
-  │  + lua/policy.lua │      │  13 syscalls → ask → verdict     │
+  │  + lua/policy.lua │      │  27 syscalls → ask → verdict     │
   └────────────────────┘      └──────────────────────────────────┘
             │                              │
             └──────────► PanelSink ◄──────┘
@@ -163,6 +163,12 @@ worth stating precisely:
   to is remembered on the agent's VM, so it holds for every later call and
   survives `/reload` — but not a restart. `agent.ask.forget` and `forget_server`
   take any of it back at any time.
+- **Allowing a capability is a wider answer than allowing a file.** The gates for
+  `io_uring`, `bpf` and `open_by_handle_at` ask about a capability rather than a
+  thing, so they cannot offer `always` — but a plain `yes` still means the
+  program may now do that, and for a ring it means it may also do everything
+  else this policy asks about, silently, until the run ends. Read the second
+  clause of the question; the first one is the verb.
 - **The first run is a flood, by design.** A cold `/bin/cat /dev/null` asks
   dozens of times — once per file: the loader's cache and map, every
   `DT_NEEDED` library, the locale catalogues, and the CPU-variant directories it
@@ -427,21 +433,75 @@ chroot, no dropped capabilities — and every syscall the policy names is
 intercepted, decoded, and put to you before it runs.
 
 ```
+# files and endpoints — a question about a path, a host, a port
 openat  unlinkat  renameat  renameat2  chmod  fchmodat
-setxattr  lsetxattr  removexattr  lremovexattr  connect  bind  sendto
+setxattr  lsetxattr  removexattr  lremovexattr
+connect  bind  sendto
+name_to_handle_at
+
+# capabilities — a question about the syscall itself, and nothing to remember
+io_uring_setup  io_uring_enter  io_uring_register
+open_by_handle_at  memfd_create  pidfd_getfd
+process_vm_readv  process_vm_writev  bpf  userfaultfd
+pkey_alloc  pkey_mprotect  pkey_free
 ```
 
 - **Anything not named in the policy is not intercepted at all.** The policy's
   keys *are* the mask, so a syscall nobody named runs straight through the kernel
-  under its default (allow) and never reaches a callback. Each of the thirteen is a
-  decision, and the absences are decisions too: `mkdirat` and `rmdir` are left out
-  on purpose, while `linkat` and `symlinkat` are a **real gap** rather than a
-  decision, and say so in `lua/policy.lua`.
+  under its default (allow) and never reaches a callback. Each of the
+  twenty-seven is a decision, and the absences are decisions too: `mkdirat` and
+  `rmdir` are left out on purpose, while `linkat` and `symlinkat` are a **real
+  gap** rather than a decision, and say so in `lua/policy.lua`. The mask is not
+  a checklist that stays true — the kernel adds syscalls every release and each
+  new one arrives *ungated*, which is the one thing to remember about a list
+  like this.
 - **`agent.http` and `agent.mcp` are not syscalls** — see
   [Security model](#security-model).
 - **A denied syscall kills the tracee.** That is the enforcement, and it is
   coarse: the whole run ends, not just the call.
 - **The network stays shared.** No `unshare(CLONE_NEWNET)`.
+
+### The gates that would otherwise walk past the rest
+
+Twenty of the twenty-seven ask about a *thing* — a path, a host, a port — so a
+trust table can answer them before you are asked and `always` has somewhere to
+record. The other seven ask about a **capability**, and they are the ones worth
+reading the list above for, because each one closes a route around all the others:
+
+- **`io_uring_enter` defeats the file gates rather than adding to them.**
+  `IORING_OP_OPENAT` and its siblings are submission-queue *opcodes*, not
+  syscalls: a program that speaks the ring protocol can open, stat, unlink,
+  rename, link and symlink without `openat`, `unlinkat` or `renameat` ever being
+  called. While the ring is ungated, every question the policy asks about a file
+  is one a program that cares to ask can walk around. All three of
+  `io_uring_setup` / `enter` / `register` are gated, because each alone is undone
+  by one of the other two.
+- **`open_by_handle_at` names a file without naming a path.** Its `path` argument
+  is a component hint of at most 64 bytes that decides nothing; the file is
+  chosen by an opaque handle. It is gated with *no path in the question*,
+  deliberately — naming the hint would produce a confident question about the
+  wrong file. Its partner `name_to_handle_at` takes a real path and is asked on
+  read trust like any other read, since the handle is only as good as the read
+  you vouched for.
+- **`memfd_create`, `pidfd_getfd`, `process_vm_readv`/`writev`, `bpf`,
+  `userfaultfd`, `pkey_*`** reach past the filesystem altogether — a file with no
+  name, a descriptor belonging to another process, another address space's
+  memory, the kernel itself. None of them has an argument worth decoding, so
+  each is one line in `lua/policy.lua` and one plain question.
+
+Capability questions carry **no `always`**, and so they come round again on the
+next call. That is deliberate, not a shortfall: an `always` is a promise about a
+*specific* thing, and for "this program may reach anything" there is nothing to be
+specific about. Asking each time costs a prompt per call, paid only by programs
+that use these — almost none. Guessing once would be a grant you made about a
+capability you could not name, made invisible from the next question onwards. So
+the question says what a *yes* means, because here it is not permission to do one
+thing: for a ring, it is permission to reach any file or endpoint without asking
+again, for as long as the run lasts.
+
+`memfd_secret` is the near miss, and is deliberately **not** gated: glibc uses it
+for the per-thread guard pages behind `MALLOC_TUNABLE_*`, and a gate that fires on
+libc's own housekeeping is a gate that teaches you to press `a`.
 
 What it does give, and the reason to want it: a real kernel-level floor under every
 decision *you* make, the arguments of a frozen syscall read out of the process —
@@ -493,7 +553,7 @@ cargo test && ./scripts/verify-sandbox.sh
 `verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
 fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
 `src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
-the check that the sandbox is still there at all. The suite is 375 library tests
+the check that the sandbox is still there at all. The suite is 380 library tests
 and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
 compiler (`-- --ignored` runs them).
 
@@ -510,6 +570,12 @@ Work in progress, and honest about the edges:
 
 - **Nobody has run this end to end against a real model yet.** Everything is
   green because it is hermetically tested; the integration is not.
+- **The mask is a list, not a property, and it cannot be a property.** Every
+  syscall the policy does not name runs ungated under the kernel's default, and
+  the kernel adds more every release. What the list *can* do is catch the routes
+  around the gates that are there — which is what the capability gates above are
+  for — and it has been extended to twenty-seven on that basis. Audit it when the
+  kernel moves, not when something breaks.
 - **`linkat` and `symlinkat` are ungated.** A real gap in the policy, not a
   decision — the sandbox engine resolves the paths, the policy just does not ask.
 - **`fchmod` is ungated**, and cannot be asked about: it names a descriptor, not

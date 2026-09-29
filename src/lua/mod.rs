@@ -69,6 +69,17 @@
 //! decided. A `__index` metatable is only consulted for the fork-family
 //! syscalls you did name, in practice never — those are engine-handled.)
 //!
+//! The mask is not merely additive, and this is the one thing worth knowing
+//! before writing one. A syscall can be an alternative *route* to work another
+//! gate already covers: `IORING_OP_OPENAT` and its siblings are io_uring
+//! submission-queue opcodes, not syscalls, so a policy that asks about
+//! `openat` and `unlinkat` and does not also name `io_uring_enter` has gates
+//! that any program able to speak the ring protocol can walk straight around.
+//! `open_by_handle_at` is the same shape for the same reason — it selects a file
+//! with an opaque handle rather than a name, so no path table can constrain it.
+//! When adding a gate, the question is not only "should this syscall be asked
+//! about" but "what does leaving it out let a program reach".
+//!
 //! The callback's outcome — callbacks may call **user-asking functions** that
 //! yield the Lua thread until answered, and they decide by returning a
 //! **boolean** or a **verdict object**:

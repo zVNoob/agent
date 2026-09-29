@@ -1236,3 +1236,266 @@ use crate::testutil::scratch_dir;
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Drive one gate of the shipped policy the way `agent.bash` drives it — in
+    /// a coroutine, with no panel — and hand back the question it raised
+    /// together with what the callback returned once `verdict` reached it.
+    ///
+    /// This is the only way to reach a gate for a syscall nothing in the suite
+    /// provokes: `io_uring_*` needs a program that speaks the ring protocol, and
+    /// there is no compiler here to build one. What that skips is the seccomp
+    /// interception step, which [`MASK`] and the engine's own filter tests
+    /// already cover. What it keeps is the part this change adds — the wording,
+    /// the `always`, and whether a second call goes quiet.
+    ///
+    /// `paths` are `(slot, text)` pairs, 1-based as `syscall_into_table` writes
+    /// them: `sys.str` is sparse and keyed by number, which JSON objects cannot
+    /// express, so they are carried as a list and re-keyed here. The table is
+    /// always built, empty or not, because the engine always sets one.
+    fn ask_through_gate(
+        lua: &mlua::Lua,
+        gate: &str,
+        sys: &serde_json::Value,
+        paths: &[(usize, &str)],
+        verdict: &str,
+    ) -> (mlua::Table, mlua::Value) {
+        // The syscall table arrives as JSON text and is decoded by the same
+        // bridge primitive the Lua side decodes MCP replies with, rather than
+        // being spliced into the chunk: a JSON object is not a Lua table, and
+        // writing it out by hand here would be a second, drifting copy of the
+        // shape `src/lua/sandbox.rs` builds.
+        let str = serde_json::to_string(&paths.to_vec()).expect("path list");
+        lua.load(
+            r#"
+        local gate_name, sys_json, str_json, verdict_src = ...
+        local policy = require("policy")
+        local gate = policy[gate_name]
+        assert(type(gate) == "function",
+               "the shipped policy has no gate named " .. tostring(gate_name))
+        local sys = agent.api.json_decode(sys_json)
+        sys.str = sys.str or {}
+        for _, entry in ipairs(agent.api.json_decode(str_json)) do
+          sys.str[entry[1]] = entry[2]
+        end
+        -- `verdict_src` is Lua source, so that a call site can say what the user
+        -- pressed — `true`, or `agent.deny("…")` — in the same words the policy
+        -- docs use rather than by hand-building the table.
+        local verdict = load("return " .. verdict_src)()
+        local co = coroutine.create(function() return gate(sys) end)
+        local ok, q = coroutine.resume(co)
+        assert(ok, tostring(q))
+        assert(type(q) == "table",
+               "the gate asked, and the question was: " .. tostring(q))
+        local done, ret = coroutine.resume(co, verdict)
+        assert(done, tostring(ret))
+        return q, ret
+    "#,
+        )
+        .call::<(mlua::Table, mlua::Value)>((gate, sys.to_string(), str, verdict))
+        .expect("gate ran")
+    }
+
+    /// The syscall table the engine would have built for a ring: a descriptor,
+    /// and no path anywhere in it. The command line is the ordinary
+    /// server-worker shape, which is the point — the question has to be
+    /// answerable when the asker is a thread with no argument list.
+    fn ring_call(name: &str) -> serde_json::Value {
+        json!({
+            "name": name,
+            "pid": 4242,
+            "args": [3, 1, 1, 0, 0, 0],
+            "cmdline": "nginx: worker process",
+        })
+    }
+
+    /// An `io_uring` ring is the one gate here added because of what it
+    /// *defeats* rather than what it allows: `IORING_OP_OPENAT` is a
+    /// submission-queue opcode rather than a syscall, so a program that speaks
+    /// the ring can open, unlink and rename files without `openat`, `unlinkat`
+    /// or `renameat` ever being called. Three things follow, and they are three
+    /// separate claims:
+    ///
+    ///  - all three entry points are gated, because gating `setup` alone would
+    ///    be undone by `enter` and gating `enter` alone by `register`;
+    ///  - none offers `always`, because a ring is not a path and there is no
+    ///    table an "always" could record into;
+    ///  - each says what allowing it *means*, because "yes" here is not
+    ///    permission to do one thing — it is permission to do everything the
+    ///    rest of this policy asks about, silently, for as long as the ring
+    ///    lives. A user who read only the first clause would not know that.
+    #[test]
+    fn an_io_uring_ring_is_asked_about_exactly_what_it_defeats() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+
+        for gate in ["io_uring_setup", "io_uring_enter", "io_uring_register"] {
+            let (q, ret) = ask_through_gate(&lua, gate, &ring_call(gate), &[], "true");
+            let description: String = q.get("description").expect("a description");
+
+            assert!(
+                description.contains(&format!("{gate} (pid 4242) requests")),
+                "{gate} names itself and who is asking: {description}"
+            );
+            assert!(
+                description.contains("without asking about it"),
+                "{gate} says what a yes actually grants, because it is not one \
+                 thing: {description}"
+            );
+            assert!(
+                description.contains("nginx: worker process"),
+                "{gate} names the tracee, which for a ring worker is the only \
+                 thing that identifies it: {description}"
+            );
+            assert_eq!(
+                q.get::<Option<bool>>("always").expect("an always field"),
+                Some(false),
+                "{gate} offers no `always`: there is no path or endpoint in a ring \
+                 for one to record"
+            );
+            assert_eq!(
+                q.get::<Option<String>>("path").expect("a path field"),
+                None,
+                "{gate} names no path, so the trust tables cannot answer it \
+                 before the user does"
+            );
+            assert!(
+                matches!(ret, mlua::Value::Boolean(true)),
+                "{gate} allowed on a plain yes: {ret:?}"
+            );
+        }
+    }
+
+    /// A capability gate repeats, because `always = false` leaves nothing to
+    /// match the next call against. That is the design rather than a shortfall,
+    /// and it is asserted as behaviour rather than read off the flag: ask
+    /// twice, allow both times, and both are questions.
+    ///
+    /// Paired with the check that nothing was written down — an "always" with
+    /// nothing to record would be the other half of the same claim.
+    #[test]
+    fn a_capability_gate_asks_again_and_records_nothing() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+        let before = trusted_entry_count(&lua);
+
+        let (first, _) = ask_through_gate(&lua, "bpf", &ring_call("bpf"), &[], "true");
+        let (second, _) = ask_through_gate(&lua, "bpf", &ring_call("bpf"), &[], "true");
+
+        let first = first.get::<String>("description").expect("description");
+        let second = second.get::<String>("description").expect("description");
+        assert_eq!(
+            first, second,
+            "the same question, so the second one being asked is a decision and \
+             not a difference in the syscall"
+        );
+        assert!(
+            first.contains("bpf"),
+            "and it is about the capability itself, which is the whole of what a \
+             capability gate can name: {first}"
+        );
+        assert_eq!(
+            trusted_entry_count(&lua),
+            before,
+            "and nothing was written down, which is the other half of the same \
+             claim: there is no table a capability gate could record into, so \
+             there is nothing for the next call to match against"
+        );
+    }
+
+    /// How many entries the path trust tables hold — the measure of "did this
+    /// answer get remembered". Counted before and after rather than pinned to a
+    /// number, because the shipped config's pre-grants are a different decision
+    /// from this one and are not what is under test here.
+    fn trusted_entry_count(lua: &mlua::Lua) -> usize {
+        lua.load(
+            r#"
+        local ask = require("ask")
+        local n = 0
+        for _ in pairs(ask.trusted_paths()) do n = n + 1 end
+        for _ in pairs(ask.trusted_write_paths()) do n = n + 1 end
+        return n
+    "#,
+        )
+        .eval()
+        .expect("trust tables")
+    }
+
+    /// Refusing a capability is a real refusal: the gate returns the denial
+    /// object rather than a `true` the engine would read as a verdict to
+    /// continue on. A gate that could only allow would be a gate that had been
+    /// renamed.
+    #[test]
+    fn a_refused_capability_denies_rather_than_allowing() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+
+        let (_, ret) = ask_through_gate(
+            &lua,
+            "open_by_handle_at",
+            &json!({ "name": "open_by_handle_at", "pid": 99, "args": [3, 4, 0, 0, 0, 0] }),
+            &[],
+            r#"agent.deny("no handles here")"#,
+        );
+        let denial: mlua::Table = match ret {
+            mlua::Value::Table(t) => t,
+            other => panic!("a refusal is a denial table, got {other:?}"),
+        };
+        assert_eq!(
+            denial.get::<String>("__agent_verdict").expect("a verdict"),
+            "deny",
+            "and it carries the reason the panel shows"
+        );
+    }
+
+    /// The handle pair is deliberately asymmetric, and the reason is worth
+    /// pinning rather than leaving to a reader: a `file_handle` carries no path
+    /// back, so remembering that a path may be *read* cannot answer a question
+    /// about spending one.
+    ///
+    /// Proven the hard way, by handing `open_by_handle_at` a trusted path in its
+    /// `str` table — something the engine does not do, and exactly what would
+    /// happen if someone "fixed" `open_by_handle_at_names_no_path_and_its_partner_names_one`
+    /// by adding the syscall to `CSTRING_ARGS`. `ask.ask` short-circuits to
+    /// `true` on a trusted path, so without `ask_capability` dropping the field
+    /// the gate would answer itself from a grant the user made about a *file*,
+    /// and the whole capability boundary would quietly become a path one.
+    #[test]
+    fn trusting_a_path_does_not_silence_opening_a_handle() {
+        let lua = shipped_vm();
+        prime_the_sandbox(&lua);
+        let dir = scratch_dir("agent-handle-trust");
+        std::fs::write(dir.join("secret"), "x\n").expect("seed");
+        let path = dir.join("secret").to_string_lossy().to_string();
+        lua.load(format!("require('ask').trust({path:?})"))
+            .exec()
+            .expect("trust the path outright");
+
+        let named = json!({
+            "name": "name_to_handle_at", "pid": 7, "args": [-100, 0, 0, 0, 0, 0],
+        });
+        let asked = json!({
+            "name": "open_by_handle_at", "pid": 7, "args": [3, 4, 0, 0, 0, 0],
+        });
+
+        let (q, _) = ask_through_gate(&lua, "open_by_handle_at", &asked, &[(4, path.as_str())], "true");
+        assert_eq!(
+            q.get::<Option<String>>("path").expect("a path field"),
+            None,
+            "the gate dropped the path, so the trust table cannot answer it: the \
+             grant above was about reading a file, and this is about an opaque \
+             handle that might not be one"
+        );
+        // A *different* path for the partner, one nothing trusts — a trusted
+        // path would (correctly) answer itself before any question, which is the
+        // behaviour above rather than a contrast to it.
+        let other = dir.join("elsewhere").to_string_lossy().to_string();
+        let (part, _) = ask_through_gate(&lua, "name_to_handle_at", &named, &[(2, other.as_str())], "true");
+        assert_eq!(
+            part.get::<Option<String>>("path").expect("a path field"),
+            Some(other),
+            "…while its partner does keep the path, which is what makes it a \
+             read-trust question instead of a capability one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }

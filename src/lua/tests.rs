@@ -441,10 +441,10 @@ fn run_policy_bash_except(
 }
 
 /// The shell the tests below drive *is* the shipped one: `lua/policy.lua` is
-/// the default sandbox policy, so `require("bash_tool")` already runs under all
-/// thirteen gated syscalls and there is nothing to install. Asserted here so a change
-/// to the default fails loudly at the point the tests start rather than as a
-/// baffling "asked nothing".
+/// the default sandbox policy, so `require("bash_tool")` already runs under
+/// every syscall `MASK` names and there is nothing to install. Asserted here so
+/// a change to the default fails loudly at the point the tests start rather
+/// than as a baffling "asked nothing".
 fn assert_default_shell(lua: &mlua::Lua) {
     // The real table, not the source: this used to grep
     // `policy.<name> = function` out of `lua/policy.lua`, which cannot see a
@@ -500,10 +500,11 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 /// The shipped policy's mask, spelled out. A policy that named fewer would
-/// silently let a connect — or an `rm`, or a `chmod` — through, so the set is
-/// pinned exactly; and it is a list rather than a count, so that adding a
-/// gate is a visible edit here and not a silent one.
-const MASK: &str = "bind,chmod,connect,fchmodat,lremovexattr,lsetxattr,openat,removexattr,renameat,renameat2,sendto,setxattr,unlinkat";
+/// silently let a connect — or an `rm`, or a `chmod`, or an `io_uring_enter`
+/// that walks past all three — through, so the set is pinned exactly; and it is
+/// a list rather than a count, so that adding a gate is a visible edit here and
+/// not a silent one.
+const MASK: &str = "bind,bpf,chmod,connect,fchmodat,io_uring_enter,io_uring_register,io_uring_setup,lremovexattr,lsetxattr,memfd_create,name_to_handle_at,open_by_handle_at,openat,pidfd_getfd,pkey_alloc,pkey_free,pkey_mprotect,process_vm_readv,process_vm_writev,removexattr,renameat,renameat2,sendto,setxattr,unlinkat,userfaultfd";
 
 /// Drive an `EventRun` to completion by answering every wait the way the
 /// reactor would (its timer fired), counting the cooperative suspensions.
