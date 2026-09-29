@@ -504,6 +504,60 @@ impl App {
         }
     }
 
+    /// Put pasted text into the input line.
+    ///
+    /// **A paste is not a keypress, and this is the whole reason it exists.**
+    /// Without bracketed paste the terminal delivers a paste as a stream of
+    /// ordinary key events, so pasting three lines of a stack trace sends
+    /// whichever line ended in a newline -- a half-finished message submitted
+    /// mid-sentence, with the rest of it arriving as a second one. There is no
+    /// way to fix that from the receiving end: those newlines are
+    /// indistinguishable from the user pressing Enter three times, and a
+    /// heuristic that decides "that was really a paste" is a heuristic.
+    ///
+    /// With bracketed paste the terminal says so (`Event::Paste`), the newlines
+    /// survive as newlines, and nothing is sent until the user decides. The text
+    /// goes in through [`apply_input_op`] rather than a private path, so a pasted
+    /// character is inserted by exactly the code that inserts a typed one.
+    ///
+    /// What is *not* preserved is the raw bytes. A paste is arbitrary content
+    /// from a clipboard, and this is the one path where bytes that would move the
+    /// cursor or clear the screen can reach the renderer, so they are dropped
+    /// rather than trusted. Carriage returns become newlines, because that is
+    /// what they meant: a terminal pastes what was copied, and what was copied
+    /// often has CRLF in it. Tabs become spaces, which is nearly always what a
+    /// tab in a message was meant to be.
+    pub fn paste(&mut self, text: &str) {
+        // Normalised in two passes, because `\r\n` is one line ending and not
+        // two. Mapping `\r` to `\n` character-by-character turns every CRLF into
+        // a blank line, which is worse than the stray return it fixes — a pasted
+        // stack trace comes out with a gap between every pair of lines. So the
+        // return is dropped when a newline follows it, and only *becomes* a
+        // newline when one does not (a classic-Mac file pasted whole, and a lone
+        // carriage return typed into a buffer selection).
+        let mut cleaned = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' => {
+                    if chars.peek() != Some(&'\n') {
+                        cleaned.push('\n');
+                    }
+                }
+                '\t' => cleaned.push(' '),
+                // Every other control character — escapes, cursor motion, bell,
+                // delete — becomes a space rather than reaching the renderer.
+                // A space is inert; a control character in an input line is not.
+                other if other.is_control() && other != '\n' => cleaned.push(' '),
+                other => cleaned.push(other),
+            }
+        }
+        if cleaned.is_empty() {
+            return;
+        }
+        self.apply_input_op(crate::lua::InputOp::Append(cleaned));
+    }
+
     /// Take a grammar into use, and apply it to what is already on screen.
     ///
     /// The hot half of hot loading, and the reason it can be done at all: adding
@@ -1750,5 +1804,116 @@ mod tests {
             app.panel.scroll, before,
             "wheel over the input box is ignored"
         );
+    }
+
+    /// A paste inserts its text, newlines and all, and **sends nothing**.
+    ///
+    /// The property worth pinning is the absence: a newline inside a pasted
+    /// string must land in the input line as a newline rather than becoming a
+    /// submission. Without bracketed paste that distinction cannot be made at all
+    /// — the terminal hands over a stream of keypresses, and a `\r` in it is
+    /// indistinguishable from the user pressing Enter — which is why this tests
+    /// `App::paste` taking the text whole rather than the event plumbing.
+    #[test]
+    fn a_pasted_newline_is_inserted_rather_than_submitted() {
+        let mut app = App::default();
+        app.paste("first line\nsecond line\nthird");
+        assert_eq!(
+            app.input, "first line\nsecond line\nthird",
+            "two newlines and three lines, not three submissions"
+        );
+        // The distinction that matters, said the other way round: the input is
+        // not the first line, which is exactly what a `\r` in the stream would
+        // have produced.
+        assert_ne!(app.input, "first line");
+    }
+
+    /// What a paste has to survive, since it is arbitrary bytes from a clipboard
+    /// and nothing else on the input path has to cope with that.
+    ///
+    /// Carriage returns are the one that bites: a terminal pastes what was
+    /// copied, and what was copied often has CRLF in it. Left alone, every line
+    /// of a pasted message carries a stray carriage return the model then reads.
+    /// Control characters are the other, and here they are a real risk rather
+    /// than a theoretical one — an input line that can clear the screen is not an
+    /// input line.
+    #[test]
+    fn a_paste_is_normalised_rather_than_trusted() {
+        // What a terminal pastes from a Windows selection, or a file with CRLF
+        // endings pasted whole. The property is one newline per line ending:
+        // a naive `\r` -> `\n` mapping turns every CRLF into a *blank* line,
+        // which is worse than the stray return it was meant to fix.
+        let mut app = App::default();
+        app.paste("alpha\r\nbeta\r\ngamma");
+        assert_eq!(
+            app.input, "alpha\nbeta\ngamma",
+            "CRLF becomes exactly one newline each — not two, so no blank lines"
+        );
+
+        // A lone carriage return, with no newline after it, is a line ending in
+        // its own right (a classic-Mac file, a selection from a buffer that uses
+        // them). It becomes a newline rather than vanishing.
+        app = App::default();
+        app.paste("one\rtwo");
+        assert_eq!(app.input, "one\ntwo", "a bare CR is still a line ending");
+
+        // Escapes and cursor-motion bytes, which are the reason this function
+        // filters at all. The escape itself becomes a space and the characters
+        // after it survive as the literal text they are. What matters is the
+        // property rather than the exact string: **no control character reaches
+        // the renderer**, so a paste can never move the cursor or clear the
+        // screen — and the words on either side of one are not swallowed.
+        app = App::default();
+        app.paste("safe\u{1b}[2Jtext\u{7}\u{8}");
+        assert_eq!(
+            app.input, "safe [2Jtext  ",
+            "control characters become spaces"
+        );
+        assert!(
+            !app.input.chars().any(char::is_control),
+            "and nothing control-ish is left to draw with: {:?}",
+            app.input
+        );
+
+        // A tab is a control character too, and a literal tab in a message is
+        // essentially never what was copied.
+        app = App::default();
+        app.paste("a\tb");
+        assert_eq!(app.input, "a b", "a tab becomes a space");
+
+        // An empty paste leaves the line alone — and in particular is not a
+        // `clear`, which is what `agent.api.input_clear` exists for.
+        app = App::default();
+        app.paste("typed already");
+        app.paste("");
+        assert_eq!(app.input, "typed already", "an empty paste is not a clear");
+    }
+
+    /// A paste appends rather than replacing, and shares the typed characters'
+    /// path.
+    ///
+    /// "The same op" is the part worth having: if paste had its own insertion
+    /// path, a configuration that grows the input line through
+    /// `agent.api.input_insert` — a leader key, a snippet — would behave
+    /// differently depending on whether a character arrived by keyboard or by
+    /// clipboard. That is the sort of difference nobody finds until it matters.
+    #[test]
+    fn a_paste_appends_and_shares_the_typed_characters_path() {
+        let mut app = App::default();
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(app.input, "hi", "typed");
+        app.paste(" there");
+        assert_eq!(app.input, "hi there", "pasted after what was typed");
+
+        // The other way round: an input op and a paste compose, because both end
+        // in `apply_input_op`.
+        app.apply_input_op(crate::lua::InputOp::Append("!".into()));
+        assert_eq!(app.input, "hi there!");
+
+        // And a backspace still works across the seam, because the line is one
+        // string rather than two buffers with a boundary.
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.input, "hi there");
     }
 }

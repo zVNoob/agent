@@ -63,7 +63,8 @@ use agent::status::StatusKind;
 use agent::tui::{Action, App, Click, Effect, MarkdownHighlighter, Role};
 use anyhow::Result;
 use crossterm::event::{
-    Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, EnableBracketedPaste, Event as CrosstermEvent, EventStream, KeyCode,
+    KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -196,7 +197,14 @@ async fn main() -> Result<()> {
     }
 
     enable_raw_mode()?;
-    execute!(stderr(), EnterAlternateScreen)?;
+    // Bracketed paste, so a paste arrives as *one event carrying its text* rather
+    // than as a stream of keypresses. Without it, pasting anything with a newline
+    // in it sends the first line and delivers the rest as a second message — and
+    // the receiver cannot tell that apart from the user pressing Enter, which is
+    // why this has to be set by the terminal side and not guessed at here.
+    // A terminal that does not support it ignores the sequence and pastes as
+    // before, so this is strictly an improvement rather than a requirement.
+    execute!(stderr(), EnterAlternateScreen, EnableBracketedPaste)?;
     write!(stderr(), "{MOUSE_ON}")?;
     let _ = stderr().flush();
     let mut terminal = Terminal::new(CrosstermBackend::new(stderr()))?;
@@ -346,7 +354,7 @@ async fn main() -> Result<()> {
     reader.abort();
     write!(stderr(), "{MOUSE_OFF}")?;
     disable_raw_mode()?;
-    execute!(stderr(), LeaveAlternateScreen)?;
+    execute!(stderr(), DisableBracketedPaste, LeaveAlternateScreen)?;
     let _ = stderr().flush();
     outcome
 }
@@ -1412,6 +1420,30 @@ async fn run<W: Write>(
                                 }
                             }
                         }
+                    }
+                }
+            }
+            // A paste is not a key, so it is handled here and not through the
+            // binding table or `handle_key`: there is no single chord to bind, no
+            // action to name, and — the point of the exercise — no `Enter` in it.
+            //
+            // It respects the two states a key respects. With a permission
+            // question on screen, a paste is ignored: the question is modal, and
+            // text arriving underneath it would be typed at a dialog. While a
+            // turn is running, a paste is *inserted* rather than sent, because
+            // `Enter` mid-turn is ignored and a pasted newline must be ignored
+            // the same way rather than submitting a message the user is still
+            // writing.
+            Tick::Key(CrosstermEvent::Paste(text)) => {
+                if pending_question.is_none() {
+                    let had = app.input.len();
+                    app.paste(&text);
+                    if app.input.len() != had {
+                        let added = app.input.len() - had;
+                        app.set_status_text(
+                            format!("pasted {added} char{}", if added == 1 { "" } else { "s" }),
+                            StatusKind::Info,
+                        );
                     }
                 }
             }

@@ -345,6 +345,21 @@ it for free. It is also why leaving is `Ctrl+d` and not a letter. Input edits ar
 exempt: by the time one is queued a command has already been chosen, so a leader
 key works mid-sentence.
 
+**Pasting keeps its newlines.** The terminal is put into bracketed-paste mode,
+so a paste arrives as one event carrying its text rather than a stream of
+keypresses, and a newline inside it lands in the input line as a newline instead
+of sending a half-finished message. That difference is not recoverable from the
+receiving end — a `\r` in a stream of keypresses is indistinguishable from the
+user pressing Enter — so it has to be the terminal telling us, and a terminal
+that does not support it just pastes as before.
+
+Pasted text is normalised rather than trusted, because a paste is arbitrary
+clipboard content: `\r\n` becomes one newline (not two, and not a stray return
+per line), tabs and other control characters become spaces, and no control
+character reaches the renderer — so a paste can never move the cursor or clear
+the screen. A paste is also never submitted on its own, and never submitted while
+a permission question is on screen.
+
 Two more things the event machinery gets right:
 
 - The event is **not fired while a permission question is on screen**. `y`/`n`/`a`
@@ -632,7 +647,7 @@ make fmt           # cargo fmt
 `verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
 fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
 `src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
-the check that the sandbox is still there at all. The suite is 394 library tests
+the check that the sandbox is still there at all. The suite is 397 library tests
 and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
 compiler (`-- --ignored` runs them).
 
