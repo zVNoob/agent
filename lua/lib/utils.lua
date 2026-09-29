@@ -20,6 +20,17 @@
 -- beyond the one registration below — every function either returns a new
 -- value or (where noted) mutates its argument by design.
 --
+-- **Most of it is for your config, not for the shipped code.** Of the ~100
+-- `str.*`/`tbl.*` functions, exactly one (`utils.tool`) is called by another
+-- shipped file; the rest are here because they are useful to someone writing a
+-- tool or a policy in `~/.config/agent/init.lua`, and they are held to that by
+-- `_selftest` rather than by a caller. That is the point of the module, not an
+-- accident of dead code — so do not read "no internal caller" as "delete me".
+-- The shipped tree does route through it where the job is exactly one of
+-- these (`bash_tool` uses `string.normalize_ws`), and hand-rolls the rest where
+-- the semantics differ: `ask.lua`'s `is_trusted` and `fs.lua`'s line splitting
+-- both *look* like library functions and are not.
+--
 -- Design rules:
 --   * pure: inputs are never mutated. The one deliberate exception is
 --     `utils.table.set` / `utils.table.unset`, which write through a path.

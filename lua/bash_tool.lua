@@ -40,6 +40,12 @@
 
 local M = { name = "bash", tools = {} }
 
+-- One local alias for the string helpers, so the title below reads as "normalise
+-- whitespace" rather than as a `gsub` chain. `utils` is on the module path and
+-- this is a top-level module, so it is required *after* the `lib/` sweep and
+-- `agent.utils` is live either way.
+local str = require("utils").string
+
 -- The run itself. The policy is the default one, `lua/policy.lua` — a module
 -- that *returns* a table, required here and handed to `agent.bash` per call. A
 -- policy is a per-call argument and never ambient state, so a caller that wants
@@ -57,7 +63,7 @@ local function run(args)
   -- otherwise break that border's alignment. A title still too long for the
   -- width is cut by the renderer (with an ellipsis), not here — the panel keeps
   -- the full command either way, in the transcript of the model's own call.
-  local title = (args.cmdline:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""))
+  local title = str.normalize_ws(args.cmdline)
   local p = agent.panel(title, { boxed = true, conceal_box = false })
   local s = agent.bash(args.cmdline, require("policy"), {
     on_stdout = function(chunk)

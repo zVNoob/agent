@@ -240,6 +240,23 @@ local function exists(path)
   return os.rename(path, path) and true or false
 end
 
+--- Is something already holding this name? `ask.taken`, for the one caller
+--- outside this file that needs exactly this and nothing more.
+---
+--- The probe and its reasoning are the ones in `exists` above, and they are
+--- worth stating once: `os.rename(p, p)` rather than `io.open`, because
+--- `io.open` follows the name and fails on anything the process may not *read*,
+--- so `/etc/shadow` — which very much exists — reads as absent, and absent is
+--- the one answer that skips the ask. Two failures do read as "not taken", and
+--- both are safe because the create cannot succeed anyway: a name below
+--- something that is not a directory (ENOTDIR), and a name whose parent may not
+--- be written (EACCES). The sandbox is a bare `fork()` with no `unshare`, so the
+--- command runs with the user's own permissions.
+function M.taken(path)
+  if type(path) ~= "string" or path == "" then return false end
+  return exists(path)
+end
+
 -- Directory or file? `io.open` succeeds on a directory too, so it cannot answer
 -- this alone — but *reading* from it cannot: `f:read(0)` returns the empty
 -- string for a readable file and nil for a directory (the read fails with

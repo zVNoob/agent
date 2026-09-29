@@ -143,25 +143,6 @@ local function reach_question(what, addr)
          " at port " .. tostring(sc.port_of(nil, addr) or "?")
 end
 
---- Does something already hold this name?
----
---- `os.rename(p, p)` is the probe, and it is here rather than `io.open` for one
---- reason. `io.open` follows the name and fails on anything the process may not
---- *read*, so `/etc/shadow` — which very much exists — reads as absent, and
---- absent is the one answer that skips the ask. Renaming a path onto itself is a
---- documented no-op that succeeds exactly when the name is taken, whatever its
---- mode and whoever owns it, and it costs no process.
----
---- Two failures do read as "not taken", and both are safe because the create
---- cannot succeed anyway: a name below something that is not a directory
---- (ENOTDIR), and a name whose parent may not be written (EACCES). The sandbox
---- is a bare `fork()` with no `unshare`, so the command runs with the user's own
---- permissions — there is no case where the gate is skipped and the write then
---- lands.
-local function taken(path)
-  if type(path) ~= "string" or path == "" then return false end
-  return os.rename(path, path) ~= nil
-end
 
 local policy = {}
 
@@ -183,9 +164,9 @@ policy.openat = function(sys)
     -- silences *reads* of it, because `trust_write` records both tables — which
     -- is right for a file the agent just made and is not true in general.
     --
-    -- What this does not do is make an overwrite silent. `taken` is the whole
-    -- difference, and it is asked of the *resolved* path: a symlink to an
-    -- existing file resolves to that file, which is taken, so it asks. The same
+    -- What this does not do is make an overwrite silent. The existence probe is
+    -- the whole difference, and it is asked of the *resolved* path: a symlink to
+    -- an existing file resolves to that file, which is taken, so it asks. The same
     -- resolution runs on every later write, so swapping a created file for a
     -- symlink makes the next write ask about the symlink's target rather than
     -- quietly following it.
@@ -197,7 +178,7 @@ policy.openat = function(sys)
     -- the opposite of what granting it read-only meant. A working directory is
     -- granted with `trust` and so is unaffected — work there still creates
     -- quietly, as it must.
-    if not taken(path) and not ask.is_readonly(path)
+    if not ask.taken(path) and not ask.is_readonly(path)
        and not ask.is_blocked(path) then
       ask.trust_write(path)
       return true
