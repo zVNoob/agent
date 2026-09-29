@@ -123,6 +123,10 @@ pub enum ConfigOrigin {
     /// The user's `init.lua` did not exist, so the shipped one was copied there
     /// and run. It is now *theirs* to edit.
     Seeded,
+    /// The user's `init.lua` existed, was byte-identical to the copy this agent
+    /// originally seeded, and was therefore replaced with the current shipped
+    /// one. Only ever a file nobody has touched — see [`ensure_config`].
+    Refreshed,
 }
 
 /// The user's configuration file, seeded from the tree's `init.lua` when it does
@@ -153,9 +157,14 @@ pub fn ensure_config(
     let dir = home.join(".config").join("agent");
     let path = dir.join("init.lua");
     if path.is_file() {
+        // Refresh a seed nobody has touched. See `may_refresh_seed` for why this
+        // is worth doing at all and why it is safe.
+        if let Some(true) = may_refresh_seed(&shipped, &path, &dir) {
+            return (path, ConfigOrigin::Refreshed);
+        }
         return (path, ConfigOrigin::Existing);
     }
-    if let Err(why) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::copy(&shipped, &path)) {
+    if let Err(why) = write_seed(&shipped, &path, &dir) {
         eprintln!(
             "[agent] could not write {} ({why}); using the built-in defaults",
             path.display()
@@ -163,6 +172,67 @@ pub fn ensure_config(
         return (shipped, ConfigOrigin::Tree);
     }
     (path, ConfigOrigin::Seeded)
+}
+
+/// The name of the copy kept beside the seeded config so that "has the user
+/// edited it?" is answerable without a hash and without guessing.
+pub const SEED_MARKER: &str = ".init.lua.seeded";
+
+/// Write the shipped script to the user's config **and** keep a copy of exactly
+/// what was written, so a later run can tell an untouched seed from an edited
+/// one.
+///
+/// The copy is a second file rather than a checksum in the config, deliberately:
+/// a checksum would need a hash function (a dependency, or a hand-rolled one
+/// whose collisions would mean *overwriting somebody's edits*), and a second file
+/// is exact and inspectable. It is the thing that makes the refresh rule below
+/// provable rather than probable.
+fn write_seed(shipped: &Path, path: &Path, dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::copy(shipped, path)?;
+    // Best effort: a config we could not record the provenance of is a config we
+    // will simply never try to refresh, which is the safe direction to fail in.
+    let _ = std::fs::copy(shipped, dir.join(SEED_MARKER));
+    Ok(())
+}
+
+/// Whether the user's config is a seed this agent wrote and nobody has since
+/// edited, and may therefore be replaced by the current shipped one.
+///
+/// **Why refresh at all.** Seeding happens once, so a user who installed the
+/// agent in its first week keeps that week's `init.lua` for ever. It is 36 KB of
+/// prose, and it is the *only* documentation of the configuration — so a fix to
+/// it, or a new `>>>` setting, reaches nobody. This project's own history has the
+/// example: `init.lua` once told users to set `AGENT_BASE_URL` to point at a
+/// different server, which is false for the TUI and never was. Fixing the text
+/// fixed it for new users and for exactly nobody else.
+///
+/// **Why it is safe.** Only for a file that is byte-identical to the copy this
+/// agent wrote. The moment the user edits one line — and editing one line is what
+/// the file is *for*, since the `>>>` settings live in it — the two differ and
+/// this returns false forever after. There is no merge, no diff, no partial
+/// update: an edited config is left exactly as it is, and the user is never told
+/// a newer starter exists.
+///
+/// **What it costs.** A user who seeds, edits nothing, upgrades, and now has a
+/// different config than the one they had an hour ago — with a line saying so at
+/// startup. That is strictly better than the alternative, which is silently
+/// running a stale copy of a file whose whole content is instructions.
+fn may_refresh_seed(shipped: &Path, path: &Path, dir: &Path) -> Option<bool> {
+    let marker = dir.join(SEED_MARKER);
+    let recorded = std::fs::read(&marker).ok()?;
+    let current = std::fs::read(path).ok()?;
+    if recorded != current {
+        return Some(false);
+    }
+    match std::fs::copy(shipped, path) {
+        Ok(_) => {
+            let _ = std::fs::copy(shipped, &marker);
+            Some(true)
+        }
+        // A config we cannot overwrite is the user's, not a failure to report.
+        Err(_) => Some(false),
+    }
 }
 
 pub fn apply_config_source(lua: &Lua, source: &str) -> Result<(), String> {

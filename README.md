@@ -282,9 +282,17 @@ and the sections around them explain the rest.
 | 9 · WHAT IS NOT IN THIS FILE | what you must not put in a config, and why |
 
 `lua/init.lua` and `~/.config/agent/init.lua` share a name on purpose — they are
-the same kind of thing — and they never meet: the shipped one is only what a fresh
-config is seeded from. Delete your copy and the next run re-seeds it from whatever
-ships next, which is also how you pick up a newer starter after an upgrade.
+the same kind of thing.
+
+Once you have edited yours, the two never meet: yours is the configuration, and
+the shipped one is only what a fresh install is seeded from. **One line is
+enough to take ownership of the whole file.** Until then, the agent keeps a copy
+of exactly what it seeded you (`~/.config/agent/.init.lua.seeded`) and refreshes
+your config from the shipped one on an upgrade — because that file is 36 KB of
+prose and it is the only documentation of the configuration, so a fix to it would
+otherwise reach nobody who installed the agent in its first week. When that
+happens the startup line says so. If you have edited the file, nothing is
+touched, ever; delete it and the next run re-seeds from whatever ships now.
 
 ### Environment
 
@@ -621,7 +629,7 @@ make fmt           # cargo fmt
 `verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
 fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
 `src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
-the check that the sandbox is still there at all. The suite is 389 library tests
+the check that the sandbox is still there at all. The suite is 391 library tests
 and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
 compiler (`-- --ignored` runs them).
 

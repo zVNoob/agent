@@ -128,6 +128,17 @@ async fn main() -> Result<()> {
         ConfigOrigin::Existing => {
             println!("config: ~/.config/agent/init.lua (user config loaded)")
         }
+        ConfigOrigin::Refreshed => {
+            // Said out loud because the file just changed under a user who may
+            // have been reading it minutes ago. The rule is narrow — only a seed
+            // nobody has edited is ever replaced — but "your configuration
+            // updated itself" is not something to discover later.
+            println!(
+                "config: refreshed ~/.config/agent/init.lua from the shipped one — \
+                 it was still the copy this agent seeded, with none of your edits \
+                 in it"
+            )
+        }
         ConfigOrigin::Tree => {
             println!("config: no writable ~/.config/agent — using the built-in defaults")
         }

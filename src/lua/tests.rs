@@ -567,6 +567,7 @@ use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, Table};
 
+pub use crate::lua::config::SEED_MARKER;
 use crate::memory::Memory;
 use crate::panels::{ALWAYS_LABEL, PaneInit, PanelOp, PanelSink, Remember};
 use crate::seccomp::{self, FdSlot, Step, Verdict};

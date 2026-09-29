@@ -385,3 +385,147 @@ fn the_user_config_is_one_path_under_home() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A seed that nobody has edited is refreshed; a seed that has been edited is
+/// left alone, permanently.
+///
+/// The asymmetry is the entire feature, and both halves are asserted rather
+/// than one of them assumed: a rule that only ever refreshes would silently
+/// revert every user's settings on upgrade, and a rule that only ever leaves
+/// alone is the status quo this exists to fix — in which every user who
+/// installed the agent in its first week is still running that week's copy of
+/// 36 KB of configuration documentation for ever, and a fix to it reaches
+/// nobody.
+///
+/// The edit is one line, because one line is what editing a configuration
+/// *is*: the `>>>` settings are in this file, and a user who has touched one
+/// of them has, for this purpose, taken ownership of the whole file.
+#[test]
+fn an_untouched_seed_is_refreshed_and_an_edited_one_never_is() {
+    let dir = unique_path("agent-seed-refresh");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = dir.join(".config").join("agent");
+    std::fs::create_dir_all(&cfg).expect("a fake home");
+    let path = cfg.join("init.lua");
+    let marker = cfg.join(SEED_MARKER);
+
+    // A tree whose shipped config we can change between runs, standing in for
+    // an upgrade: same file, new contents.
+    let tree_dir = dir.join("tree");
+    std::fs::create_dir_all(&tree_dir).expect("tree");
+    let shipped = tree_dir.join("init.lua");
+    std::fs::write(&shipped, "-- version one\n").expect("v1");
+
+    let (seeded_to, origin) = ensure_config(&tree_dir, Some(&dir));
+    assert_eq!(origin, ConfigOrigin::Seeded);
+    assert_eq!(seeded_to, path, "seeded to the one path");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "-- version one\n",
+        "seeded"
+    );
+    assert!(
+        marker.is_file(),
+        "and a copy of exactly what was written, which is what makes the \
+         untouched case decidable: {}",
+        marker.display()
+    );
+
+    // An upgrade: the shipped file changes, the user's has not.
+    std::fs::write(&shipped, "-- version two\n").expect("v2");
+    let (_, origin) = ensure_config(&tree_dir, Some(&dir));
+    assert_eq!(
+        origin,
+        ConfigOrigin::Refreshed,
+        "a seed nobody has touched is replaced, so documentation fixes in the \
+         shipped config actually reach people"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "-- version two\n",
+        "and the refreshed file is the new shipped one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "-- version two\n",
+        "and the marker moves with it, so a second upgrade is decidable too"
+    );
+
+    // Idempotent: a refresh is not a reason to refresh again next run.
+    let (_, origin) = ensure_config(&tree_dir, Some(&dir));
+    assert_eq!(
+        origin,
+        ConfigOrigin::Refreshed,
+        "still byte-identical to the marker, so still refreshable — and \
+         reported as such, so the startup line is never a lie"
+    );
+
+    // Now the user edits one line, as they are meant to.
+    std::fs::write(&shipped, "-- version three\n").expect("v3");
+    let mut edited = std::fs::read_to_string(&path).expect("current");
+    edited.push_str("agent.llm.model = 'my-model'\n");
+    std::fs::write(&path, &edited).expect("edit the config");
+
+    let (_, origin) = ensure_config(&tree_dir, Some(&dir));
+    assert_eq!(
+        origin,
+        ConfigOrigin::Existing,
+        "one edited line is enough to take ownership of the whole file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        edited,
+        "and the edit survives the upgrade intact — this is the case that \
+         would destroy somebody's settings if the rule were wrong"
+    );
+
+    // And it stays that way: no later upgrade touches it either.
+    std::fs::write(&shipped, "-- version four\n").expect("v4");
+    let (_, origin) = ensure_config(&tree_dir, Some(&dir));
+    assert_eq!(origin, ConfigOrigin::Existing, "and for ever after");
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains("my-model"),
+        "the setting the user actually cared about is still there"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A config from before this feature existed has no marker, and must be left
+/// alone — there is no way to know whether it is an untouched seed or
+/// something the user wrote themselves, and "assume untouched" would revert
+/// settings for anyone whose config predates the mechanism.
+///
+/// Which is also what happens to a config someone copied in by hand, and the
+/// asymmetry is deliberate: refreshing when unsure would lose work, and not
+/// refreshing only means the user does not get new documentation.
+#[test]
+fn a_config_with_no_marker_is_left_alone_even_when_it_looks_like_a_seed() {
+    let dir = unique_path("agent-seed-nomarker");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = dir.join(".config").join("agent");
+    std::fs::create_dir_all(&cfg).expect("a fake home");
+    let path = cfg.join("init.lua");
+
+    let tree_dir = dir.join("tree");
+    std::fs::create_dir_all(&tree_dir).expect("tree");
+    let shipped = tree_dir.join("init.lua");
+    std::fs::write(&shipped, "-- the shipped one\n").expect("shipped");
+
+    // A config that is *exactly* the shipped text, but with no marker beside
+    // it: indistinguishable, by construction, from a hand-written one.
+    std::fs::write(&path, std::fs::read(&shipped).unwrap()).expect("a lookalike");
+    let (_, origin) = ensure_config(&tree_dir, Some(&dir));
+    assert_eq!(
+        origin,
+        ConfigOrigin::Existing,
+        "no marker means no provenance, and no provenance means hands off"
+    );
+    assert!(
+        !cfg.join(SEED_MARKER).exists(),
+        "and no marker is invented, because inventing one would make the next \
+         run think it knows where the file came from"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
