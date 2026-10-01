@@ -774,9 +774,6 @@ fn splice_panel_records(
     records: &[serde_json::Value],
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::with_capacity(slice.len() + records.len());
-    // Only splice into a slice that actually contains the position; a stale index
-    // (compaction shortened the history) must not put a panel in the wrong place,
-    // and dropping it is better than that.
     let cut = at
         .filter(|&i| i >= saved_upto && i <= saved_upto + slice.len())
         .map(|i| i - saved_upto);
@@ -786,7 +783,22 @@ fn splice_panel_records(
             out.extend_from_slice(records);
             out.extend_from_slice(&slice[i..]);
         }
-        None => out.extend_from_slice(slice),
+        // No place to splice — and **append, never drop**. The common case is a
+        // streamed tool: its chunks arrive over several frames, long after the
+        // round that started it was archived, so the recorded position is already
+        // behind the watermark. Dropping them is what left every `bash` panel
+        // bare on resume — the `Create` made it into the same frame as the
+        // request, and everything the command then printed was thrown away.
+        //
+        // Appending is safe, and not merely a consolation prize: panel ops are
+        // addressed by *id*, not by position, so replay applies an `Append` to
+        // the panel its `Create` opened wherever it sits in the log. Only the op
+        // that materialises a box cares about position, and that is the one this
+        // splice exists for.
+        None => {
+            out.extend_from_slice(slice);
+            out.extend_from_slice(records);
+        }
     }
     out
 }
@@ -2370,7 +2382,7 @@ mod tests {
     /// A stale or absent position must not misplace a panel: it is dropped, and
     /// the messages still go out in order.
     #[test]
-    fn a_position_outside_the_slice_drops_the_panel_rather_than_misplacing_it() {
+    fn a_position_outside_the_slice_appends_the_panel_rather_than_dropping_it() {
         let panel = agent::panels::panel_record(&agent::panels::PanelOp::Create {
             id: 1,
             title: "bash".into(),
@@ -2379,11 +2391,29 @@ mod tests {
         });
         let slice = vec![json!({"role": "user", "content": "u"})];
         // `None` (no round has claimed a position) and a position past the end
-        // (compaction shortened the history) both mean the panel cannot be placed.
+        // (compaction shortened the history) cannot be spliced — so the records go
+        // after the slice rather than being dropped. A streamed tool's chunks take
+        // this path every time: they arrive long after the round that set the
+        // position was itself written.
         for at in [None, Some(2), Some(99)] {
             let out = splice_panel_records(&slice, 0, at, std::slice::from_ref(&panel));
-            assert_eq!(out, slice, "no panel spliced at {at:?}: {out:?}");
+            assert_eq!(
+                out.len(),
+                2,
+                "the record is kept, not dropped, at {at:?}: {out:?}"
+            );
+            assert!(
+                agent::panels::is_panel_record(&out[1]),
+                "appended after the messages at {at:?}: {out:?}"
+            );
         }
+        // Behind the watermark is the case that actually bit: the round that set
+        // the position has already been written.
+        let out = splice_panel_records(&slice, 5, Some(2), std::slice::from_ref(&panel));
+        assert!(
+            agent::panels::is_panel_record(&out[1]),
+            "a stale position still keeps the drawing: {out:?}"
+        );
         // The ends of the slice are *inside* it, and both are legal positions.
         let first = splice_panel_records(&slice, 0, Some(0), std::slice::from_ref(&panel));
         assert!(
@@ -2402,87 +2432,141 @@ mod tests {
         );
     }
 
-    /// The whole chain against a real log *file*: write one the way the loop writes
-    /// it, then read it back the way a cold start does.
+    /// The whole chain against a real log *file*, written the way the loop
+    /// actually writes it: frame by frame, through [`splice_panel_records`].
     ///
-    /// Uses [`agent::memory::Memory`] directly rather than the Lua bridge,
-    /// because the bridge binds a process-global (`OnceLock`) that another test
-    /// already claims — a second bind would be a flaky test, not a real one.
+    /// The frames matter. A round's `Create` is written in the same frame as the
+    /// request that started it, so it can be spliced in beside it; a *streamed*
+    /// tool's chunks arrive over the frames after, when that request is already
+    /// on disk and the recorded position is behind the watermark. Writing the log
+    /// directly would skip exactly the step that lost every `bash` panel.
+    ///
+    /// Uses [`agent::memory::Memory`] rather than the Lua bridge, which binds a
+    /// process-global (`OnceLock`) another test already claims — a second bind
+    /// would be a flaky test rather than a real one.
     #[test]
     fn a_panel_survives_a_real_log_file_and_comes_back_on_a_cold_start() {
         let path = unique_path("panel-archive");
         let _ = std::fs::remove_file(&path);
 
-        // --- write: one user turn, a round's panel, the request, the result ---
+        let rec = agent::panels::panel_record;
+        let patch_panel = [
+            agent::panels::PanelOp::Split {
+                id: 1,
+                title: "apply_patch: /tmp/x.lua".into(),
+                panes: vec![
+                    agent::panels::PaneInit {
+                        caption: "before".into(),
+                        lang: Some("lua".into()),
+                    },
+                    agent::panels::PaneInit {
+                        caption: "after".into(),
+                        lang: Some("lua".into()),
+                    },
+                ],
+            },
+            agent::panels::PanelOp::SetPane {
+                id: 1,
+                pane: 1,
+                text: "\t\tlocal a = 1\n".into(),
+            },
+            agent::panels::PanelOp::SetPane {
+                id: 1,
+                pane: 2,
+                text: "        local a = 2\n".into(),
+            },
+        ]
+        .iter()
+        .map(rec)
+        .collect::<Vec<_>>();
+        let stream_create = rec(&agent::panels::PanelOp::Create {
+            id: 9,
+            title: "ls -F".into(),
+            boxed: true,
+            conceal_box: false,
+        });
+        let chunks = ["README.md\n", "lua/\n"]
+            .iter()
+            .map(|c| {
+                rec(&agent::panels::PanelOp::Append {
+                    id: 9,
+                    text: (*c).into(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let user = json!({"role": "user", "content": "add the python entry"});
+        let preamble = json!({"role": "assistant", "content": "on it"});
+        let calls = json!({
+            "role": "assistant",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "fs.apply_patch", "arguments": "{}"}}],
+        });
+        let result = json!({"role": "tool", "tool_call_id": "c1", "content": "{\"ok\":true}"});
+
+        // --- the frames, as `run` would drive them ---
+        let mut written: Vec<serde_json::Value> = Vec::new();
+        let mut saved_upto = 0usize;
+
+        // Frame A: the model's words and its request are new, and both tools'
+        // opening ops drain in this same frame — so they splice in beside the
+        // request, where they belong.
+        let mut opening = patch_panel;
+        opening.push(stream_create);
+        let frame_a = vec![user.clone(), preamble.clone(), calls.clone()];
+        written.extend(splice_panel_records(
+            &frame_a,
+            saved_upto,
+            Some(2),
+            &opening,
+        ));
+        saved_upto = frame_a.len();
+
+        // Frames B…: the command streams its output. No new messages, so nothing
+        // is written and the chunks pile up in the buffer.
+        //
+        // Frame C: the result lands, so the batch goes out — and the recorded
+        // position is now *behind* the watermark. That is the branch that used to
+        // drop the chunks, leaving every streamed panel bare.
+        written.extend(splice_panel_records(
+            std::slice::from_ref(&result),
+            saved_upto,
+            Some(2),
+            &chunks,
+        ));
+
         {
             let mut mem = agent::memory::Memory::open(&path).expect("log opens");
-            let mut lines: Vec<serde_json::Value> = vec![json!({
-                "role": "user", "content": "add the python entry",
-            })];
-            for op in [
-                agent::panels::PanelOp::Split {
-                    id: 1,
-                    title: "apply_patch: /tmp/x.lua".into(),
-                    panes: vec![
-                        agent::panels::PaneInit {
-                            caption: "before".into(),
-                            lang: Some("lua".into()),
-                        },
-                        agent::panels::PaneInit {
-                            caption: "after".into(),
-                            lang: Some("lua".into()),
-                        },
-                    ],
-                },
-                agent::panels::PanelOp::SetPane {
-                    id: 1,
-                    pane: 1,
-                    text: "\t\tlocal a = 1\n".into(),
-                },
-                agent::panels::PanelOp::SetPane {
-                    id: 1,
-                    pane: 2,
-                    text: "        local a = 2\n".into(),
-                },
-            ] {
-                lines.push(agent::panels::panel_record(&op));
-            }
-            lines.push(json!({"role": "assistant", "content": "on it"}));
-            lines.push(json!({
-                "role": "assistant",
-                "tool_calls": [{"id": "c1", "type": "function",
-                                "function": {"name": "fs.apply_patch", "arguments": "{}"}}],
-            }));
-            lines.push(json!({"role": "tool", "tool_call_id": "c1", "content": "{\"ok\":true}"}));
-            for line in &lines {
+            for line in &written {
                 mem.append(&serde_json::to_string(line).unwrap())
                     .expect("append");
             }
             mem.flush().expect("flush");
         }
 
-        // --- read: the transcript half puts the panel back ---
+        // --- read: the transcript half puts the panels back ---
         let records = replay_records(&path, 20);
         assert_eq!(
             records
                 .iter()
                 .filter(|r| agent::panels::is_panel_record(r))
                 .count(),
-            3,
-            "all three ops are in the log: {records:?}"
+            6,
+            "every op is in the log, the streamed chunks included: {records:?}"
         );
 
-        // Through the same function `main` calls, not a copy of it.
         let mut app = App::default();
         replay_transcript(&mut app, &records);
-        let panel = &mut app.panel;
 
         // Asserted through what a resumed session's user actually sees.
-        let (w, h) = (100u16, 20u16);
+        let (w, h) = (100u16, 30u16);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
         terminal
-            .draw(|frame| panel.render(frame, ratatui::layout::Rect::new(0, 0, w, h)))
+            .draw(|frame| {
+                app.panel
+                    .render(frame, ratatui::layout::Rect::new(0, 0, w, h))
+            })
             .expect("draw");
         let buf = terminal.backend().buffer();
         let screen: String = (0..h)
@@ -2494,6 +2578,12 @@ mod tests {
             "after",
             "local a = 1",
             "local a = 2",
+            // The streamed tool: its title *and* what it printed. The chunks
+            // arrive after the round that opened it was archived, which is the
+            // case that used to drop them and leave a bare box.
+            "ls -F",
+            "README.md",
+            "lua/",
         ] {
             assert!(
                 screen.contains(needle),
