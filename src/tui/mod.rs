@@ -27,7 +27,7 @@ mod panel;
 // module's geometry and rendering are its own business.
 pub use highlight::{MarkdownHighlighter, Segment};
 pub use panel::Click;
-pub use panel::{BorderedRenderer, HistoryItem, Message, Role, TurnPanel};
+pub use panel::{BorderedRenderer, HistoryItem, Message, REASONING, Role, TurnPanel};
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,

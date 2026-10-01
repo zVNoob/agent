@@ -100,13 +100,19 @@ use tokio::sync::mpsc;
 /// and request history (cold-start context, chronological).
 ///
 /// Blocks, not messages. A block is the log's unit of storage — records are
-/// appended into it and sealed at a turn boundary — so it is the only unit a byte
-/// offset can name, and it is also the unit the transcript already draws: a block
-/// is a turn or two of conversation, whole. Counting *messages* instead cut the
-/// window mid-block, so it began partway through a turn (a tool's panel with no
-/// sentence introducing it) and left the paging cursor addressing a position no
-/// offset could name — the source of records appearing twice, or not at all, when
-/// scrolling back.
+/// appended into it, and the loop seals one at the end of every turn — so it is the
+/// only unit a byte offset can name, and in practice a block is a turn. Counting
+/// *messages* instead cut the window mid-block, so it began partway through a turn (a
+/// tool's panel with no sentence introducing it) and left the paging cursor addressing
+/// a position no offset could name — the source of records appearing twice, or not at
+/// all, when scrolling back.
+///
+/// The count is therefore a bound in blocks, not in tokens: see
+/// [`agent::memory::Options::block_target`] for what actually bounds a block's size,
+/// and be aware that two blocks of a log written before turn-end sealing existed is
+/// the whole log. That is not a fault — there is nothing to page when everything is
+/// already resident — but the cold-start context is then the whole log rather than a
+/// window, which is a trade this constant does not get to make quietly.
 ///
 /// This is the *window*, not the extent of the history: it is what is resident at
 /// startup and what the model is sent, and scrolling past it pages older blocks in
@@ -3016,6 +3022,196 @@ mod tests {
         );
     }
 
+    /// Reasoning in the paged-in range comes back, folded, in its turn's position.
+    ///
+    /// The defect this covers was asymmetry, not absence: a cold start reconstructs
+    /// reasoning (see `reasoning_is_archived_and_replayed_in_its_own_block`), so the
+    /// turns in the window showed their thinking and the turns reached by scrolling
+    /// showed none. One log, two reconstructions, one lossy — and the lossy one is
+    /// whichever the reader had to scroll to reach.
+    ///
+    /// Reasoning belongs in the one ordered list of a turn's records, so it is placed
+    /// where the turn had it rather than appended after it: a block that moved reads as
+    /// though the model thought *after* answering.
+    #[test]
+    fn reasoning_behind_the_reload_point_is_reconstructed_when_paged_in() {
+        let path = unique_log("paging-reasoning");
+        let _ = std::fs::remove_file(&path);
+        let think = "the stat syscall runs per keystroke.";
+        let answer = "because it re-reads it.";
+        let mut written = Vec::new();
+        for i in 0..40 {
+            if i == 4 {
+                // Reasoning is archived first within a turn, then the words.
+                written.push(agent::panels::reasoning_record(&format!("{think}\n")));
+                written.push(json!({"role": "assistant", "content": answer}));
+                continue;
+            }
+            written.push(json!({
+                "role": if i % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("line {i:02}"),
+            }));
+        }
+        {
+            let mut mem = agent::memory::Memory::with_options(
+                &path,
+                agent::memory::Options {
+                    block_target: 256,
+                    working_set: 1,
+                },
+            )
+            .expect("log opens");
+            for line in &written {
+                mem.append(&serde_json::to_string(line).unwrap())
+                    .expect("append");
+            }
+            mem.flush().expect("flush");
+        }
+
+        // A one-block window against a log of many: the thinking has to be *behind* the
+        // reload point, or this only re-tests the cold start.
+        let replayed = cold_start(&path, 1);
+        let mut app = App::default();
+        replay_transcript(&mut app, &replayed.records);
+        // Rendered before paging, as the loop always is: the page wraps to the width
+        // the panel was last given, and with no frame drawn there is no width.
+        let before = app_screen(&mut app, 80, 60);
+        assert!(
+            !before.contains("[+] reasoning"),
+            "the thinking is older than the window, so there is nothing to \
+             reconstruct yet:\n{before}"
+        );
+
+        let mut pager = paging::Pager::new();
+        pager.resume_at(&path, replayed.cursor);
+        let mut guard = 0;
+        loop {
+            app.perform(Action::Top);
+            if pager.page(&mut app) == 0 {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 64, "the pager is making progress");
+        }
+
+        app.panel.jump_top();
+        let all = app_screen(&mut app, 80, 60);
+        assert!(
+            all.contains("[+] reasoning"),
+            "the paged-in turn brought its thinking back, folded like every \
+             reconstructed block:\n{all}"
+        );
+        assert!(
+            !all.contains(think),
+            "and folded — the thinking is behind the click, not filling the view:\n{all}"
+        );
+        let at = |needle: &str| {
+            all.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} is not on screen at all:\n{all}"))
+        };
+        assert!(
+            at("[+] reasoning") < at(answer),
+            "reasoning sits where the turn had it — before the answer, not after it:\n{all}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A panel whose opening and whose body are in different blocks still comes back.
+    ///
+    /// A panel is two records — the `Create` that names it and the `Append` that fills
+    /// it — and a page is one block, so a boundary can fall between them. It is worse
+    /// than a cosmetic split: reading backwards, the content is met first and its
+    /// `Create` is in the next older block, so the two halves land in different
+    /// per-page id ranges and neither draws. The panel silently disappears from a turn
+    /// that has it.
+    ///
+    /// Built by flushing between the two records, so the split is the shape under test
+    /// rather than a side effect of where a byte threshold happens to fall.
+    #[test]
+    fn a_panel_split_across_a_block_boundary_still_reconstructs() {
+        let path = unique_log("paging-split");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut mem = agent::memory::Memory::open(&path).expect("log opens");
+            // Block A: the opening, and nothing else.
+            mem.append(
+                &serde_json::to_string(&agent::panels::panel_record(
+                    &agent::panels::PanelOp::Create {
+                        id: 1,
+                        title: "split-tool".into(),
+                        boxed: true,
+                        conceal_box: false,
+                    },
+                ))
+                .unwrap(),
+            )
+            .expect("append");
+            mem.flush().expect("seal the opening into its own block");
+            // Block B: the body, with no opening in sight.
+            mem.append(
+                &serde_json::to_string(&agent::panels::panel_record(
+                    &agent::panels::PanelOp::Append {
+                        id: 1,
+                        text: "split-output\n".into(),
+                    },
+                ))
+                .unwrap(),
+            )
+            .expect("append");
+            mem.flush().expect("seal the body into the next block");
+            // Blocks after it, so the window has something to be a window *of*.
+            for i in 0..8 {
+                mem.append(
+                    &serde_json::to_string(&json!({
+                        "role": "assistant",
+                        "content": format!("line {i:02}"),
+                    }))
+                    .unwrap(),
+                )
+                .expect("append");
+            }
+            mem.flush().expect("flush");
+        }
+
+        let replayed = cold_start(&path, 1);
+        let mut app = App::default();
+        replay_transcript(&mut app, &replayed.records);
+        let before = app_screen(&mut app, 80, 40);
+        assert!(
+            !before.contains("split-tool"),
+            "the panel is older than the window, so there is nothing to reconstruct \
+             yet:\n{before}"
+        );
+
+        let mut pager = paging::Pager::new();
+        pager.resume_at(&path, replayed.cursor);
+        let mut guard = 0;
+        loop {
+            app.perform(Action::Top);
+            if pager.page(&mut app) == 0 {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 32, "the pager is making progress");
+        }
+
+        app.panel.jump_top();
+        let all = app_screen(&mut app, 80, 40);
+        assert!(
+            all.contains("split-tool [+]"),
+            "the panel is reconstructed, under its own title and folded — the page \
+             reached back for the opening that the boundary separated from the \
+             body:\n{all}"
+        );
+        assert!(
+            !all.contains("split-output"),
+            "and folded, so its body is behind the click:\n{all}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Scrolling past the loaded window brings older history in — in order, once,
     /// without moving what the user was reading, and as panels that still belong to
     /// their own tools.
@@ -3139,10 +3335,29 @@ mod tests {
         // it, so putting the offset back would mean the gesture that fetched the
         // history shows none of it, and they would have to scroll up through the whole
         // page again to reach what they just asked for.
+        //
+        // Compared by *age*, not by a particular record: a page is one block, and where
+        // the block boundaries fall is `block_target`'s business. What has to hold is
+        // that the top of the view now shows something older than the window did.
+        // The number off a `message NN` row. `position` consumes up to and including
+        // the match, so the number is simply the next token.
+        let oldest_visible = |screen: &str| -> i64 {
+            screen
+                .lines()
+                .filter_map(|l| {
+                    let mut w = l.split_whitespace();
+                    w.position(|t| t == "message")?;
+                    w.next()?.parse::<i64>().ok()
+                })
+                .min()
+                .unwrap_or_else(|| panic!("no numbered message on screen:\n{screen}"))
+        };
         let after = app_screen(&mut app, 80, 12);
         assert!(
-            after.contains("old-tool"),
-            "the page is visible, not pushed back above the viewport:\n{after}"
+            oldest_visible(&after) < oldest_visible(&before),
+            "the page is on screen, not pushed back above the viewport — something \
+             older than the window's oldest ({}) is showing:\n{after}",
+            oldest_visible(&before)
         );
 
         // Asking again fetches again. The offset is still at the top of what is loaded
@@ -3164,7 +3379,9 @@ mod tests {
         // failure.
         let mut guard = 0;
         loop {
-            app.panel.jump_top();
+            // Through the action, not `jump_top`: paging answers a scroll request the
+            // app could not satisfy, and `jump_top` on the panel is not one.
+            app.perform(Action::Top);
             if pager.page(&mut app) == 0 {
                 break;
             }

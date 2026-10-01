@@ -586,6 +586,15 @@ pub enum HistoryItem {
     Op(crate::panels::PanelOp),
     /// A plain conversation message.
     Message(Role, String),
+    /// A chunk of streamed reasoning, folded into its own block.
+    ///
+    /// Its own variant rather than a `Message`, because reasoning is drawn as a
+    /// borderless collapsible block and not as conversation — the same reason a cold
+    /// start reconstructs it through `stream_append_boxed` rather than pushing a
+    /// message. Without this a paged-in turn lost the thinking that was in it while
+    /// the turns reconstructed at startup kept theirs: the same log, reconstructed two
+    /// ways, one of them lossy.
+    Reasoning(String),
 }
 
 impl TurnPanel {
@@ -670,6 +679,10 @@ impl TurnPanel {
             match item {
                 HistoryItem::Op(op) => older.apply_op(op),
                 HistoryItem::Message(role, text) => older.push(role, text),
+                // The same seam a cold start uses, so the two reconstructions of a
+                // turn agree: folded, titled, and collapsible rather than an ordinary
+                // message.
+                HistoryItem::Reasoning(text) => older.stream_append_boxed(&text, REASONING.into()),
             }
         }
         self.highlighter = std::mem::take(&mut older.highlighter);

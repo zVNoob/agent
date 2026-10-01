@@ -94,8 +94,22 @@ const MAX_RECORD_WINDOW: u64 = DEFAULT_BLOCK_TARGET as u64 + (1 << 20);
 /// sweet spot for chat-history workloads; small values are handy in tests.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
-    /// Seal + compress the pending buffer once it holds this many bytes.
-    /// Clamped to `>= 64`.
+    /// Seal + compress the pending buffer once it holds this many bytes of
+    /// **uncompressed** record text. Clamped to `>= 64`.
+    ///
+    /// The only bound on a block's size, and a block is the transcript's unit of
+    /// paging — `read_before` hands out whole blocks — so this is also what bounds a
+    /// page. It is a loose bound: a megabyte of English is a quarter of a million
+    /// tokens, and the buffer is sealed only when a record *arrives*, so a block is as
+    /// large as the largest run of records between two seals. In practice the loop
+    /// flushes at the end of every turn, which seals sooner than this does for ordinary
+    /// turns; the bound is what catches the turn that does not end, or the one that
+    /// runs a command printing a great deal.
+    ///
+    /// Counted in bytes rather than records because that is the resource that runs out
+    /// — a single record may be a whole file, and no record count bounds it. The cost is
+    /// that a block of many small records is not bounded in *tokens* either, so a page
+    /// of them is as large as its records make it.
     pub block_target: usize,
     /// Ring size of the in-memory working set. Clamped to `>= 1`.
     pub working_set: usize,

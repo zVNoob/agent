@@ -7,11 +7,20 @@
 //!
 //! ## What a page is
 //!
-//! Whole blocks, one gesture's worth of them. Records are appended into
-//! block-compressed blocks ([`agent::memory`]) and a block is what has to be
-//! decompressed to reach any record inside it, so it is the only unit a byte offset
-//! can name. Blocks are also sealed at turn boundaries, so a page is a turn or two
-//! of history — the same shape the transcript already draws.
+//! One block. Records are appended into block-compressed blocks
+//! ([`agent::memory`]) and a block is what has to be decompressed to reach any record
+//! inside it, so it is the only unit a byte offset can name — which is what lets the
+//! cursor be a single offset and the boundary between two pages be a place the log can
+//! actually point at.
+//!
+//! The loop flushes at the end of every turn, which seals a block, so in practice a
+//! block *is* a turn. That is a habit rather than a guarantee: a block is bounded by
+//! [`agent::memory::Options::block_target`] and by nothing else, so the turn that runs
+//! a command printing megabytes seals mid-turn instead, and a page is as large as
+//! whatever went into it.
+//!
+//! One block may still be two records short of a whole panel, and the page reaches
+//! back for the rest — see `page_has_orphan`.
 //!
 //! ## The gesture
 //!
@@ -47,12 +56,59 @@
 //! its ids into a range of its own.
 
 use agent::memory;
-use agent::panels;
+use agent::panels::{self, PanelOp};
 use agent::tui::{App, HistoryItem, Role};
 use serde_json::Value;
 
 /// How many blocks a page brings.
-const PAGE_BLOCKS: usize = 2;
+///
+/// One. A block is bounded by size and nothing else — see
+/// [`agent::memory::Options::block_target`] — so a page of two could be twice a turn's
+/// output, decompressed, rebuilt and re-measured on one keypress. One block is already
+/// "as much as went into it", and the next keypress brings the next.
+const PAGE_BLOCKS: usize = 1;
+
+/// How many extra blocks a page may read backwards to find the `Create` that opens a
+/// panel it fills.
+///
+/// One is the answer in practice — a panel's opening and its body are adjacent records,
+/// so a single boundary falls between them at most — and the bound is there so a log
+/// that cannot be satisfied ends the reach instead of walking the whole file.
+const MAX_PANEL_REACH: usize = 4;
+
+/// Whether these records fill a panel that they do not also open.
+///
+/// The ids are the log's own, which is what makes this checkable before any remapping:
+/// within one page a panel's `Create` and its content agree, and a disagreement means
+/// the opening is in an older block.
+fn page_has_orphan(records: &[String]) -> bool {
+    let mut opened = std::collections::BTreeSet::new();
+    let mut filled = std::collections::BTreeSet::new();
+    for line in records {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(op) = panels::panel_record_op(&record) else {
+            continue;
+        };
+        let Some(id) = op.panel_id() else { continue };
+        match op {
+            PanelOp::Create { .. } => {
+                opened.insert(id);
+            }
+            // Ops that put something in the panel. Styling and geometry address a panel
+            // that has content already and neither open nor fill one.
+            PanelOp::Append { .. }
+            | PanelOp::Set { .. }
+            | PanelOp::Split { .. }
+            | PanelOp::SetPane { .. } => {
+                filled.insert(id);
+            }
+            _ => {}
+        }
+    }
+    filled.difference(&opened).next().is_some()
+}
 
 /// Where the next page of history is, and whether there is one.
 pub struct Pager {
@@ -111,7 +167,7 @@ impl Pager {
         let Some(path) = self.path.as_deref() else {
             return 0;
         };
-        let page = match memory::read_before(path, at, PAGE_BLOCKS) {
+        let mut page = match memory::read_before(path, at, PAGE_BLOCKS) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[agent] history page failed: {e}");
@@ -119,6 +175,34 @@ impl Pager {
                 return 0;
             }
         };
+        // A page is a block, but a panel's `Create` and the text that fills it are two
+        // records and a boundary can fall between them. Reading backwards, the content
+        // is met *first* and its `Create` is in the next older block — so reach back
+        // until the page opens everything it fills. Without this the two halves are
+        // rewritten into different id ranges and neither draws: the panel vanishes
+        // from a turn that has it.
+        //
+        // Bounded, and only while there is somewhere to reach: a log that opens with a
+        // `Create` already lost cannot be repaired by reading further forward.
+        let mut reach = 0;
+        while reach < MAX_PANEL_REACH
+            && !memory::at_log_start(page.next)
+            && page_has_orphan(&page.records)
+        {
+            let older = match memory::read_before(path, page.next, 1) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[agent] history page failed: {e}");
+                    break;
+                }
+            };
+            if older.records.is_empty() {
+                break;
+            }
+            page.records.splice(0..0, older.records);
+            page.next = older.next;
+            reach += 1;
+        }
         self.at = Some(page.next);
         if memory::at_log_start(page.next) {
             self.exhausted = true;
@@ -161,6 +245,17 @@ impl Pager {
                 out.push(HistoryItem::Op(moved));
                 continue;
             }
+            // Reasoning is its own record kind, interleaved with the panels and
+            // messages of the turn it belongs to — recognised here, in the one ordered
+            // list, rather than in a pass of its own that would move it to the end of
+            // the turn. Dropping it, as this did, lost the thinking from every paged-in
+            // turn while the turns reconstructed at startup kept theirs.
+            if record["kind"].as_str() == Some(panels::REASONING_RECORD) {
+                if let Some(text) = record["text"].as_str() {
+                    out.push(HistoryItem::Reasoning(text.to_string()));
+                }
+                continue;
+            }
             let (Some(role), Some(content)) = (record["role"].as_str(), record["content"].as_str())
             else {
                 continue;
@@ -171,8 +266,8 @@ impl Pager {
             let role = match role {
                 "user" => Role::User,
                 "assistant" => Role::Assistant,
-                // `tool` results are invisible, as they are live; the reasoning and
-                // panel records were handled above.
+                // `tool` results are invisible, as they are live; the panel and
+                // reasoning records were handled above.
                 _ => continue,
             };
             out.push(HistoryItem::Message(role, content.to_string()));
