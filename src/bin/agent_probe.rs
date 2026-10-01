@@ -47,8 +47,6 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::io::Write;
 
-const MAX_TOOL_ROUNDS: usize = 8;
-
 /// The agent's configuration lives in Lua (`~/.config/agent/init.lua` — the LLM endpoint,
 /// system prompt, and conversation-log settings, read via `agent::lua`); the
 /// `AGENT_*` env vars still override the *endpoint* here when set, so an
@@ -219,7 +217,6 @@ async fn main() -> Result<()> {
     for prompt in prompts {
         println!("[user] {prompt}");
         messages.push(json!({"role": "user", "content": prompt}));
-        let mut tool_rounds: usize = 0;
         loop {
             let mut stream = match chat.stream_turn(&messages).await {
                 Ok(s) => s,
@@ -283,8 +280,7 @@ async fn main() -> Result<()> {
             if let Some(summary) = turn.summary() {
                 println!("[usage] {summary}");
             }
-            if turn.wants_tools() && tool_rounds < MAX_TOOL_ROUNDS {
-                tool_rounds += 1;
+            if turn.wants_tools() {
                 messages.push(api::assistant_tool_message(&turn.tool_calls));
                 for c in &turn.tool_calls {
                     println!("[tool-call] {} {}", c.name, c.arguments);

@@ -14,13 +14,17 @@
 //!     through `agent.bash`, under the Lua policy in `lua/policy.lua` — and
 //!     `Ctrl+c` interrupts that run through a per-run flag, not a signal;
 //!   - the result is fed back as a `tool` message and the continuation is
-//!     streamed, up to [`MAX_TOOL_ROUNDS`] chained rounds per user turn.
+//!     streamed. A turn chains as many tool rounds as the model asks for —
+//!     there is no round cap, because a cap silently truncated real work; a
+//!     runaway loop is stopped by the user instead (`Ctrl+c` ends the *turn*,
+//!     not just the tool it was watching).
 //!
 //! Key semantics: Enter mid-turn is ignored (the typed text stays in the
 //! input and submits once the current turn ends). `Ctrl+d` leaves and `Ctrl+c`
-//! interrupts the running tool; every other key — `Enter`, `Esc`, `q`, the
-//! scroll keys — is bound in Lua, because a keybinding table that Rust could
-//! override would make config unreachable (see `src/tui/mod.rs`).
+//! interrupts the running tool *and ends the turn*; every other key — `Enter`,
+//! `Esc`, `q`, the scroll keys — is bound in Lua, because a keybinding table
+//! that Rust could override would make config unreachable (see
+//! `src/tui/mod.rs`).
 //! `/reload` re-reads the user config (`~/.config/agent/init.lua`) — endpoint,
 //! system prompt, `agent.mcps` tools — without restarting; `/save` flushes the
 //! conversation log to disk and reports where it went. Nothing else is a local
@@ -79,9 +83,6 @@ use std::io::{Write, stderr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
-
-/// Safety cap on chained tool rounds within a single user turn.
-const MAX_TOOL_ROUNDS: usize = 8;
 
 /// How many of the newest archived messages a fresh session replays into the
 /// transcript and request history (cold-start context, chronological).
@@ -482,10 +483,11 @@ fn default_key(app: &mut App, key: crossterm::event::KeyEvent, busy: bool) -> Ef
 /// in this repository does one call at a time, and llama.cpp emits one — so the
 /// only way to see it is a model that asks for two.
 ///
-/// `answering` says whether the loop will actually run this turn's calls. A turn
-/// whose tool-round budget is spent is recorded as the text it produced and
-/// nothing more: claiming calls that will never be answered is what makes the
-/// *next* request invalid, so the calls message is simply not written.
+/// `answering` says whether the loop will actually run this turn's calls — which
+/// is [`continues`]'s answer. A stopped turn, or one that wanted no tools, is
+/// recorded as the text it produced and nothing more: claiming calls that will
+/// never be answered is what makes the *next* request invalid, so the calls
+/// message is simply not written.
 fn push_assistant_turn(history: &mut Vec<Value>, turn: &agent::api::Turn, answering: bool) {
     if !turn.content.is_empty() {
         history.push(json!({"role": "assistant", "content": turn.content}));
@@ -493,6 +495,25 @@ fn push_assistant_turn(history: &mut Vec<Value>, turn: &agent::api::Turn, answer
     if answering && turn.wants_tools() {
         history.push(assistant_tool_message(&turn.tool_calls));
     }
+}
+
+/// Whether a turn that ended with `turn` chains into another round of tool
+/// calls: the model still wants tools, and the user has not stopped the turn.
+///
+/// **No round cap.** There used to be one (`MAX_TOOL_ROUNDS`, 8), and it was
+/// the wrong shape of limit for this: a count says nothing about how long the
+/// work is, so it truncated real tasks — a diff to read, an edit to verify, a
+/// build to run — at a number chosen without knowing any of that, and stopped
+/// with the model's calls unanswered. Time or round counts both misprice
+/// "enough"; the user watching the turn *is* the one who knows.
+///
+/// So the loop runs as long as the model asks. The cost of that is a model
+/// stuck in a loop, which is why `Ctrl+c` stops the turn rather than only the
+/// tool running at the time: killing the tool alone just hands the model an
+/// `interrupted` result to read, and a model that ignores that asks again, with
+/// nothing left to stop it but `Ctrl+d`.
+fn continues(turn_wants_tools: bool, stopped: bool) -> bool {
+    turn_wants_tools && !stopped
 }
 
 /// Ask the Lua `key` handler what a key press should do.
@@ -1135,7 +1156,6 @@ async fn run<W: Write>(
     let mut saved_upto: usize = history.len();
     let mut stream: Option<agent::api::TurnStream> = None;
     let mut builder = TurnBuilder::new();
-    let mut tool_rounds: usize = 0;
     // Tool-round state: queued calls (id, name, arguments) still waiting to
     // run, the in-flight call's completion channel, the same call's
     // permission-ask channel (both live while a tool runs), the round's
@@ -1152,6 +1172,12 @@ async fn run<W: Write>(
     // A call that finished (or never started) and is waiting to be folded into
     // the conversation at the top of the next iteration.
     let mut pending_outcome: Option<ToolOutcome> = None;
+    // The user asked to stop the *turn*, not just the tool it was watching.
+    // There is no round cap any more (see `stop_turn`), so this is the only
+    // thing standing between a model that keeps asking for tools and a session
+    // that never ends: cleared at every new user turn, and checked wherever a
+    // turn would otherwise chain into another round.
+    let mut stop_turn = false;
     let mut round_sink: Option<agent::panels::PanelSink> = None;
     // The highest panel id handed out so far, carried across tool rounds: see
     // `PanelSink::continuing_from` for why an id has to outlive its sink.
@@ -1331,6 +1357,11 @@ async fn run<W: Write>(
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
                                     agent::seccomp::request_interrupt();
+                                    // Same as the idle path: killing the tool is
+                                    // not the same as ending the turn, and with
+                                    // no round cap the difference is the whole
+                                    // escape hatch.
+                                    stop_turn = true;
                                     app.set_status_text("interrupting…", StatusKind::Warn);
                                 }
                                 // Ctrl+d leaves even mid-question: the one way out
@@ -1389,6 +1420,12 @@ async fn run<W: Write>(
                             // there is nothing to unwind, and the tool result
                             // comes back marked interrupted.
                             agent::seccomp::request_interrupt();
+                            // …and the *turn* stops too. Killing the tool alone
+                            // only answered the run: the model reads
+                            // `interrupted` as a result and may ask again, which
+                            // with no round cap means a loop the user cannot
+                            // leave. This is the stop that ends it.
+                            stop_turn = true;
                             app.set_status_text("interrupting…", StatusKind::Warn);
                         }
                     }
@@ -1473,7 +1510,7 @@ async fn run<W: Write>(
                             }
                         } else {
                             history.push(json!({"role": "user", "content": text}));
-                            tool_rounds = 0;
+                            stop_turn = false;
                             // Reindex `agent.mcps` for this request (never
                             // cached) so the registry is already current in
                             // the tools offered to the model.
@@ -1584,7 +1621,7 @@ async fn run<W: Write>(
                         app.push(Role::User, text.clone());
                         history.push(json!({"role": "user", "content": text}));
                     }
-                    tool_rounds = 0;
+                    stop_turn = false;
                     if let Err(e) = refresh_chat_tools(chat, config, vm) {
                         app.push_boxed(
                             Role::Assistant,
@@ -1686,17 +1723,21 @@ async fn run<W: Write>(
                 }
 
                 // A turn *continues* into another tool round while the model
-                // still wants tools and the round budget remains; otherwise
-                // the user turn is complete (final answer, or the budget ran
-                // out — the model's unanswered calls stay in the transcript
-                // and a note names the cap).
-                let continuing = turn.wants_tools() && tool_rounds < MAX_TOOL_ROUNDS;
+                // still wants tools and the user has not stopped it. There is no
+                // round cap: a turn runs as long as the model keeps asking, and
+                // `stop_turn` (set by `Ctrl+c`) is what ends it.
+                //
+                // A stopped turn leaves the model's calls *unanswered* on purpose.
+                // It records them with `answering: false`, so it claims nothing
+                // it will not answer — an assistant message asking for calls
+                // whose results never come is exactly what a server rejects
+                // (`incomplete_parallel_tool_calls`, see `push_assistant_turn`).
+                let continuing = continues(turn.wants_tools(), stop_turn);
                 // What the model said, then what it asked for — in that order,
                 // because that order is the protocol's. See
                 // `push_assistant_turn`.
                 push_assistant_turn(&mut history, &turn, continuing);
                 if continuing {
-                    tool_rounds += 1;
                     // Queue the round's calls and start the first one. A tool
                     // is a coroutine on the config VM that the loop steps (see
                     // `start_next_tool`), so it only runs between frames; panel
@@ -1728,14 +1769,14 @@ async fn run<W: Write>(
                     tool_flight = started;
                     pending_outcome = refused;
                 } else if turn.wants_tools() {
-                    // The tool-round budget ran out while the model still
-                    // wanted tools: keep whatever it said and name the cap.
+                    // The user stopped the turn while the model still wanted
+                    // tools: say so, rather than leaving the turn to end with no
+                    // explanation on screen.
                     app.push(
                         Role::Assistant,
-                        format!(
-                            "tool round limit ({MAX_TOOL_ROUNDS}) reached; giving up on this turn."
-                        ),
+                        "stopped: you interrupted this turn.".to_string(),
                     );
+                    app.set_status_text("turn stopped", StatusKind::Warn);
                 }
                 if !continuing {
                     // The user turn is over: start `turn_completed` so a Lua
@@ -2539,6 +2580,93 @@ mod tests {
     /// produced and **nothing else**. Claiming calls that will never be answered
     /// is precisely what invalidates the next request, so the calls message is
     /// not written at all.
+    /// A turn chains as long as the model wants tools and the user has not stopped
+    /// it. The load-bearing half is the second clause: with no round cap, a
+    /// `Ctrl+c` that only killed the running tool would leave a looping model
+    /// with nothing to stop it.
+    #[test]
+    fn a_turn_continues_only_while_the_model_wants_tools_and_the_user_has_not_stopped_it() {
+        assert!(
+            continues(true, false),
+            "a model asking for tools, nobody stopping it: another round"
+        );
+        assert!(
+            !continues(true, true),
+            "the user stopped the turn, so it does NOT chain — this is the escape \
+             hatch that replaces the round cap"
+        );
+        assert!(
+            !continues(false, false),
+            "a final answer ends the turn however long it has been running"
+        );
+        assert!(!continues(false, true), "nothing to continue either way");
+    }
+
+    /// The stopped turn must leave the history *valid*, which is the subtle half.
+    ///
+    /// Stopping mid-round means the model's calls never got answers. Recording
+    /// them anyway — an assistant message claiming two calls followed by one
+    /// `tool` message — is what a server rejects as
+    /// `incomplete_parallel_tool_calls`, so the next user turn would fail on a
+    /// request the user never caused. Stopping has to be silent about the calls.
+    #[test]
+    fn a_turn_stopped_before_its_calls_ran_claims_none_of_them() {
+        let mut turn = agent::api::TurnBuilder::new();
+        for p in [
+            r#"{"choices":[{"delta":{"content":"still working on it"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"fs.read","arguments":"{}"}},{"index":1,"id":"call_b","type":"function","function":{"name":"bash.bash","arguments":"{}"}}]}}]}"#,
+        ] {
+            for ev in agent::api::acc_sse(p) {
+                turn.apply(ev);
+            }
+        }
+        let turn = turn.finish();
+        assert!(
+            turn.wants_tools() && turn.tool_calls.len() == 2,
+            "the model asked for two calls, which is what makes this interesting"
+        );
+
+        let mut history: Vec<serde_json::Value> = Vec::new();
+        // What the loop does: `continues` said no, so `answering` is false.
+        push_assistant_turn(&mut history, &turn, continues(turn.wants_tools(), true));
+        assert_eq!(
+            history.len(),
+            1,
+            "the text only — no calls message, so nothing is left unanswered: \
+             {history:?}"
+        );
+        assert_eq!(history[0]["content"], "still working on it");
+        assert!(
+            history[0]["tool_calls"].is_null(),
+            "and no calls claimed: {history:?}"
+        );
+    }
+
+    /// The converse, so the pair cannot be satisfied by never claiming anything:
+    /// an *unstopped* turn does record its calls, or every tool call would be
+    /// dropped from the transcript and the model would never see a result.
+    #[test]
+    fn an_unstopped_turn_still_records_its_calls() {
+        let mut turn = agent::api::TurnBuilder::new();
+        for ev in agent::api::acc_sse(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
+        ) {
+            turn.apply(ev);
+        }
+        let turn = turn.finish();
+
+        let mut history: Vec<serde_json::Value> = Vec::new();
+        push_assistant_turn(&mut history, &turn, continues(turn.wants_tools(), false));
+        // Index 0, not 1: this turn produced no text, so the calls message is
+        // the only one written. (The paired test above *does* carry text, which
+        // is what puts the calls message at index 1 there.)
+        assert_eq!(
+            history[0]["tool_calls"].as_array().map(Vec::len),
+            Some(1),
+            "the call is claimed and will be answered: {history:?}"
+        );
+    }
+
     #[test]
     fn a_turn_whose_calls_will_not_run_claims_none_of_them() {
         let mut turn = agent::api::TurnBuilder::new();

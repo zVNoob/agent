@@ -315,9 +315,10 @@ it. `compact` narrows to nothing, so a compaction turn can only answer.
 
 ## Keys
 
-Rust binds two keys and nothing else: `Ctrl+c` (stop the running command) and
-`Ctrl+d` (leave). Everything else — `Enter`, `Esc`, `q`, `Alt+c`, `Alt+Enter`,
-scrolling — is a config's business, bound by name in Lua:
+Rust binds two keys and nothing else: `Ctrl+c` (stop — the running command *and*
+the turn it belongs to) and `Ctrl+d` (leave). Everything else — `Enter`, `Esc`,
+`q`, `Alt+c`, `Alt+Enter`, scrolling — is a config's business, bound by name in
+Lua:
 
 ```lua
 agent.on_event("key", function(k) return BIND[k.spec] end)   -- see lua/init.lua §8
@@ -378,6 +379,17 @@ cannot signal a pid because the tree grows as it forks. The request travels to t
 one place that can act, which kills the whole captured tree and lets the run
 finish the ordinary way — so the result comes back marked `interrupted` rather
 than looking like a crash.
+
+Killing the command is only half of it, and the other half is what makes `Ctrl+c`
+an escape rather than a speed bump. A turn chains as many tool rounds as the model
+asks for — there is **no round cap**, because a count prices nothing: it truncated
+real work at a number picked without knowing how long the task was, and stopped
+with the model's calls unanswered. A turn that only killed the tool would be no
+stop at all, since the model reads `interrupted` as a result and may simply ask
+again. So `Ctrl+c` ends the turn too, and the stopped turn records only what the
+model said — never a claim on calls that will not be answered, which is what a
+server rejects as `incomplete_parallel_tool_calls`. The next message you type
+starts clean.
 
 ---
 
