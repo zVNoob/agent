@@ -196,9 +196,9 @@ async fn main() -> Result<()> {
     // off — the newest MEMORY_REPLAY_LATEST archived messages become the
     // starting transcript/request history. The loop's save watermark starts
     // past them (see `run`), so the replayed prefix is never re-archived.
-    let replayed: Vec<Value> = match agent::lua::memory_path() {
-        Some(p) => replay_history(&p, MEMORY_REPLAY_LATEST),
-        None => Vec::new(),
+    let (replayed, request_history): (Vec<Value>, Vec<Value>) = match agent::lua::memory_path() {
+        Some(p) => cold_start(&p, MEMORY_REPLAY_LATEST),
+        None => (Vec::new(), Vec::new()),
     };
     if !replayed.is_empty() {
         println!("memory: resumed {} archived messages", replayed.len());
@@ -325,10 +325,10 @@ async fn main() -> Result<()> {
         &config,
         &config_vm,
         &mut catalog,
-        // Messages only, and rebuilt: `replayed` also carries the archived panel
-        // records, which the transcript above has already replayed and which must
-        // not be sent to the model as if they were conversation.
-        replayed_request_history(&replayed),
+        // The request half, already split off by `cold_start`: it carries no panel
+        // records, which the transcript above has replayed and which must not be
+        // sent to the model as if they were conversation.
+        request_history,
     )
     .await;
 
@@ -1096,15 +1096,22 @@ fn replay_transcript(app: &mut App, records: &[Value]) {
     }
 }
 
-/// Cold-start replay: the newest `n` archived messages of the conversation
-/// log (chronological order), parsed into request-history messages. Corrupt
-/// lines are skipped, never fatal — a torn record simply shortens the
-/// resumed context.
+/// Cold start: the archived records, split into the two things that want them.
 ///
-/// Tool results come back as a one-line record of *what ran* rather than what
-/// it printed. See [`rebuild_tool_results`] for why, and for what is kept.
-fn replay_history(path: &std::path::Path, n: usize) -> Vec<Value> {
-    replayed_request_history(&replay_records(path, n))
+/// `(transcript, request)` — the first is every record, in log order, so
+/// [`replay_transcript`] can rebuild the panels as well as the words; the second
+/// is the messages alone, rebuilt for sending.
+///
+/// **One call, one split, on purpose.** These were two independent reads once,
+/// and the panel half was quietly lost: startup read the *messages-only* half for
+/// both purposes, so every archived panel was filtered out before the transcript
+/// could apply it. Nothing failed — the tests all drove the pieces directly, and
+/// the pieces were each correct. It is the one defect that only a test of the
+/// *wiring* can catch, so the wiring is the thing that is a function.
+fn cold_start(path: &std::path::Path, n: usize) -> (Vec<Value>, Vec<Value>) {
+    let records = replay_records(path, n);
+    let request = replayed_request_history(&records);
+    (records, request)
 }
 
 /// The request half of a replay: the messages, with each tool result reduced to
@@ -2240,7 +2247,7 @@ mod tests {
             }
             mem.flush().unwrap();
         }
-        let replayed = replay_history(&path, 2);
+        let (_, replayed) = cold_start(&path, 2);
         assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[0]["content"], "a1", "oldest-to-newest of the tail");
         assert_eq!(replayed[0]["role"], "assistant");
@@ -2545,7 +2552,10 @@ mod tests {
         }
 
         // --- read: the transcript half puts the panels back ---
-        let records = replay_records(&path, 20);
+        // Through `cold_start` — the exact call `main` makes. Reading the records
+        // and splitting them by hand here is what let the startup half go on using
+        // the messages-only path while every test below it stayed green.
+        let (records, sent) = cold_start(&path, 20);
         assert_eq!(
             records
                 .iter()
@@ -2592,7 +2602,6 @@ mod tests {
         }
 
         // --- and the request half must not see any of it ---
-        let sent = replayed_request_history(&records);
         assert!(
             !sent.iter().any(agent::panels::is_panel_record),
             "a panel is not conversation: {sent:?}"
@@ -2606,6 +2615,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The whole chain against a real log *file*, written the way the loop
+    /// actually writes it: frame by frame, through [`splice_panel_records`].
+    ///
+    /// The frames matter. A round's `Create` is written in the same frame as the
+    /// request that started it, so it can be spliced in beside it; a *streamed*
+    /// tool's chunks arrive over the frames after, when that request is already
+    /// on disk and the recorded position is behind the watermark. Writing the log
     #[test]
     fn a_replayed_tool_result_becomes_one_line_about_the_call() {
         let bulky = "x".repeat(40_000);
@@ -2621,7 +2637,7 @@ mod tests {
             }
             mem.flush().unwrap();
         }
-        let replayed = replay_history(&path, 10);
+        let (_, replayed) = cold_start(&path, 10);
         let tool = replayed
             .iter()
             .find(|m| m["role"] == "tool")
@@ -2748,7 +2764,7 @@ mod tests {
     fn replay_history_returns_empty_for_a_missing_or_empty_log() {
         let gone = unique_log("replay-gone");
         assert!(
-            replay_history(&gone, 5).is_empty(),
+            cold_start(&gone, 5).0.is_empty(),
             "a missing log replays nothing"
         );
         let path = unique_log("replay-empty");
@@ -2756,7 +2772,7 @@ mod tests {
             let _mem = agent::memory::Memory::open(&path).unwrap(); // header only
         }
         assert!(
-            replay_history(&path, 5).is_empty(),
+            cold_start(&path, 5).0.is_empty(),
             "an empty log replays nothing"
         );
         let _ = std::fs::remove_file(&path);
