@@ -39,6 +39,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::highlight::{MarkdownHighlighter, Segment, style_for_spec};
 use super::wrap_lines;
@@ -64,14 +66,20 @@ const TAG_COLS: usize = 10;
 /// on a row. Any control character does it — `\t`, a `\r` from a CRLF file, an
 /// escape byte out of command output.
 ///
-/// **Why a space and not a deletion.** Byte offsets into panel text cross this
+/// **Why spaces and not a deletion.** Byte offsets into panel text cross this
 /// boundary: `fs.apply_patch` computes `line_bytes` on the text it read and
 /// passes those offsets to `p:highlight` (`lua/fs.lua`), so the text stored here
-/// must be byte-for-byte the same length as the text the offsets were measured
-/// against. One space per control character keeps every later offset valid,
-/// while dropping the character would shift all of them. A tab therefore shows
-/// as one space rather than a tab stop — the one thing lost, and the price of
-/// offsets that still mean what the caller meant.
+/// must be at least as long as the text the offsets were measured against, and
+/// every offset before the substitution must still point where it did. A
+/// substitution *of at least the same length* keeps both true; a deletion would
+/// shift every later offset and tint the wrong lines.
+///
+/// A tab becomes [`TAB_CELLS`] spaces, not one. One space is the width that
+/// guarantees the offsets, but it collapses indentation to nothing, and
+/// indentation is the thing being shown — a tab-indented Lua file rendered one
+/// space per tab looks like a wall of unindented text, which is worse than the
+/// misalignment this replaced. The extra width cannot break an offset: it only
+/// ever lands *after* the position it was measured at.
 ///
 /// `\n` is left alone: it is structure, not content, and every wrapper here
 /// splits on it.
@@ -79,11 +87,68 @@ fn renderable(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.chars().any(char::is_control) {
         return std::borrow::Cow::Borrowed(text);
     }
-    std::borrow::Cow::Owned(
-        text.chars()
-            .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
-            .collect(),
-    )
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '\n' {
+            out.push('\n');
+        } else if c == '\t' {
+            out.extend(std::iter::repeat_n(' ', TAB_CELLS));
+        } else if c.is_control() {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Cells a tab is drawn as. Two, not the terminal's usual eight: a panel column
+/// is often 40-60 cells wide and split between two panes, so eight spaces per
+/// indent level eats the pane. Two keeps a tab-indented file legible at depth
+/// while still showing the structure.
+const TAB_CELLS: usize = 2;
+
+/// The terminal cells `s` occupies when drawn — what ratatui's buffer will
+/// actually hold.
+///
+/// **Not `chars().count()`.** A `char` is a code point and a cell is a column,
+/// and they are not the same thing in either direction: an emoji or a CJK
+/// character is one `char` and *two* cells, and a base letter with a combining
+/// accent is two `chars` and *one* cell. Budgeting a row in chars while the
+/// renderer draws cells is the same disagreement as [`renderable`]'s, one
+/// layer over: the padding is computed for fewer cells than get drawn, so it
+/// under-fills and the box's right edge slides out of the box.
+///
+/// The module used to measure in `chars()` on purpose — "grapheme/CJK-aware
+/// wrapping is out of scope for the minimal UI" — which was defensible while
+/// every row was ASCII. It stopped being defensible the moment a panel showed
+/// an emoji: `fs.write_file` and `apply_patch` put arbitrary file contents in
+/// front of the user, so the character set is whatever the repository holds.
+///
+/// Ratatui measures per grapheme cluster and drops control characters;
+/// [`renderable`] has already removed those, so these agree for anything that
+/// reaches here.
+fn cells(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// The longest prefix of `s` that fits in `width` cells.
+///
+/// Cut on grapheme boundaries, never inside one: slicing by `char` can split a
+/// base letter from its combining accent, which leaves a lone accent on the
+/// next row and a byte range that no longer lines up with what was drawn.
+fn take_cells(s: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for g in s.graphemes(true) {
+        let w = cells(g);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        out.push_str(g);
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,22 +439,76 @@ impl Default for TurnPanel {
 }
 
 /// The message's [`Message::segs`] after a (re)highlight: the markdown
-/// segments plus the Lua panel regions (`user_segs`), each clamped to the
-/// text length, then sorted by start for the clipping pipelines.
+/// segments plus the Lua panel regions (`user_segs`), each clamped to the text
+/// length, then **reduced to disjoint ranges** and sorted by start for the
+/// clipping pipelines.
+///
+/// Disjoint is the whole point, and it was not true before. [`clip_segments`]
+/// walks every segment and prints the slice each one covers, so two segments
+/// over the same bytes print that text *twice* — the line appears doubled, and
+/// the row is twice as wide as the layout budgeted, which pushes the box's
+/// right border off its own edge.
+///
+/// Overlap is the normal case, not a corner: `fs.apply_patch` tints its changed
+/// lines with `p:highlight`, and the pane's declared `lang` has the grammar
+/// colour those same bytes. Every highlighted line of every patch was doubled.
+///
+/// **User regions win the bytes they cover**, and among themselves the *last*
+/// one does. A caller asking for a tint on a line means it, so the grammar's
+/// colouring of those bytes is dropped rather than drawn alongside;
+/// `sort_by_key(start)` would not say that, since the grammar's segment for a
+/// line usually starts before the region's and would win by accident, making the
+/// red/green of a diff the one thing not drawn. Last-wins among the caller's own
+/// regions is what makes layering work — dim a range, then bold part of it — and
+/// is why they are taken in reverse.
 fn merged_segs(markdown: Vec<Segment>, user: &[Segment], len: usize) -> Vec<Segment> {
-    let mut all = markdown;
-    for sg in user {
-        let (s, e) = (sg.start.min(len), sg.end.min(len));
-        if s < e {
-            all.push(Segment {
-                start: s,
-                end: e,
+    let mut out: Vec<Segment> = Vec::new();
+    // Bytes already spoken for, kept sorted and disjoint.
+    let mut claimed: Vec<(usize, usize)> = Vec::new();
+    for sg in user.iter().rev().chain(markdown.iter()) {
+        let (start, end) = (sg.start.min(len), sg.end.min(len));
+        for (start, end) in unclaimed(start, end, &claimed) {
+            claimed.push((start, end));
+            claimed.sort_unstable();
+            out.push(Segment {
+                start,
+                end,
                 style: sg.style,
             });
         }
     }
-    all.sort_by_key(|sg| (sg.start, sg.end));
-    all
+    out.sort_by_key(|sg| (sg.start, sg.end));
+    out
+}
+
+/// The parts of `s..e` not already inside `claimed` (sorted, disjoint).
+///
+/// What makes a later, higher-priority segment *replace* an earlier one rather
+/// than sit on top of it: the earlier bytes are subtracted off, so each byte of
+/// the text ends up in exactly one segment and is therefore printed once.
+fn unclaimed(s: usize, e: usize, claimed: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut cur = s;
+    for &(cs, ce) in claimed {
+        if ce <= cur {
+            continue; // entirely before the range still to fill
+        }
+        if cs >= e {
+            break; // and past its end, since `claimed` is sorted
+        }
+        if cs > cur {
+            out.push((cur, cs.min(e))); // the gap in front of this claim
+            cur = cs;
+        }
+        cur = cur.max(ce); // skip over the claimed bytes
+        if cur >= e {
+            break;
+        }
+    }
+    if cur < e {
+        out.push((cur, e));
+    }
+    out
 }
 
 /// Pane `pane` (1-based) of `messages[idx]`'s split panel — `None` when the
@@ -1205,7 +1324,7 @@ fn message_lines(msg: &Message, text_w: usize, conceal: bool) -> Vec<Line<'stati
 /// A `room` too small for the ellipsis itself is left empty rather than filled
 /// with one.
 fn fit_title(title: &str, room: usize) -> String {
-    if title.chars().count() <= room {
+    if cells(title) <= room {
         return title.to_string();
     }
     if room == 0 {
@@ -1214,7 +1333,7 @@ fn fit_title(title: &str, room: usize) -> String {
     if room == 1 {
         return "…".to_string();
     }
-    let head: String = title.chars().take(room - 1).collect();
+    let head: String = take_cells(title, room - 1);
     format!("{head}…")
 }
 
@@ -1247,16 +1366,16 @@ fn boxed_lines(msg: &Message, content_w: usize, conceal: bool) -> Vec<Line<'stat
     // it, the indicator, the space before the fill, *and* the closing `┐`. The
     // last one is the easy one to forget, and forgetting it is off by exactly
     // one cell on every row.
-    let fixed = "┌─ ".chars().count() // 3
+    let fixed = cells("┌─ ") // 3
         + 1 // space between title and indicator
-        + indicator.chars().count()
+        + cells(indicator)
         + 1 // space between indicator and fill
-        + "┐".chars().count();
+        + cells("┐");
     let mut top = format!(
         "┌─ {} {indicator} ",
         fit_title(title, content_w.saturating_sub(fixed))
     );
-    let fill = content_w.saturating_sub(top.chars().count() + 1);
+    let fill = content_w.saturating_sub(cells(&top) + 1);
     top.push_str(&"─".repeat(fill));
     top.push('┐');
     let mut out = Vec::new();
@@ -1266,7 +1385,7 @@ fn boxed_lines(msg: &Message, content_w: usize, conceal: bool) -> Vec<Line<'stat
         if msg.panes.is_some() {
             let inner = content_w.saturating_sub(4);
             for row in split_body_rows(msg, inner) {
-                let used: usize = row.spans.iter().map(|s| s.content.chars().count()).sum();
+                let used: usize = row.spans.iter().map(|s| cells(&s.content)).sum();
                 let pad = " ".repeat(inner.saturating_sub(used));
                 let mut spans = Vec::with_capacity(row.spans.len() + 2);
                 spans.push(Span::raw("│ "));
@@ -1279,7 +1398,7 @@ fn boxed_lines(msg: &Message, content_w: usize, conceal: bool) -> Vec<Line<'stat
             }
         } else {
             for row in body_rows(msg, inner, conceal && msg.conceal_box) {
-                let used: usize = row.iter().map(|s| s.content.chars().count()).sum();
+                let used: usize = row.iter().map(|s| cells(&s.content)).sum();
                 let pad = " ".repeat(inner.saturating_sub(used));
                 let mut spans = Vec::with_capacity(row.len() + 2);
                 spans.push(Span::raw("│ "));
@@ -1384,7 +1503,7 @@ fn prompt_hit(prompt: &str, offset: usize) -> Option<char> {
 /// test uses, so the underline cannot land somewhere the click does not.
 fn overlay_title(prompt: &str, inner: usize, style: Style) -> Line<'static> {
     let head = format!("┌─ {prompt} ");
-    let fill = inner.saturating_sub(head.chars().count() + 1);
+    let fill = inner.saturating_sub(cells(&head) + 1);
     let border = format!("{head}{}┐", "─".repeat(fill));
     let labels = prompt_labels(prompt);
     let hot = style.add_modifier(Modifier::UNDERLINED);
@@ -1491,12 +1610,12 @@ fn overlay_rows(msg: &Message, content_w: usize) -> Vec<Line<'static>> {
     if lines.len() > 2 {
         lines.truncate(2);
         let last = lines.last_mut().expect("non-empty after truncate");
-        if last.chars().count() < text_w {
+        if cells(last) < text_w {
             last.push('…');
         }
     }
     for line in lines {
-        let used = line.chars().count();
+        let used = cells(&line);
         let pad = " ".repeat(text_w.saturating_sub(used));
         out.push(frame_row(format!("│ {line}{pad} │"), body));
     }
@@ -1599,7 +1718,7 @@ fn pane_column_rows(pane: &PaneContent, width: usize) -> Vec<Line<'static>> {
 /// width (wrapping and caption clipping guarantee it), so padding alone keeps
 /// the pane grid aligned.
 fn pad_line_to(line: &Line<'static>, width: usize) -> Vec<Span<'static>> {
-    let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let used: usize = line.spans.iter().map(|s| cells(&s.content)).sum();
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
     spans.extend(line.spans.iter().cloned());
     if used < width {
@@ -1694,32 +1813,35 @@ fn wrap_rows(
     if width == 0 {
         return vec![vec![]];
     }
-    // byte_at[i] = byte offset where char index i starts (chars + 1 entries).
-    let n = text.chars().count();
-    let mut byte_at: Vec<usize> = Vec::with_capacity(n + 1);
-    byte_at.push(0);
-    byte_at.extend(text.char_indices().skip(1).map(|(b, _)| b));
-    byte_at.push(text.len());
 
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut para_start = 0; // char index of the paragraph's first char
+    // Byte offset of the current paragraph's start within `text`.
+    let mut base = 0usize;
     for para in text.split('\n') {
-        let para_chars = para.chars().count();
-        if para_chars == 0 {
+        if para.is_empty() {
             rows.push(Vec::new());
-            para_start += 1;
+            base += 1;
             continue;
         }
-        let mut rest = 0;
-        while rest < para_chars {
-            let take = width.min(para_chars - rest);
-            rows.push(clip(
-                byte_at[para_start + rest],
-                byte_at[para_start + rest + take],
-            ));
-            rest += take;
+        // Byte offset of the current row's start within `para`, and the cells
+        // that row has used so far.
+        let mut row_start = 0usize;
+        let mut used = 0usize;
+        for (off, grapheme) in para.grapheme_indices(true) {
+            let w = cells(grapheme);
+            // Break *before* a grapheme that would overflow, never inside one.
+            // A row is a run of cells, so a `char` count would both overfill a
+            // row (an emoji is one char, two cells) and be free to split a base
+            // letter from its combining accent.
+            if used > 0 && used + w > width {
+                rows.push(clip(base + row_start, base + off));
+                row_start = off;
+                used = 0;
+            }
+            used += w;
         }
-        para_start += para_chars + 1;
+        rows.push(clip(base + row_start, base + para.len()));
+        base += para.len() + 1;
     }
     rows
 }
@@ -1882,29 +2004,75 @@ mod tests {
         assert_box_edge_holds("one tab", "local x = 1\n\treturn x", 120);
     }
 
-    /// The sanitiser keeps the text's **byte length**, which is not cosmetic: it
-    /// is the whole reason it can live at this boundary. `fs.apply_patch` reads a
-    /// file, computes `line_bytes` against those exact bytes, and passes the
-    /// offsets to `p:highlight` — so a control character replaced by *nothing*
-    /// would shift every later offset and tint the wrong lines.
+    /// The sanitiser never *removes* a character, which is what lets it live at
+    /// this boundary. `fs.apply_patch` reads a file, computes `line_bytes`
+    /// against those exact bytes, and passes the offsets to `p:highlight` — so a
+    /// control character replaced by *nothing* would shift every later offset and
+    /// tint the wrong lines.
+    ///
+    /// The invariant is per character, not "the length is unchanged": every
+    /// character of the source is still *there*, at its own position shifted only
+    /// by the substitutions before it. A tab becomes `TAB_CELLS` spaces, so
+    /// everything after one moves along — which is exactly why the offset has to
+    /// be computed against the text the panel stores (`fs.lua` expands tabs
+    /// itself for that reason), and why this test walks the mapping rather than
+    /// comparing lengths.
     #[test]
     fn sanitising_keeps_byte_offsets_meaning_the_same_thing() {
-        // A leading tab, a `\r` from a CRLF file, and an escape byte: the three
-        // that reach a panel in practice.
         for raw in ["\tlocal x", "local x\r", "\x1b[0m", "a\tb\rc\x1b"] {
             let clean = renderable(raw);
-            assert_eq!(
-                clean.len(),
-                raw.len(),
-                "byte length must survive, or every offset past it shifts: {raw:?}"
-            );
             assert!(
                 !clean.chars().any(|c| c.is_control() && c != '\n'),
-                "no control character may reach the renderer: {raw:?}"
+                "no control character may reach the renderer: {raw:?} -> {clean:?}"
+            );
+            // Walk the source, tracking how far the substitutions so far have
+            // pushed everything along, and require each surviving character to
+            // still be the one the source had at that point.
+            let mut shift = 0usize;
+            for (i, c) in raw.char_indices() {
+                if c == '\t' {
+                    assert!(
+                        clean[i + shift..].starts_with(&" ".repeat(TAB_CELLS)),
+                        "a tab widens to {TAB_CELLS} spaces: {raw:?} -> {clean:?}"
+                    );
+                    shift += TAB_CELLS - 1;
+                } else if c.is_control() {
+                    // Substituted, but one for one: this is what makes a `\r`
+                    // free, and it must not move anything either.
+                    assert_eq!(
+                        clean[i + shift..].chars().next(),
+                        Some(' '),
+                        "a control character becomes exactly one space: \
+                         {raw:?} -> {clean:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        clean[i + shift..].chars().next(),
+                        Some(c),
+                        "byte {i} still holds {:?}, shifted by {shift}: \
+                         {raw:?} -> {clean:?}",
+                        c
+                    );
+                }
+            }
+            assert!(
+                clean.len() >= raw.len(),
+                "a substitution never shortens the text: {raw:?} -> {clean:?}"
             );
         }
-        // A tab becomes a space, not a deletion — one cell, as the layout expects.
-        assert_eq!(renderable("\tx"), " x");
+        // A tab becomes `TAB_CELLS` spaces, never a deletion — two keeps the
+        // indentation legible in a narrow pane column.
+        assert_eq!(renderable("\tx"), format!("{}x", " ".repeat(TAB_CELLS)));
+        // The width itself, spelled out rather than in terms of the constant:
+        // every other assertion here reads `TAB_CELLS`, so without this one
+        // changing the constant to any other value would pass them all. Two is
+        // what was asked for, and it is also the point — a tab-indented file
+        // rendered one space per tab is a wall of unindented text.
+        assert_eq!(TAB_CELLS, 2, "a tab is drawn as two spaces");
+        assert_eq!(renderable("\tx"), "  x");
+        // A `\r` is a single space: one byte in, one byte out, so CRLF costs
+        // nothing and shifts nothing.
+        assert_eq!(renderable("a\rb"), "a b");
         // Newline is structure, not content: every wrapper splits on it.
         assert_eq!(renderable("a\nb"), "a\nb");
         // Nothing to do is a no-op, and keeps the borrow.
@@ -1914,9 +2082,16 @@ mod tests {
         ));
     }
 
-    /// The offsets `apply_patch` passes still land on the lines it meant, which
-    /// is the property the byte-length rule exists to protect. Pane 1 holds a
-    /// tab-indented file and the tint is asked for a line *after* the tabs.
+    /// The offsets `apply_patch` passes still land on the lines it meant, which is
+    /// what the whole byte-offset arrangement exists to protect.
+    ///
+    /// Pane 1 holds a tab-indented file and the tint is asked for a line *after*
+    /// the tabs. Note the text is given here already expanded, because that is
+    /// what Lua does: `fs.apply_patch` substitutes tabs for spaces itself, before
+    /// `line_bytes` measures anything, precisely because `p:highlight` addresses
+    /// the text `p:set` stored. `Rust`'s own expansion in `renderable` is the
+    /// fallback for text that arrives with tabs still in it (bash output, model
+    /// text), where nothing is measuring offsets against it.
     #[test]
     fn a_highlight_after_tabs_lands_on_the_line_it_named() {
         let mut panel = TurnPanel::default();
@@ -1928,12 +2103,14 @@ mod tests {
                 lang: None,
             }],
         });
-        // Two tab-indented lines, then a third that is what gets tinted.
-        let body = "\t\tfirst\n\t\t\tsecond\n\t\tthird";
+        // Two tab-indented lines, then a third that is what gets tinted — the
+        // shape `fs.lua` produces, tabs already widened.
+        let pad = " ".repeat(TAB_CELLS);
+        let body = format!("{pad}{pad}first\n{pad}{pad}{pad}second\n{pad}{pad}third");
         panel.apply_op(PanelOp::SetPane {
             id: 1,
             pane: 1,
-            text: body.into(),
+            text: body.clone(),
         });
         let third = body.rfind("third").expect("third line");
         panel.apply_op(PanelOp::HighlightPane {
@@ -1954,6 +2131,108 @@ mod tests {
              tabs ahead of it were sanitised: got {marked:?} at {:?}",
             seg.start..seg.end
         );
+    }
+
+    /// Overlapping segments print their text **once**.
+    ///
+    /// `clip_segments` walks every segment and prints the slice it covers, so two
+    /// segments over the same bytes used to render that text twice — and the row
+    /// twice as wide as the layout budgeted, which put the box's right border
+    /// past its own edge. Overlap is the *normal* case for a patch panel: the
+    /// pane's `lang` has the grammar colour the changed lines and `p:highlight`
+    /// tints the same lines, so every highlighted line of every `apply_patch` was
+    /// doubled.
+    #[test]
+    fn overlapping_segments_print_their_text_once() {
+        // A full-coverage grammar segment plus a user region over its head.
+        let text = "one\ntwo\n";
+        let segs = merged_segs(
+            vec![Segment {
+                start: 0,
+                end: text.len(),
+                style: Style::default().fg(Color::Blue),
+            }],
+            &[Segment {
+                start: 0,
+                end: 4,
+                style: Style::default().add_modifier(Modifier::BOLD),
+            }],
+            text.len(),
+        );
+        let rows = wrap_segments(text, &segs, 40);
+        // `wrap_segments` returns row spans, so the newlines live *between* rows
+        // rather than inside them: the printed text is the rows joined.
+        let shown: String = rows.iter().flatten().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            shown, "onetwo",
+            "every byte printed exactly once, in order — doubled text would \
+             read 'oneone' or similar"
+        );
+        // The region won the bytes it covers, so the tint is actually visible —
+        // the grammar colour must not be the one that survives there.
+        assert!(
+            segs[0].style.add_modifier.contains(Modifier::BOLD),
+            "the caller's region wins its own bytes: {segs:?}"
+        );
+    }
+
+    /// A 2-cell character keeps the box border in its column.
+    ///
+    /// The layout measures rows in `chars()` and pads them to a column, but
+    /// ratatui draws an emoji (and anything else East Asian Wide) as *two*
+    /// cells. A row holding one is therefore budgeted a cell short, the padding
+    /// under-fills, and the right border slides out of the box — the same
+    /// disagreement as a dropped control character, one layer over.
+    #[test]
+    fn a_two_cell_character_keeps_the_box_border_in_one_column() {
+        // An emoji in the middle of a Lua-looking line, which is what a
+        // `write_file`/`apply_patch` panel shows for any repository that uses one.
+        assert_box_edge_holds("emoji", "\ttext = \"\u{1f40d} here\",\n\tlocal x = 1", 120);
+        assert_box_edge_holds(
+            "CJK",
+            "\tlocal x = \"\u{4f60}\u{597d}\u{4e16}\u{754c}\"",
+            120,
+        );
+        // A base letter and a combining accent: two `char`s, one cell. Measured in
+        // chars it looks two cells too wide, so the border would land early.
+        assert_box_edge_holds("combining", "\tlocal x = e\u{301}cole", 120);
+    }
+
+    /// A wide character must not push a row past its column, which is what
+    /// `wrap_lines` and `wrap_segments` agreeing row-for-row exists to protect.
+    #[test]
+    fn a_row_of_emoji_fits_the_column_it_is_wrapped_to() {
+        // Four two-cell emoji into a five-cell column: two fit (four cells) and a
+        // third would not, so it breaks two-and-two. Measured in `char`s the four
+        // would fit on one row — twice too wide, overrunning the box.
+        let text = "🐍🐍🐍🐍";
+        let rows = wrap_lines(text, 5);
+        assert_eq!(
+            rows,
+            vec!["🐍🐍".to_string(), "🐍🐍".to_string()],
+            "two rows of two emoji, not one row of four"
+        );
+        for row in &rows {
+            assert!(
+                cells(row) <= 5,
+                "no row may exceed the column it was wrapped to: {row:?} is {} cells",
+                cells(row)
+            );
+        }
+        // And it is the same answer the segment path gives, or the two would
+        // disagree about a message's height.
+        let segs = vec![Segment {
+            start: 0,
+            end: text.len(),
+            style: Style::default(),
+        }];
+        assert_eq!(
+            wrap_segments(text, &segs, 5).len(),
+            rows.len(),
+            "the plain and highlighted wrappers must agree on height"
+        );
+        // Nothing is lost: every emoji survives, in order.
+        assert_eq!(rows.concat(), text);
     }
 
     #[test]
@@ -3330,8 +3609,21 @@ mod tests {
         assert_eq!(panel.messages[0].role, Role::Assistant);
     }
 
+    /// Two regions over the same bytes come back **disjoint, last one winning**.
+    ///
+    /// They used to be kept as written — two overlapping segments, both drawn —
+    /// and `clip_segments` prints the slice each one covers, so the overlapping
+    /// text was rendered twice and the row came out twice as wide as the layout
+    /// budgeted for it. That is not a corner case: it is what every
+    /// `apply_patch` produces, where the pane's `lang` colours a line and
+    /// `p:highlight` tints the same line.
+    ///
+    /// "Last wins" is the layering rule that makes both of those legible: a
+    /// caller may dim a whole range and then bold part of it, and the second
+    /// call is the more specific intention. Sorted-by-start would not express
+    /// that, since the broader region usually starts first.
     #[test]
-    fn panel_highlight_adds_sorted_styled_regions() {
+    fn overlapping_highlight_regions_become_disjoint_with_the_last_winning() {
         let mut panel = TurnPanel::default();
         panel.apply_op(PanelOp::Create {
             id: 1,
@@ -3360,9 +3652,11 @@ mod tests {
         assert_eq!(
             segs,
             &[
+                // The part the *first* region still owns, since the second
+                // (later, and narrower in practice) took 2..5 from it.
                 Segment {
                     start: 0,
-                    end: 5,
+                    end: 2,
                     style: Style::default().add_modifier(Modifier::BOLD)
                 },
                 Segment {
@@ -3370,7 +3664,9 @@ mod tests {
                     end: 5,
                     style: Style::default().fg(Color::Cyan)
                 },
-            ]
+            ],
+            "disjoint, tiled over 0..5 exactly once, and the later region won \
+             the bytes they shared"
         );
         // Capture-name styles still work as a fallback for unknown specs.
         panel.apply_op(PanelOp::Highlight {

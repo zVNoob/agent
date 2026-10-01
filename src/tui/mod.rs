@@ -36,6 +36,8 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::status::{StatusKind, StatusLine};
 
@@ -777,10 +779,14 @@ impl App {
     }
 }
 
-/// Split `text` into rows of at most `width` cells, breaking on `\n` too.
-/// One cell per `char` — grapheme/CJK-aware wrapping is out of scope for the
-/// minimal UI (a comment in the renderer notes the same approximation).
+/// Split `text` into rows of at most `width` **cells**, breaking on `\n` too.
 /// Shared by the shell (input box height, cursor) and the turn panel.
+///
+/// Measured in cells, not `char`s, and cut on grapheme boundaries — an emoji is
+/// one `char` and two cells, so a `char` count fills a row past its column and
+/// every box around it under-pads. It must also agree with the panel's own
+/// wrapper row for row, since both are asked for row counts of the same text
+/// (pinned by `wrap_segments_matches_wrap_lines_layout`).
 fn wrap_lines(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
@@ -791,13 +797,18 @@ fn wrap_lines(text: &str, width: usize) -> Vec<String> {
             out.push(String::new());
             continue;
         }
-        let mut rest = para;
-        while !rest.is_empty() {
-            let take = width.min(rest.chars().count());
-            let chunk: String = rest.chars().take(take).collect();
-            rest = &rest[chunk.len()..];
-            out.push(chunk);
+        let mut row = String::new();
+        let mut used = 0usize;
+        for g in para.graphemes(true) {
+            let w = UnicodeWidthStr::width(g);
+            if used > 0 && used + w > width {
+                out.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            used += w;
+            row.push_str(g);
         }
+        out.push(row);
     }
     out
 }

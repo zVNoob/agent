@@ -98,6 +98,31 @@ fn capture_names(query: &str) -> Vec<String> {
     out
 }
 
+/// The style of a byte covered by every capture still open, folded
+/// **outermost first** so the innermost wins each property it sets and the outer
+/// ones fill in what it leaves.
+///
+/// Taking only `stack.last()` threw the outer captures away. That is invisible
+/// for simple markup — `**bold**` is a single capture, so its delimiters and its
+/// content are the same run and the bold reaches both — but wrong the moment
+/// markup nests, which is the shape models write constantly:
+///
+/// ```text
+/// - **`init.lua`**: the entry point
+/// ```
+///
+/// The stack over `init.lua` there is `[markup.strong, markup.raw]`. With
+/// `last()` the code span's colour won outright, and the bold was left sitting on
+/// the `**` delimiters — which markup concealment *hides*. So the emphasis was
+/// not mis-styled, it was gone: the line rendered as an ordinary code span and
+/// the bold never appeared on screen. Folding gives the content its colour **and**
+/// the bold, which is what the source says.
+fn style_for_stack(stack: &[Highlight], names: &[String]) -> Style {
+    stack.iter().fold(Style::default(), |acc, h| {
+        acc.patch(style_for_capture(&names[h.0]))
+    })
+}
+
 /// Capture name -> style. `markup.*`/`text.*` refine by their second segment;
 /// anything unknown stays plain (merges with the surrounding text).
 pub fn style_for_capture(name: &str) -> Style {
@@ -967,10 +992,20 @@ fn consume_events(
                         }
                     }
                 }
-                let style = match stack.last() {
-                    Some(h) => style_for_capture(&names[h.0]),
-                    None => Style::default(),
-                };
+                // The style of every capture still open, folded outermost-first so the
+                // innermost wins each property and the outer ones fill in what it
+                // does not set.
+                //
+                // Taking `stack.last()` alone threw the outer captures away, and
+                // that is invisible for simple markup (`**bold**` is one
+                // capture, and its delimiters carry the bold too) but wrong the
+                // moment markup nests. In `- **`init.lua`**:` the stack over the
+                // text is [strong, raw], so the code span's colour won outright
+                // and the bold went with it — and because the bold was left on
+                // the `**` delimiters, which concealment hides, the emphasis
+                // was not merely mis-styled, it was *gone*. Folding gives the
+                // content green **and** bold, which is what the source says.
+                let style = style_for_stack(&stack, names);
                 if start > prev_end {
                     out.push(Segment {
                         start: prev_end,
@@ -1124,6 +1159,65 @@ fn merge_conceal(conceal: &mut Vec<(usize, usize)>, fence_content: &[(usize, usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nested markup keeps the outer emphasis.
+    ///
+    /// `- **`init.lua`**:` is the shape every model writes for a list item naming
+    /// a file, and it lost its bold entirely: the style of a byte came from the
+    /// *innermost* capture alone, so the code span's colour won and the strong
+    /// span's bold was left sitting on the `**` delimiters — which concealment
+    /// hides. The emphasis was not mis-styled, it was gone.
+    ///
+    /// Plain `**bold**` never showed it, being a single capture: the delimiters
+    /// carry the bold and the content is the same run.
+    ///
+    /// Drives [`style_for_stack`] — the function `consume_events` calls for every
+    /// byte it styles — rather than restating the fold, so reverting the
+    /// production code fails this test instead of leaving it agreeing with a copy
+    /// of itself.
+    #[test]
+    fn a_nested_span_keeps_the_outer_emphasis() {
+        assert_eq!(
+            style_for_capture("markup.strong"),
+            Style::default().add_modifier(Modifier::BOLD),
+            "the premise: strong alone is just bold"
+        );
+        let raw = style_for_capture("markup.raw");
+        assert!(
+            !raw.add_modifier.contains(Modifier::BOLD),
+            "and raw alone is not bold, so the fold has something to add"
+        );
+
+        let names = vec![
+            "markup.strong".to_string(), // 0: the `**`
+            "markup.raw".to_string(),    // 1: the `` `init.lua` ``
+        ];
+        let strong = Highlight(0);
+        let inner = Highlight(1);
+
+        // The stack over the content of `- **`init.lua`**:`.
+        let folded = style_for_stack(&[strong, inner], &names);
+        assert_eq!(
+            folded.fg, raw.fg,
+            "the inner capture still decides the colour"
+        );
+        assert!(
+            folded.add_modifier.contains(Modifier::BOLD),
+            "and the outer one is not thrown away: {folded:?}"
+        );
+
+        // What `stack.last()` produced: the innermost capture on its own. This is
+        // the regression, stated as the thing the fix has to differ from.
+        let innermost_only = style_for_stack(&[inner], &names);
+        assert!(
+            !innermost_only.add_modifier.contains(Modifier::BOLD),
+            "the old behaviour loses the bold entirely: {innermost_only:?}"
+        );
+        assert_ne!(
+            innermost_only, folded,
+            "and the full stack must not be the same thing"
+        );
+    }
 
     #[test]
     fn capture_names_collects_and_filters() {

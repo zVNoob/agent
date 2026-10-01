@@ -29,6 +29,8 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-highlight",
  "tree-sitter-language",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

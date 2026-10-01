@@ -52,6 +52,14 @@ anyhow = "1"
 ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 
+# Display width, and the cluster boundaries it is measured over. A panel lays
+# out terminal *cells*, and a `char` is not one: an emoji is one `char` and two
+# cells, a base letter plus a combining accent is two `char`s and one cell. Both
+# are already in the tree via ratatui; naming them makes the layout's own rule
+# explicit instead of borrowing the renderer's.
+unicode-width = "0.2"
+unicode-segmentation = "1"
+
 # Runtime grammar acquisition (see `src/grammars.rs`): the tree-sitter core is
 # a cargo dep, but grammar *code* is never — it is fetched from the registry,
 # compiled with the system C compiler, and dlopen'd at runtime.

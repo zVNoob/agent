@@ -706,10 +706,19 @@ local function apply_patch(args)
     handle:write(new_text)
     handle:close()
   end
-  local before_lines = patch_split(before_text)
-  local after_lines = patch_split(new_text)
-  p:set(1, before_text)
-  p:set(2, new_text)
+  -- Tabs are drawn as two spaces (the panel cannot draw a tab stop, and the
+  -- width is fixed in Rust's `renderable`, src/tui/panel.rs). That has to
+  -- happen *here*, before the byte offsets below are measured, and not in the
+  -- panel: `p:highlight` takes offsets into the text `p:set` stored, so if the
+  -- panel expanded them and not us, every offset after the first tab would land
+  -- a line or two off and the red/green would mark the wrong text.
+  local function shown(s)
+    return (s:gsub("\t", "  "))
+  end
+  local before_lines = patch_split(shown(before_text))
+  local after_lines = patch_split(shown(new_text))
+  p:set(1, shown(before_text))
+  p:set(2, shown(new_text))
   for _, span in ipairs(res.before_changed) do
     local a, b = line_bytes(before_lines, span[1], span[2])
     if b > a then p:highlight(1, a, b, "bold.red") end
