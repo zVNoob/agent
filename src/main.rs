@@ -2810,20 +2810,28 @@ mod tests {
         // The blocks are in the order the turn had them: the question, the
         // thinking, the answer, the tool's box.
         let screen: String = panel_screen(&mut app.panel, 100, 40);
+        // Folded: on resume the thinking is history, and it is the longest thing in
+        // a turn. A fold that hid it *permanently* would be the opposite of
+        // reconstructing it, so the click has to bring it back — checked below.
         assert!(
-            screen.contains("the stat syscall runs per keystroke."),
-            "the thinking is readable again:\n{screen}"
+            screen.contains("[+] reasoning"),
+            "the block is there, folded:\n{screen}"
         );
-        // In the order the turn had it: the question, the thinking, the answer.
+        assert!(
+            !screen.contains("the stat syscall runs per keystroke."),
+            "with the thinking behind the click:\n{screen}"
+        );
+        // In the order the turn had it: the question, then the fold standing for
+        // the thinking, then the answer.
         let at = |needle: &str| {
             screen.find(needle).unwrap_or_else(|| {
                 panic!("{needle:?} is not on screen at all:\n{screen}");
             })
         };
         assert!(
-            at("why is it slow?") < at("the stat syscall runs per keystroke.")
-                && at("the stat syscall runs per keystroke.") < at("because it re-reads it."),
-            "thinking before the answer, not after it:\n{screen}"
+            at("why is it slow?") < at("[+] reasoning")
+                && at("[+] reasoning") < at("because it re-reads it."),
+            "the fold sits where the thinking was — before the answer:\n{screen}"
         );
         assert!(
             screen.contains("because it re-reads it."),

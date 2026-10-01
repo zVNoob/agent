@@ -290,16 +290,65 @@ impl ChatRenderer {
     }
 }
 
+/// The title of the streamed reasoning block.
+pub const REASONING: &str = "reasoning";
+
+/// The title of the streamed answer block.
+pub const RESPONSE: &str = "response";
+
+/// Whether `msg` is the streamed *reasoning* block.
+///
+/// Its own predicate rather than `!is_borderless_box(msg)`: the answer block is
+/// borderless too, and it is excluded from most of what follows.
+fn is_reasoning(msg: &Message) -> bool {
+    msg.boxed.as_deref() == Some(REASONING)
+}
+
 /// Whether `msg` is a *borderless* streamed block — the "reasoning" and
 /// "response" blocks the agent loop streams via
-/// [`TurnPanel::stream_append_boxed`]. They render (and measure) like plain
-/// messages: no frame, no click-to-collapse — and the reasoning one is
-/// dimmed so the model's thinking reads quieter than the answer. Tool-call
-/// boxes and Lua panels keep their borders.
+/// [`TurnPanel::stream_append_boxed`]. They render and measure like plain
+/// messages: no frame. The reasoning one is dimmed so the model's thinking reads
+/// quieter than the answer. Tool-call boxes and Lua panels keep their borders.
 fn is_borderless_box(msg: &Message) -> bool {
     msg.boxed
         .as_deref()
-        .is_some_and(|t| matches!(t, "reasoning" | "response"))
+        .is_some_and(|t| matches!(t, REASONING | RESPONSE))
+}
+
+/// Whether a click folds this block.
+///
+/// The framed boxes all do. The borderless **reasoning** block does too: it is
+/// the longest thing in a turn and the least re-read, so a click puts it away
+/// and leaves the answer legible. It has no frame to carry a `[−]`, which is why
+/// the collapsed form is a line of its own rather than a two-row box.
+///
+/// The answer block does not: it is the answer, and an answer you have to click
+/// to read is not one.
+fn is_collapsible(msg: &Message) -> bool {
+    msg.boxed.is_some() && (!is_borderless_box(msg) || is_reasoning(msg))
+}
+
+/// The one line a collapsed reasoning block draws in place of its thinking.
+///
+/// `[+] reasoning`, at the left edge — where the frame of a folded box would
+/// have been, so the fold reads as the same kind of gesture. Not dimmed: it is
+/// the block's only content now, and a heading nobody can see is not a heading.
+/// The title is the same string the block carries, so there is one spelling of it.
+fn collapsed_reasoning_row() -> Line<'static> {
+    Line::from(vec![
+        Span::raw("[+] "),
+        Span::styled(REASONING, msg_style_for(REASONING)),
+    ])
+}
+
+/// The style a block title is drawn in, so the collapsed line and the expanded
+/// block agree on it.
+fn msg_style_for(title: &str) -> Style {
+    if title == REASONING {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    }
 }
 
 /// Lay [`Modifier::DIM`] onto every span of `lines` (the reasoning block's
@@ -342,11 +391,17 @@ impl BorderedRenderer {
         for msg in messages {
             if msg.boxed.is_some() {
                 if is_borderless_box(msg) {
-                    let mut rows = message_lines(msg, text_w, conceal);
-                    if msg.boxed.as_deref() == Some("reasoning") {
-                        rows = dim_spans(rows);
+                    // Folded, the block is one line naming itself; there is no
+                    // frame to fold into, so this is the whole of it.
+                    if is_reasoning(msg) && msg.collapsed {
+                        lines.push(collapsed_reasoning_row());
+                    } else {
+                        let mut rows = message_lines(msg, text_w, conceal);
+                        if is_reasoning(msg) {
+                            rows = dim_spans(rows);
+                        }
+                        lines.extend(rows);
                     }
-                    lines.extend(rows);
                 } else {
                     lines.extend(boxed_lines(msg, content_w, conceal));
                 }
@@ -536,22 +591,23 @@ impl TurnPanel {
         self.highlighter.as_mut()
     }
 
-    /// Collapse every framed box in the transcript.
+    /// Collapse everything in the transcript that a click can fold.
     ///
-    /// For a resumed session, where the boxes are *history*: a long session has
-    /// a panel per tool call, and expanding them all buries the conversation that
-    /// is actually being resumed under screens of old output. Collapsed, each is
-    /// its title and a `[+]`, and the transcript reads as the outline it is.
+    /// For a resumed session, where all of it is *history*: a long session has a
+    /// panel per tool call and a block of thinking per turn, and expanding them
+    /// all buries the conversation being resumed under screens of old output.
+    /// Folded, each is a line naming itself, and the transcript reads as the
+    /// outline it is.
     ///
-    /// Only framed boxes: the borderless streamed blocks (`reasoning`,
-    /// `response`) have no frame and no collapse affordance — see
-    /// [`is_borderless_box`] — so they are left exactly as replayed them.
+    /// That is [`is_collapsible`] — the framed boxes and the reasoning block. The
+    /// answer block is not: it is the answer, and a resumed transcript whose
+    /// answer is behind a click is not showing its answer.
     ///
-    /// A no-op on a message with nothing to collapse, and idempotent, so calling
-    /// it on a transcript that is already collapsed changes nothing.
+    /// A no-op on a message with nothing to fold, and idempotent, so calling it on
+    /// an already-collapsed transcript changes nothing.
     pub fn collapse_all_boxes(&mut self) {
         for msg in &mut self.messages {
-            if msg.boxed.is_some() && !is_borderless_box(msg) && !msg.collapsed {
+            if is_collapsible(msg) && !msg.collapsed {
                 msg.collapsed = true;
                 msg.dirty = true;
             }
@@ -1213,7 +1269,7 @@ impl TurnPanel {
                         };
                     }
                 }
-                if msg.boxed.is_some() && !is_borderless_box(msg) {
+                if is_collapsible(msg) {
                     msg.collapsed = !msg.collapsed;
                     msg.dirty = true; // collapse changes the row count
                     return Click::Toggled;
@@ -1283,6 +1339,12 @@ fn message_rows(msg: &Message, content_w: usize, conceal: bool) -> usize {
             0
         };
         return rows + 2 + overlay;
+    }
+    // A folded reasoning block is the single line that says it is there — not a
+    // two-row box, since there is no frame, and not its body, since that is
+    // exactly what folding is for.
+    if is_reasoning(msg) && msg.collapsed {
+        return 1;
     }
     let text_w = content_w.saturating_sub(TAG_COLS + 1);
     let text: std::borrow::Cow<'_, str> = if conceal {
@@ -2434,7 +2496,7 @@ mod tests {
     /// point: collapsing must not become a way to hide a resumed turn's thinking,
     /// which is the one thing the user asked to have back.
     #[test]
-    fn collapsing_leaves_the_borderless_blocks_alone() {
+    fn collapsing_folds_the_reasoning_but_not_the_answer() {
         let mut panel = TurnPanel::default();
         panel.stream_append_boxed("thinking about it", "reasoning".into());
         panel.stream_append_boxed("the answer", "response".into());
@@ -2458,12 +2520,13 @@ mod tests {
         assert_eq!(
             state,
             vec![
-                (Some("reasoning"), false),
+                (Some("reasoning"), true),
                 (Some("response"), false),
                 (Some("ls"), true),
             ],
-            "only the framed box collapsed — the borderless ones have no frame and \
-             no affordance to collapse to"
+            "the framed box and the reasoning fold; the answer does not — it is the \
+             answer, and a resumed transcript whose answer is behind a click is \
+             not showing its answer"
         );
         let screen: String = BorderedRenderer::lines(&panel.messages, 60, true)
             .iter()
@@ -2475,9 +2538,124 @@ mod tests {
             })
             .collect();
         assert!(
-            screen.contains("thinking about it"),
-            "and the reasoning is still readable: {screen}"
+            !screen.contains("thinking about it"),
+            "the thinking is behind the fold, which is the point: {screen}"
         );
+        assert!(
+            screen.contains("[+] reasoning"),
+            "and the fold names what is behind it: {screen}"
+        );
+    }
+
+    /// A folded reasoning block is one line naming itself, and unfolding brings the
+    /// thinking back.
+    ///
+    /// The second half is the one that matters. A fold that could not be opened
+    /// would be a way of *losing* a resumed turn's reasoning rather than putting it
+    /// away, which is the opposite of reconstructing it — so the click, the row
+    /// count and the restored text are all checked.
+    #[test]
+    fn a_folded_reasoning_block_unfolds_back_to_its_thinking() {
+        let mut panel = TurnPanel::default();
+        panel.stream_append_boxed("first it stats the file.\n", REASONING.into());
+        panel.stream_append_boxed("then it diffs the two.\n", REASONING.into());
+        panel.stream_append_boxed("so the cost is one stat per key.", REASONING.into());
+        panel.stream_append_boxed("the answer.", RESPONSE.into());
+
+        let at = |p: &TurnPanel| -> String {
+            BorderedRenderer::lines(&p.messages, 60, true)
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Expanded: the thinking is there, dimmed, and the answer is not.
+        let open = at(&panel);
+        assert!(open.contains("first it stats the file."), "{open}");
+        assert!(open.contains("then it diffs the two."), "{open}");
+        assert!(open.contains("the answer."), "{open}");
+        let rows_open = panel.content_height(60);
+
+        // Folded: one line, naming itself, with the thinking gone from view — but
+        // the answer untouched, because it was never a fold target.
+        panel.collapse_all_boxes();
+        let folded = at(&panel);
+        assert!(
+            folded.contains("[+] reasoning"),
+            "the fold names itself: {folded}"
+        );
+        assert!(!folded.contains("first it stats the file."), "{folded}");
+        assert!(
+            folded.contains("the answer."),
+            "the answer is not folded: {folded}"
+        );
+        assert_eq!(
+            panel.content_height(60),
+            rows_open - 2,
+            "and the transcript really is shorter"
+        );
+
+        // Unfolded by a click on the fold's own row, the thinking is back.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 10,
+        };
+        assert_eq!(
+            panel.handle_click(1, 0, area),
+            Click::Toggled,
+            "the fold is clickable"
+        );
+        assert!(
+            at(&panel).contains("first it stats the file."),
+            "and unfolding restores the thinking verbatim"
+        );
+        assert_eq!(
+            panel.content_height(60),
+            rows_open,
+            "at exactly the height it had before"
+        );
+
+        // A second click folds it again, and the answer never moved.
+        assert_eq!(panel.handle_click(1, 0, area), Click::Toggled);
+        assert!(!at(&panel).contains("first it stats the file."));
+        assert!(at(&panel).contains("the answer."));
+    }
+
+    /// Only the reasoning block folds among the borderless ones, and only when it
+    /// is a reasoning block — a framed box folds too, and the answer does not.
+    #[test]
+    fn collapsible_is_the_reasoning_block_and_the_framed_boxes() {
+        let mk = |title: Option<&str>| Message {
+            role: Role::Assistant,
+            text: "x".into(),
+            segs: Vec::new(),
+            conceal: Vec::new(),
+            user_segs: Vec::new(),
+            boxed: title.map(str::to_string),
+            conceal_box: false,
+            collapsed: false,
+            lang: None,
+            overlay: None,
+            panes: None,
+            rows: 0,
+            dirty: true,
+        };
+        assert!(is_collapsible(&mk(Some(REASONING))), "the thinking folds");
+        assert!(is_collapsible(&mk(Some("bash"))), "so does a tool box");
+        assert!(is_collapsible(&mk(Some("apply_patch"))));
+        assert!(
+            !is_collapsible(&mk(Some(RESPONSE))),
+            "the answer does not: it is the answer"
+        );
+        assert!(!is_collapsible(&mk(None)), "nor plain prose");
     }
 
     #[test]
@@ -3908,9 +4086,11 @@ mod tests {
         );
         assert!(!all_dim(&lines[2]), "the framed box stays undimmed");
 
-        // Only framed boxes toggle on click; borderless blocks do not.
+        // Framed boxes toggle on click, and so does the reasoning block — it is the
+        // longest thing in a turn. The answer block does not.
         let mut panel = TurnPanel::default();
         panel.stream_append_boxed("think", "reasoning".into());
+        panel.stream_append_boxed("the answer", "response".into());
         panel.push_boxed(Role::Assistant, "ls -la".into(), "bash".into());
         let area = Rect {
             x: 0,
@@ -3920,15 +4100,22 @@ mod tests {
         };
         assert_eq!(
             panel.handle_click(5, 0, area),
-            Click::Nothing,
-            "a reasoning row is not a collapsible box"
+            Click::Toggled,
+            "a click on the reasoning folds it"
         );
+        assert!(panel.messages[0].collapsed);
         assert_eq!(
             panel.handle_click(5, 1, area),
+            Click::Nothing,
+            "and the answer is not a target — it is the answer"
+        );
+        assert!(!panel.messages[1].collapsed);
+        assert_eq!(
+            panel.handle_click(5, 2, area),
             Click::Toggled,
             "the framed tool box still toggles"
         );
-        assert!(panel.messages[1].collapsed);
+        assert!(panel.messages[2].collapsed);
     }
 
     #[test]
