@@ -225,7 +225,7 @@ impl TurnBuilder {
     }
 
     pub fn finish(self) -> Turn {
-        let mut tool_calls: Vec<ToolCall> = self
+        let tool_calls: Vec<ToolCall> = self
             .tool_calls
             .into_iter()
             .filter(|c| c.has_anything())
@@ -239,8 +239,18 @@ impl TurnBuilder {
                 arguments: c.arguments.trim().into(),
             })
             .collect();
-        // Server may deliver deltas out of order per `index`; sort for stability.
-        tool_calls.sort_by(|a, b| a.id.cmp(&b.id));
+        // Order is the *index* order, and it is already: `self.tool_calls` is
+        // indexed by `d.index`, so a call's slot is where the stream said it was,
+        // however the payloads were interleaved.
+        //
+        // This used to sort by **id string**, on the reasoning that a server
+        // "may deliver deltas out of order per `index`". That reasoning is wrong
+        // in both halves: the vector is indexed by `index`, so ordering is
+        // structural and needs no help; and ids are opaque — `toolu_01H…`,
+        // `call_abc123` — so sorting by one scrambles a parallel group into an
+        // order the model never chose. Servers match results by id and mostly do
+        // not care, but a group that must be answered together is answered in
+        // the order it was asked in, and that is not this code's to rearrange.
         Turn {
             content: self.content,
             tool_calls,
@@ -263,7 +273,12 @@ fn sse_payload(line: &str) -> Option<&str> {
 /// Pure: it parses and nothing else. Accumulation is [`TurnBuilder`]'s job, and
 /// it is the *only* accumulator — this function used to keep a second one
 /// (`TurnAccState`) alongside it, which no production code ever read.
-fn acc_sse(payload: &str) -> Vec<TurnEvent> {
+///
+/// Public because the binary is a separate crate and the loop's own tests need
+/// to drive it: where an assistant turn becomes request history is `main.rs`,
+/// and the ordering there is exactly what a provider rejects when it is wrong. A
+/// test that cannot reach the parser cannot drive the loop.
+pub fn acc_sse(payload: &str) -> Vec<TurnEvent> {
     let mut events = Vec::new();
     let Ok(evt) = serde_json::from_str::<Value>(payload) else {
         return events;
@@ -558,5 +573,124 @@ mod tests {
         assert_eq!(t.prompt, Some(11));
         assert_eq!(t.completion, Some(4));
         assert_eq!(turn.tokens(), crate::lua::Usage::default());
+    }
+    /// Two tool calls in ONE assistant message — the "parallel tool call" shape —
+    /// must accumulate as two calls, each keeping its own id, name and arguments.
+    ///
+    /// The shape providers stream for it: a call announced with id, name and the
+    /// first sliver of its arguments; the second call announced in the *same*
+    /// payload, which several do; then the argument chunks **interleaved**, each
+    /// addressed by `index` rather than by position in the array.
+    ///
+    /// The payloads are built rather than written out because they are nested JSON —
+    /// the arguments are JSON *inside* the delta, inside the choices array — and
+    /// hand-writing that escaping is how a test ends up asserting on its own typos.
+    /// The chunk arguments are raw strings for the same reason: they are JSON text,
+    /// and every level of escaping between the test and the payload is another place
+    /// to lose a quote.
+    #[test]
+    fn parallel_tool_calls_accumulate_into_separate_calls() {
+        /// One `data:` payload announcing or extending one tool call.
+        fn delta(index: usize, id: Option<&str>, name: Option<&str>, args: Option<&str>) -> String {
+            let mut tc = format!("{{\"index\":{index}");
+            if let Some(id) = id {
+                tc.push_str(&format!(",\"id\":\"{id}\",\"type\":\"function\""));
+            }
+            if name.is_some() || args.is_some() {
+                tc.push_str(",\"function\":{");
+                if let Some(n) = name {
+                    tc.push_str(&format!("\"name\":\"{n}\""));
+                    if args.is_some() {
+                        tc.push(',');
+                    }
+                }
+                if let Some(a) = args {
+                    // The arguments are themselves JSON text, so they go in as a JSON
+                    // string: quotes and backslashes in the chunk are escaped once,
+                    // here, and nowhere else.
+                    let escaped = a.replace('\\', "\\\\").replace('"', "\\\"");
+                    tc.push_str(&format!("\"arguments\":\"{escaped}\""));
+                }
+                tc.push('}');
+            }
+            tc.push('}');
+            format!("{{\"choices\":[{{\"delta\":{{\"tool_calls\":[{tc}]}}}}]}}")
+        }
+
+        let payloads = [
+            // Call 0 announced, with the first sliver of its arguments.
+            delta(0, Some("call_a"), Some("fs.read"), Some(r#"{"path":""#)),
+            // Call 1 announced in the *same* payload, as several providers do.
+            delta(1, Some("call_b"), Some("bash.bash"), Some(r#"{"cmd":""#)),
+            // Argument chunks, interleaved and out of issue order.
+            delta(1, None, None, Some(r#"ls"}"#)),
+            delta(0, None, None, Some(r#"/a"}"#)),
+        ];
+
+        let mut b = TurnBuilder::new();
+        for p in &payloads {
+            for ev in acc_sse(p) {
+                b.apply(ev);
+            }
+        }
+        let turn = b.finish();
+
+        assert!(
+            turn.wants_tools(),
+            "two tool calls means the turn wants tools"
+        );
+        let got: Vec<(String, String, String)> = turn
+            .tool_calls
+            .iter()
+            .map(|c| (c.id.clone(), c.name.clone(), c.arguments.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "call_a".to_string(),
+                    "fs.read".to_string(),
+                    r#"{"path":"/a"}"#.to_string()
+                ),
+                (
+                    "call_b".to_string(),
+                    "bash.bash".to_string(),
+                    r#"{"cmd":"ls"}"#.to_string()
+                ),
+            ],
+            "both calls, each with its own id, name and *complete* arguments — the \
+         interleaved chunks must land on the call that owns the index, or a tool \
+         is handed the other call's arguments"
+        );
+    }
+
+    /// The calls keep the order the model asked for them in, whatever their ids.
+    ///
+    /// `finish` sorted by **id string**, which is arbitrary: providers mint ids like
+    /// `toolu_01H…` or `call_abc123`, so two calls issued B-then-A come back A-then-B.
+    /// Most servers match results by id and never notice — but the order is not the
+    /// model's to lose, and re-sorting by an opaque string buys nothing.
+    ///
+    /// Asserted with ids whose lexicographic order is the *reverse* of the issue
+    /// order, so a sort by id cannot pass by accident.
+    #[test]
+    fn parallel_tool_calls_keep_the_order_they_were_issued_in() {
+        let payloads = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_z","type":"function","function":{"name":"bash.bash","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_a","type":"function","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
+        ];
+        let mut b = TurnBuilder::new();
+        for p in payloads {
+            for ev in acc_sse(p) {
+                b.apply(ev);
+            }
+        }
+        let ids: Vec<String> = b.finish().tool_calls.into_iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            vec!["call_z".to_string(), "call_a".to_string()],
+            "issue order, not id order — `call_z` was asked first and sorting by id \
+         would put it second"
+        );
     }
 }

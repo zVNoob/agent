@@ -457,6 +457,44 @@ fn default_key(app: &mut App, key: crossterm::event::KeyEvent, busy: bool) -> Ef
     }
 }
 
+/// Put an assistant turn into the history, in the order the protocol requires.
+///
+/// **The text comes first, then the calls.** They are one turn the model
+/// produced together, and `assistant_tool_message` carries `content: null`, so
+/// they are two messages — and the protocol only accepts them in this order:
+///
+/// ```text
+/// assistant: "I'll start by looking at the README."
+/// assistant: tool_calls=[read(README), read(Makefile)]
+/// tool: …        <- one per call, immediately after
+/// tool: …
+/// ```
+///
+/// The other order — calls, then the text — puts an assistant message *between* a
+/// call and its answers, which is the model's next turn arriving before the group
+/// it opened has been answered. HuggingFace's router rejects that with
+/// `400 incomplete_parallel_tool_calls: every tool call in a parallel group must
+/// be answered before the next turn`, which is what a `moonshotai/Kimi-K3` turn
+/// through this loop produced.
+///
+/// It is invisible with one call per turn, because then there is no group to
+/// complete and the single result still lands before the next request. Every test
+/// in this repository does one call at a time, and llama.cpp emits one — so the
+/// only way to see it is a model that asks for two.
+///
+/// `answering` says whether the loop will actually run this turn's calls. A turn
+/// whose tool-round budget is spent is recorded as the text it produced and
+/// nothing more: claiming calls that will never be answered is what makes the
+/// *next* request invalid, so the calls message is simply not written.
+fn push_assistant_turn(history: &mut Vec<Value>, turn: &agent::api::Turn, answering: bool) {
+    if !turn.content.is_empty() {
+        history.push(json!({"role": "assistant", "content": turn.content}));
+    }
+    if answering && turn.wants_tools() {
+        history.push(assistant_tool_message(&turn.tool_calls));
+    }
+}
+
 /// Ask the Lua `key` handler what a key press should do.
 ///
 /// Returns `None` when nothing is bound to it, which is the normal case and
@@ -983,6 +1021,44 @@ fn rebuild_tool_results(mut msgs: Vec<Value>) -> Vec<Value> {
             {
                 names.insert(id.to_string(), name.to_string());
             }
+        }
+    }
+
+    // **Both halves of the pairing, in this order.** First drop the results whose
+    // requesting assistant message fell outside the window, then — the half this
+    // used to be missing — trim the assistant messages that survive down to the
+    // calls that actually have a result in the window.
+    //
+    // Without the second half the request can claim two calls and carry one
+    // answer, which a server rejects outright: HuggingFace's router says
+    // `incomplete_parallel_tool_calls: every tool call in a parallel group must
+    // be answered before the next turn`, and OpenAI is no more forgiving. It only
+    // arises when the window starts *inside* a round — the newest-N window does
+    // that whenever the previous session ended mid-tool — and with one call per
+    // turn it takes a session that ended between an assistant message and its
+    // single result, which is why it went unseen against a local llama.
+    // A model that asks for two at once makes it ordinary.
+    let answered: std::collections::HashSet<String> = msgs
+        .iter()
+        .filter(|m| m["role"].as_str() == Some("tool"))
+        .filter_map(|m| m["tool_call_id"].as_str().map(str::to_string))
+        .collect();
+    for msg in &mut msgs {
+        if msg["role"].as_str() != Some("assistant") {
+            continue;
+        }
+        let Some(calls) = msg["tool_calls"].as_array_mut() else {
+            continue;
+        };
+        calls.retain(|c| c["id"].as_str().is_some_and(|id| answered.contains(id)));
+        // Nothing left to answer: the message is just what the model said. The
+        // field goes rather than becoming an empty array, because an empty
+        // `tool_calls` is itself something some routers read as a request for
+        // zero calls and reject.
+        if calls.is_empty() {
+            msg.as_object_mut()
+                .expect("a message is an object")
+                .remove("tool_calls");
         }
     }
 
@@ -1615,9 +1691,12 @@ async fn run<W: Write>(
                 // out — the model's unanswered calls stay in the transcript
                 // and a note names the cap).
                 let continuing = turn.wants_tools() && tool_rounds < MAX_TOOL_ROUNDS;
+                // What the model said, then what it asked for — in that order,
+                // because that order is the protocol's. See
+                // `push_assistant_turn`.
+                push_assistant_turn(&mut history, &turn, continuing);
                 if continuing {
                     tool_rounds += 1;
-                    history.push(assistant_tool_message(&turn.tool_calls));
                     // Queue the round's calls and start the first one. A tool
                     // is a coroutine on the config VM that the loop steps (see
                     // `start_next_tool`), so it only runs between frames; panel
@@ -1657,12 +1736,6 @@ async fn run<W: Write>(
                             "tool round limit ({MAX_TOOL_ROUNDS}) reached; giving up on this turn."
                         ),
                     );
-                }
-                // Text the model said alongside (or instead of) tool calls is
-                // its own assistant message — assistant_tool_message carries
-                // content: null, so it is not baked into the calls message.
-                if !turn.content.is_empty() {
-                    history.push(json!({"role": "assistant", "content": turn.content}));
                 }
                 if !continuing {
                     // The user turn is over: start `turn_completed` so a Lua
@@ -2290,6 +2363,206 @@ mod tests {
         assert!(may_run("bash", &none).is_err());
         // An empty name cannot sneak through either.
         assert!(may_run("", &offered).is_err());
+    }
+
+    /// An assistant message that asks for calls must only ask for calls that have
+    /// answers in the same request. The replay window can break that pairing —
+    /// this is the case, seen from HuggingFace's router as
+    /// `400 incomplete_parallel_tool_calls: every tool call in a parallel group
+    /// must be answered before the next turn`.
+    ///
+    /// The window is the newest N messages, so it starts mid-round whenever the
+    /// previous session ended inside one. `rebuild_tool_results` already drops a
+    /// result whose *requesting* assistant message fell outside — but not the
+    /// other half: an assistant message that fell *in* while some of its results
+    /// fell out. That leaves the request claiming two calls and carrying one
+    /// answer, which is precisely what the server rejects.
+    ///
+    /// With a single call per turn — what llama.cpp emits, and what every test
+    /// here does — the window has to cut between an assistant message and its one
+    /// result for this to bite, so the suite never saw it. A model that asks for
+    /// two at once makes it ordinary.
+    #[test]
+    fn a_parallel_group_is_trimmed_to_the_calls_that_were_answered() {
+        // The window starts at the assistant message: both calls requested, only
+        // the first answered.
+        let out = rebuild_tool_results(vec![
+            json!({"role": "assistant", "content": "on it", "tool_calls": [
+                {"id": "call_a", "type": "function",
+                 "function": {"name": "fs.read", "arguments": "{}"}},
+                {"id": "call_b", "type": "function",
+                 "function": {"name": "bash.bash", "arguments": "{}"}},
+            ]}),
+            json!({"role": "tool", "tool_call_id": "call_a", "content": "ok"}),
+            json!({"role": "user", "content": "next question"}),
+        ]);
+
+        let calls = out[0]["tool_calls"]
+            .as_array()
+            .expect("still an assistant turn");
+        assert_eq!(
+            calls.len(),
+            1,
+            "the un-answered call is gone, or the server rejects the whole request: \
+             {out:?}"
+        );
+        assert_eq!(calls[0]["id"], "call_a", "and the answered one is kept");
+        assert_eq!(
+            out[1]["tool_call_id"], "call_a",
+            "its result survives to match it"
+        );
+    }
+
+    /// The other half of the same rule: an assistant message whose calls were
+    /// *all* answered outside the window has no `tool_calls` left, and must stop
+    /// claiming any. What is left is a plain assistant message — with its
+    /// content, which is what it actually said.
+    #[test]
+    fn an_assistant_message_with_no_answers_left_stops_claiming_calls() {
+        let out = rebuild_tool_results(vec![
+            json!({"role": "assistant", "content": "here is the answer", "tool_calls": [
+                {"id": "call_a", "type": "function",
+                 "function": {"name": "fs.read", "arguments": "{}"}},
+                {"id": "call_b", "type": "function",
+                 "function": {"name": "bash.bash", "arguments": "{}"}},
+            ]}),
+            json!({"role": "user", "content": "next question"}),
+        ]);
+        assert!(
+            out[0]["tool_calls"].is_null(),
+            "no answers in the window, so no calls claimed: {out:?}"
+        );
+        assert_eq!(
+            out[0]["role"], "assistant",
+            "and it stays an assistant turn, content and all"
+        );
+        assert_eq!(
+            out[0]["content"], "here is the answer",
+            "with the text the model actually produced, which is the point of \\
+             keeping it"
+        );
+    }
+
+    /// The ordinary case is untouched: a fully-answered group keeps every call and
+    /// every result, and the message keeps its content.
+    #[test]
+    fn a_fully_answered_group_is_left_exactly_as_it_was() {
+        let msgs = vec![
+            json!({"role": "assistant", "content": "checking", "tool_calls": [
+                {"id": "call_a", "type": "function",
+                 "function": {"name": "fs.read", "arguments": "{}"}},
+                {"id": "call_b", "type": "function",
+                 "function": {"name": "bash.bash", "arguments": "{}"}},
+            ]}),
+            json!({"role": "tool", "tool_call_id": "call_a", "content": "one"}),
+            json!({"role": "tool", "tool_call_id": "call_b", "content": "two"}),
+        ];
+        let out = rebuild_tool_results(msgs.clone());
+        assert_eq!(out.len(), 3, "nothing dropped: {out:?}");
+        assert_eq!(
+            out[0]["tool_calls"].as_array().map(Vec::len),
+            Some(2),
+            "both calls still claimed, in the order the model asked"
+        );
+        for (i, id) in ["call_a", "call_b"].iter().enumerate() {
+            assert_eq!(out[1 + i]["tool_call_id"], *id, "results still matched");
+        }
+    }
+
+    /// A turn that said *and* asked gets two assistant messages, and they must be
+    /// in the order the protocol requires: the text first, then the calls.
+    ///
+    /// This is the live half of `incomplete_parallel_tool_calls`. The loop used
+    /// to push the calls message and the text message in separate places, and the
+    /// text landed *after* it — so the history read
+    ///
+    /// ```text
+    /// assistant: tool_calls=[read(A), read(B)]
+    /// assistant: "I'll start by looking at the README."   <- the next turn
+    /// tool: …
+    /// tool: …
+    /// ```
+    ///
+    /// An assistant message between a call and its answers is the model's next
+    /// turn arriving before the group it opened has been answered, and
+    /// HuggingFace rejects the whole request for it. With one call per turn there
+    /// is no group and the result still precedes the next request, so it is
+    /// invisible — and every test here does one call at a time, as does
+    /// llama.cpp. A model that asks for two at once hits it every turn.
+    #[test]
+    fn an_assistant_turn_records_its_text_before_its_calls() {
+        let mut turn = agent::api::TurnBuilder::new();
+        for p in [
+            r#"{"choices":[{"delta":{"content":"I'll start by reading the README."}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
+        ] {
+            for ev in agent::api::acc_sse(p) {
+                turn.apply(ev);
+            }
+        }
+        let turn = turn.finish();
+        assert!(
+            turn.wants_tools() && !turn.content.is_empty(),
+            "a turn with both"
+        );
+
+        let mut history: Vec<serde_json::Value> = Vec::new();
+        push_assistant_turn(&mut history, &turn, true);
+
+        assert_eq!(
+            history.len(),
+            2,
+            "text and calls, one message each: {history:?}"
+        );
+        assert_eq!(history[0]["role"], "assistant", "the text comes first");
+        assert_eq!(
+            history[0]["content"], "I'll start by reading the README.",
+            "and it is the text the model actually produced"
+        );
+        assert!(
+            history[0]["tool_calls"].is_null(),
+            "…with no calls attached, because the two are separate messages"
+        );
+        assert_eq!(
+            history[1]["tool_calls"].as_array().map(Vec::len),
+            Some(2),
+            "the calls follow, both of them: {history:?}"
+        );
+        assert!(
+            history[1]["content"].is_null(),
+            "and carry no text of their own"
+        );
+    }
+
+    /// A turn whose tool-round budget is spent is recorded as the text it
+    /// produced and **nothing else**. Claiming calls that will never be answered
+    /// is precisely what invalidates the next request, so the calls message is
+    /// not written at all.
+    #[test]
+    fn a_turn_whose_calls_will_not_run_claims_none_of_them() {
+        let mut turn = agent::api::TurnBuilder::new();
+        // Two payloads: the text, then the call.
+        for p in [
+            r#"{"choices":[{"delta":{"content":"still working on it"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
+        ] {
+            for ev in agent::api::acc_sse(p) {
+                turn.apply(ev);
+            }
+        }
+        let turn = turn.finish();
+        assert!(turn.wants_tools(), "the model did ask for a tool");
+
+        let mut history: Vec<serde_json::Value> = Vec::new();
+        push_assistant_turn(&mut history, &turn, false);
+        assert_eq!(
+            history.len(),
+            1,
+            "just the text — no calls claimed, because none will be answered: \\
+             {history:?}"
+        );
+        assert_eq!(history[0]["content"], "still working on it");
     }
 
     /// The three answers, and the rule that makes "always" conditional: `a` is

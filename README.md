@@ -647,8 +647,8 @@ make fmt           # cargo fmt
 `verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
 fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
 `src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
-the check that the sandbox is still there at all. The suite is 398 library tests
-and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
+the check that the sandbox is still there at all. The suite is 400 library tests
+and 19 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
 compiler (`-- --ignored` runs them).
 
 Other binaries, for narrower jobs: `chat` (a terminal setup demo, no Lua),
@@ -662,8 +662,12 @@ sandboxed run directly).
 
 Work in progress, and honest about the edges:
 
-- **Nobody has run this end to end against a real model yet.** Everything is
-  green because it is hermetically tested; the integration is not.
+- **Parallel tool calls were broken and are now fixed.** A model that asks for
+  two tools in one message got a `400 incomplete_parallel_tool_calls` from the
+  server, because the agent put its own assistant message *between* the request
+  and the answers. Invisible with one call per turn — which is what every test
+  here does, and what llama.cpp emits. If you point this at a model that batches,
+  see the `push_assistant_turn` comment in `src/main.rs`.
 - **The mask is a list, not a property, and it cannot be a property.** Every
   syscall the policy does not name runs ungated under the kernel's default, and
   the kernel adds more every release. What the list *can* do is catch the routes
