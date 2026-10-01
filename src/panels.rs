@@ -173,6 +173,86 @@ pub struct PaneInit {
 /// log would carry panel ops to the model as if they were conversation.
 pub const PANEL_RECORD: &str = "panel_op";
 
+impl PanelOp {
+    /// The panel this op addresses, or `None` if it addresses none.
+    ///
+    /// [`PanelOp::Overlay`] has one: it draws inside a boxed message, and a
+    /// transcript that paged in a second chunk's ops must be able to tell whose
+    /// dialog it is.
+    pub fn panel_id(&self) -> Option<u64> {
+        match self {
+            PanelOp::Create { id, .. }
+            | PanelOp::Append { id, .. }
+            | PanelOp::Set { id, .. }
+            | PanelOp::Highlight { id, .. }
+            | PanelOp::ClearRegions { id, .. }
+            | PanelOp::Split { id, .. }
+            | PanelOp::SetPane { id, .. }
+            | PanelOp::SetPaneLang { id, .. }
+            | PanelOp::HighlightPane { id, .. }
+            | PanelOp::ClearPaneRegions { id, .. }
+            | PanelOp::Overlay { id, .. } => Some(*id),
+        }
+    }
+
+    /// The same op, addressing panel `new`.
+    ///
+    /// Needed because panel ids are only unique **within a tool round**: the
+    /// allocator is per-round, continuing across rounds, so a long session has
+    /// several panels numbered 1. Replaying two chunks of the log into one
+    /// transcript would therefore have the second chunk's panel 1 attach to the
+    /// first's — a panel showing another panel's title and somebody else's file.
+    /// Paging rewrites ids into a disjoint range per chunk to keep them apart.
+    ///
+    /// The pane index is *not* touched: it is 1-based within its own panel, and
+    /// only the transcript knows what that means.
+    pub fn with_panel_id(self, new: u64) -> Self {
+        let id = new;
+        match self {
+            PanelOp::Create {
+                title,
+                boxed,
+                conceal_box,
+                ..
+            } => PanelOp::Create {
+                id,
+                title,
+                boxed,
+                conceal_box,
+            },
+            PanelOp::Append { text, .. } => PanelOp::Append { id, text },
+            PanelOp::Set { text, .. } => PanelOp::Set { id, text },
+            PanelOp::Highlight {
+                start, end, style, ..
+            } => PanelOp::Highlight {
+                id,
+                start,
+                end,
+                style,
+            },
+            PanelOp::ClearRegions { .. } => PanelOp::ClearRegions { id },
+            PanelOp::Split { title, panes, .. } => PanelOp::Split { id, title, panes },
+            PanelOp::SetPane { pane, text, .. } => PanelOp::SetPane { id, pane, text },
+            PanelOp::SetPaneLang { pane, lang, .. } => PanelOp::SetPaneLang { id, pane, lang },
+            PanelOp::HighlightPane {
+                pane,
+                start,
+                end,
+                style,
+                ..
+            } => PanelOp::HighlightPane {
+                id,
+                pane,
+                start,
+                end,
+                style,
+            },
+            PanelOp::ClearPaneRegions { pane, .. } => PanelOp::ClearPaneRegions { id, pane },
+            PanelOp::Overlay { text, remember, .. } => PanelOp::Overlay { id, text, remember },
+        }
+    }
+}
+
 /// Wrap an op as one log record.
 ///
 /// `{"kind":"panel_op","op":{"SetPane":{…}}}`. The `kind` is what the replay

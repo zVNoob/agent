@@ -175,6 +175,25 @@ is no second reconstruction from the call's arguments and result, because a
 panel rebuilt from those would be a plausible impostor of one that was archived,
 and a drawing that is not the drawing is worse than an absent one.
 
+What resumes is a *window*: the newest twenty messages, which is the cold-start
+context and everything resident at once. That is not the extent of the history —
+scrolling up past the window pages older records out of the log as they are
+reached, a few at a time, and they reconstruct the same way: panels and all,
+folded. Two things make that more than a bigger read. Paging does **not** touch
+the request history — scrolling back to read something is not asking to send it
+to a model, and silently growing the context on a scroll gesture is a surprise in
+the expensive direction. And each page's panel ids are moved into a range of its
+own, because ids are allocated per tool round, so every chunk of a long session
+has a panel numbered 1 and merged unchecked the older chunk's `Create` would
+retitle the newer one's box.
+
+The log is the only thing that has to be resident, and it is not: pages are read
+backwards from the end, one compressed block at a time, which is also the log's
+own unit of storage — so a page boundary lands *inside* a block, and the resume
+point has to name a block and how much of its front belongs to the page rather
+than a byte offset. Getting that wrong shows a record twice or skips one, and
+either looks like a rendering fault rather than a paging one.
+
 ---
 
 ## Security model

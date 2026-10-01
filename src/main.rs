@@ -57,7 +57,9 @@
 //! On startup a fresh session *continues* from the log: the newest
 //! [`MEMORY_REPLAY_LATEST`] messages are replayed into the transcript and the
 //! request history (the watermark starts past them, so nothing is
-//! re-archived).
+//! re-archived). That window bounds the model's context and what is resident
+//! at once, not how far back the transcript can be read: scrolling up past it
+//! pages older records out of the log as they are reached (`paging`).
 //!
 //! Tool panels are archived too — as the [`agent::panels::PanelOp`]s that drew
 //! them, spliced into the log where they sat in the transcript — so a resumed
@@ -72,6 +74,8 @@ use agent::api::{Chat, TurnBuilder, TurnEvent, assistant_tool_message};
 use agent::grammars::Catalog;
 use agent::status::StatusKind;
 use agent::tui::{Action, App, Click, Effect, MarkdownHighlighter, Role};
+
+mod paging;
 use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event as CrosstermEvent, EventStream, KeyCode,
@@ -93,6 +97,12 @@ use tokio::sync::mpsc;
 
 /// How many of the newest archived messages a fresh session replays into the
 /// transcript and request history (cold-start context, chronological).
+///
+/// This is the *window*, not the extent of the history: it is what is resident
+/// at startup and what the model is sent, and scrolling past it pages older
+/// records in on demand ([`paging`]). Growing it would grow the context — and
+/// the bill — for every message in a session, which is not a knob to turn
+/// because the transcript happens to be scrollable.
 const MEMORY_REPLAY_LATEST: usize = 20;
 
 /// Mouse capture: press/release + SGR coordinates only. crossterm's
@@ -196,10 +206,12 @@ async fn main() -> Result<()> {
     // off — the newest MEMORY_REPLAY_LATEST archived messages become the
     // starting transcript/request history. The loop's save watermark starts
     // past them (see `run`), so the replayed prefix is never re-archived.
-    let (replayed, request_history): (Vec<Value>, Vec<Value>) = match agent::lua::memory_path() {
+    let resumed = match agent::lua::memory_path() {
         Some(p) => cold_start(&p, MEMORY_REPLAY_LATEST),
-        None => (Vec::new(), Vec::new()),
+        None => Replayed::empty(),
     };
+    let replayed = resumed.records;
+    let request_history = replayed_request_history(&replayed);
     if !replayed.is_empty() {
         println!("memory: resumed {} archived messages", replayed.len());
     }
@@ -297,6 +309,14 @@ async fn main() -> Result<()> {
     // produced them silently missing. A log written before panels were archived
     // simply has no panel records, and resumes as it always did.
     replay_transcript(&mut app, &replayed);
+    // Armed from the *same* window the transcript just read, so the first page
+    // starts exactly where that window's oldest record ends. A block boundary is
+    // not a record boundary, so asking the log twice where "the last n" is can
+    // disagree — and the panel would repeat one record or skip it.
+    let mut pager = paging::Pager::new();
+    if let Some(p) = agent::lua::memory_path() {
+        pager.resume_at(&p, resumed.cursor);
+    }
     let system_prompt = match agent::lua::system_prompt(&config_vm) {
         Ok(p) if !p.trim().is_empty() => " · system prompt set".to_string(),
         Ok(_) => " · no system prompt".to_string(),
@@ -329,6 +349,7 @@ async fn main() -> Result<()> {
         // records, which the transcript above has replayed and which must not be
         // sent to the model as if they were conversation.
         request_history,
+        &mut pager,
     )
     .await;
 
@@ -1165,10 +1186,8 @@ fn replay_transcript(app: &mut App, records: &[Value]) {
 /// could apply it. Nothing failed — the tests all drove the pieces directly, and
 /// the pieces were each correct. It is the one defect that only a test of the
 /// *wiring* can catch, so the wiring is the thing that is a function.
-fn cold_start(path: &std::path::Path, n: usize) -> (Vec<Value>, Vec<Value>) {
-    let records = replay_records(path, n);
-    let request = replayed_request_history(&records);
-    (records, request)
+fn cold_start(path: &std::path::Path, n: usize) -> Replayed {
+    replay_records(path, n)
 }
 
 /// The request half of a replay: the messages, with each tool result reduced to
@@ -1216,22 +1235,25 @@ fn is_transcript_record(record: &Value) -> bool {
 /// Corrupt lines are skipped, never fatal. A panel record this build cannot
 /// decode is dropped by [`agent::panels::panel_record_op`], so an op variant
 /// added after the log was written costs that one panel and nothing else.
-fn replay_records(path: &std::path::Path, n: usize) -> Vec<Value> {
+fn replay_records(path: &std::path::Path, n: usize) -> Replayed {
     // Generous, then trimmed: a round with a parallel group and a panel can be
     // a dozen lines for one message.
     let read = n.saturating_mul(8).max(n);
-    match agent::memory::read_tail(path, read) {
-        Ok(lines) => {
-            let parsed: Vec<Value> = lines
-                .into_iter()
-                .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-                .collect();
-            // Trim from the newest end until only `n` messages remain, so the
-            // window keeps its meaning and the panels it brackets come with it.
-            let mut kept_from = parsed.len();
+    match agent::memory::read_before(path, agent::memory::Cursor::end(), read) {
+        Ok(page) => {
+            // Trim from the newest end until only `n` messages remain, so the window
+            // keeps its meaning and the panels it brackets come with it. Counted over
+            // the page's own records, not over a parsed copy: `kept_from` has to be an
+            // index into `page.records`, because that is what the cursor is computed
+            // from. A line that does not parse is skipped without counting, so it is
+            // neither in the window nor mistaken for a message.
+            let mut kept_from = page.records.len();
             let mut messages = 0usize;
-            for (i, r) in parsed.iter().enumerate().rev() {
-                if !agent::panels::is_panel_record(r) {
+            for (i, line) in page.records.iter().enumerate().rev() {
+                let Ok(record) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if !agent::panels::is_panel_record(&record) {
                     messages += 1;
                     if messages == n {
                         kept_from = i;
@@ -1240,15 +1262,60 @@ fn replay_records(path: &std::path::Path, n: usize) -> Vec<Value> {
                 }
                 kept_from = i;
             }
-            let mut out = parsed[kept_from..].to_vec();
-            if out.is_empty() {
-                out = parsed;
+            let records: Vec<Value> = page.records[kept_from..]
+                .iter()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            // Resume from where the *window* ends, not where the read did. The trim
+            // dropped records; paging from the read's edge would hand them back as if
+            // they had never been shown, and the panel ids in them would be applied a
+            // second time.
+            let mut cursor = page.resume_after(kept_from);
+            let mut records = records;
+            if records.is_empty() {
+                // Fewer records than messages asked for: the window is the whole page,
+                // so it also ends where the page did.
+                records = page
+                    .records
+                    .iter()
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect();
+                cursor = page.next;
             }
-            out
+            Replayed { records, cursor }
         }
         Err(e) => {
             eprintln!("[agent] memory replay failed: {e}");
-            Vec::new()
+            Replayed::empty()
+        }
+    }
+}
+
+/// What a replay read: the window's records, and where in the log it ends.
+///
+/// The cursor travels with the records because the two have to come from the same
+/// read. `replay_records` trims by *messages* — the newest `n` messages plus the
+/// panel records interleaved among them — and that trimmed range is not something
+/// a record count can name, so only the read that found it knows where it ended.
+/// Asking the log a second time for "where the last n records are" would land
+/// somewhere else entirely.
+struct Replayed {
+    /// The window, oldest → newest.
+    records: Vec<Value>,
+    /// Where to read records older than the window.
+    cursor: agent::memory::Cursor,
+}
+
+impl Replayed {
+    /// Nothing to show, and nothing older to page in.
+    ///
+    /// The cursor says so rather than pointing at the end of the log: `Cursor::end`
+    /// is the *start* of a backward walk, and from there a pager with somewhere to
+    /// read would walk the whole file to find a window that does not exist.
+    fn empty() -> Self {
+        Replayed {
+            records: Vec::new(),
+            cursor: agent::memory::Cursor { at: 0, take: 0 },
         }
     }
 }
@@ -1396,6 +1463,7 @@ async fn run<W: Write>(
     vm: &mlua::Lua,
     catalog: &mut Catalog,
     initial_history: Vec<Value>,
+    pager: &mut paging::Pager,
 ) -> Result<()> {
     // The starting conversation: whatever earlier sessions archived and this
     // startup replayed (see `main`), else empty.
@@ -1436,6 +1504,8 @@ async fn run<W: Write>(
     // conversation history, so without this a resumed session shows the
     // conclusions and none of the thinking that reached them.
     let mut reasoning_log: Vec<Value> = Vec::new();
+    // The pager is armed by the caller, against the same window this history came
+    // from; see `paging::Pager::resume_after`.
     let mut round_sink: Option<agent::panels::PanelSink> = None;
     // The highest panel id handed out so far, carried across tool rounds: see
     // `PanelSink::continuing_from` for why an id has to outlive its sink.
@@ -2150,6 +2220,10 @@ async fn run<W: Write>(
 
         terminal.autoresize()?;
         terminal.draw(|frame| app.render(frame))?;
+        // After the draw: that is when the panel knows where the view actually is,
+        // since `at_loaded_top` reads the scroll offset the render just resolved.
+        // Paging before it would ask on the previous frame's position.
+        paging::page_if_at_top(app, pager);
         // Force the frame to the terminal fd (belt and braces on top of
         // ratatui's own backend flush).
         stderr().flush()?;
@@ -2172,6 +2246,28 @@ mod tests {
         terminal
             .draw(|frame| panel.render(frame, ratatui::layout::Rect::new(0, 0, w, h)))
             .expect("draw");
+        let buf = terminal.backend().buffer();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The whole app as a user would see it.
+    ///
+    /// Unlike [`panel_screen`] this goes through [`App::render`], which is what
+    /// gives the transcript the area it measures and wraps at — so a test that
+    /// needs the app to know its own width has to read it this way. Asserting
+    /// through `panel_screen` alone would leave `panel_area` unset and every
+    /// width-dependent path untested.
+    fn app_screen(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
         let buf = terminal.backend().buffer();
         (0..h)
             .map(|y| {
@@ -2345,7 +2441,7 @@ mod tests {
             }
             mem.flush().unwrap();
         }
-        let (_, replayed) = cold_start(&path, 2);
+        let replayed = replayed_request_history(&cold_start(&path, 2).records);
         assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[0]["content"], "a1", "oldest-to-newest of the tail");
         assert_eq!(replayed[0]["role"], "assistant");
@@ -2653,7 +2749,9 @@ mod tests {
         // Through `cold_start` — the exact call `main` makes. Reading the records
         // and splitting them by hand here is what let the startup half go on using
         // the messages-only path while every test below it stayed green.
-        let (records, sent) = cold_start(&path, 20);
+        let resumed = cold_start(&path, 20);
+        let records = resumed.records;
+        let sent = replayed_request_history(&records);
         let mut app = App::default();
         replay_transcript(&mut app, &records);
 
@@ -2803,7 +2901,9 @@ mod tests {
             mem.flush().expect("flush");
         }
 
-        let (records, sent) = cold_start(&path, 20);
+        let resumed = cold_start(&path, 20);
+        let records = resumed.records;
+        let sent = replayed_request_history(&records);
         let mut app = App::default();
         replay_transcript(&mut app, &records);
 
@@ -2850,6 +2950,216 @@ mod tests {
                 .contains("per keystroke"),
             "the thinking is not in the request at all; the answer's own words are, \
              and only those: {sent:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scrolling past the loaded window brings older history in — in order, once,
+    /// without moving what the user was reading, and as panels that still belong to
+    /// their own tools.
+    ///
+    /// Each of those is a separate thing that can be got wrong in a way a row count
+    /// cannot see, and each has bitten:
+    ///
+    /// * **The boundary.** The window is trimmed by *messages* (the newest `n`, plus
+    ///   the panel records interleaved among them), and the log is addressed by
+    ///   *block*. Getting that wrong shows a record twice or skips one, and either
+    ///   looks like a rendering fault rather than a paging one.
+    /// * **The view.** Rows are counted from the top, so history arriving at the top
+    ///   pushes the content down. Without the matching scroll shift the view jumps
+    ///   away from the line being read.
+    /// * **The panel ids.** They are per tool round and continue across rounds, so
+    ///   every chunk of a long session has a panel numbered 1. Merged unchecked, the
+    ///   older chunk's `Create` retitles the newer chunk's box and its output appends
+    ///   into it — and every click on either box then opens the wrong thing.
+    ///
+    /// Zero-padded numbers so none is a prefix of another (`message 1` is a substring
+    /// of `message 17`, which would make the "does not repeat" check count every
+    /// later number), and a small block target so the trim boundary lands *inside* a
+    /// block — at the 1 MiB default this log is one block, the window already covers
+    /// it, and there is correctly nothing older to page in.
+    #[test]
+    fn a_page_arrives_when_the_view_reaches_the_top_of_what_is_loaded() {
+        let path = unique_log("paging");
+        let _ = std::fs::remove_file(&path);
+        // Two tool panels, one inside the window and one *older* than it, both with
+        // id 1 — which is what a real session has. Each carries output that is
+        // recognisably its own, so a merge reads as one box wearing the other's name.
+        let panel = |id: u64, title: &str, text: &str| {
+            vec![
+                agent::panels::panel_record(&agent::panels::PanelOp::Create {
+                    id,
+                    title: title.into(),
+                    boxed: true,
+                    conceal_box: false,
+                }),
+                agent::panels::panel_record(&agent::panels::PanelOp::Append {
+                    id,
+                    text: format!("{text}\n"),
+                }),
+            ]
+        };
+        let mut written = Vec::new();
+        for i in 0..24 {
+            match i {
+                12 => written.extend(panel(1, "old-tool", "old-output")),
+                20 => written.extend(panel(1, "new-tool", "new-output")),
+                _ => written.push(json!({
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("message {i:02}"),
+                })),
+            }
+        }
+        {
+            let mut mem = agent::memory::Memory::with_options(
+                &path,
+                agent::memory::Options {
+                    // Big enough that a block holds a dozen records, so the window's
+                    // trim boundary lands mid-block and the resume cursor has to
+                    // carry a skip count as well as an offset.
+                    block_target: 256,
+                    working_set: 1,
+                },
+            )
+            .expect("log opens");
+            for line in &written {
+                mem.append(&serde_json::to_string(line).unwrap())
+                    .expect("append");
+            }
+            mem.flush().expect("flush");
+        }
+
+        const WINDOW: usize = 6;
+        let replayed = cold_start(&path, WINDOW);
+        let mut app = App::default();
+        replay_transcript(&mut app, &replayed.records);
+        // Armed from the same read, at the same boundary.
+        let mut pager = paging::Pager::new();
+        pager.resume_at(&path, replayed.cursor);
+
+        // Rendered first, and through the app: the top of the view is only a
+        // position once a draw has resolved the offset, and the width a page wraps to
+        // is the area the panel was last given. A test that jumped straight to the
+        // top would be asking for a page at no width at all.
+        //
+        // Narrow, so the transcript is taller than the screen and the scroll offset
+        // has somewhere to be wrong. At a height that fits the whole window, every
+        // screen shows every message and the "the view did not move" assertion below
+        // passes whether or not the offset was adjusted at all.
+        let before = app_screen(&mut app, 80, 12);
+        assert!(
+            before.contains("new-tool [+]") && !before.contains("old-tool"),
+            "the window holds the newest records, panel and all, and none of the \
+             older chunk:\n{before}"
+        );
+
+        // Sitting at the bottom asking repeatedly must not page: the gesture that
+        // means "more history" is arriving at the top, not being idle there.
+        let mut idle = paging::Pager::new();
+        idle.resume_at(&path, replayed.cursor);
+        assert_eq!(
+            idle.page(&mut app),
+            0,
+            "an un-scrolled view reads no history"
+        );
+
+        app.panel.jump_top();
+        let rows = pager.page(&mut app);
+        assert!(rows > 0, "a page arrived: {rows} rows");
+
+        // Still showing what was on screen. Compared with the scrollbar lane dropped:
+        // the thumb moves because the content grew above it, and that is correct —
+        // what must not change is the *text* under the reader.
+        let body = |s: &str| -> String {
+            s.lines()
+                .map(|l| {
+                    let mut chars = l.chars();
+                    chars.next_back();
+                    chars.as_str().to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            body(&app_screen(&mut app, 80, 12)),
+            body(&before),
+            "the page went in *above* the view, so the same line is still under the \
+             same row"
+        );
+
+        // Paged all the way back. Guarded, because an exhausted cursor that never
+        // says so shows up here as a test that never finishes rather than as a
+        // failure.
+        let mut guard = 0;
+        loop {
+            app.panel.jump_top();
+            if pager.page(&mut app) == 0 {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 32, "the pager is making progress");
+        }
+
+        // Now the content, read off one tall screen rather than a walk down
+        // overlapping ones: consecutive screens share rows, so a count of "how many
+        // times does this message appear" across them counts a message once per
+        // screen it stayed on screen, which says nothing about the transcript. One
+        // screen tall enough to hold the lot has no overlap and no such ambiguity.
+        app.panel.jump_top();
+        let all = app_screen(&mut app, 80, 40);
+        for i in 0..24 {
+            if matches!(i, 12 | 20) {
+                continue; // those two are the panels, not messages
+            }
+            let needle = format!("message {i:02}");
+            assert_eq!(
+                all.matches(&needle).count(),
+                1,
+                "`{needle}` appears {} times — the pager's boundary and the \
+                 window's do not agree:\n{all}",
+                all.matches(&needle).count()
+            );
+        }
+        // Folded, exactly as the panels reconstructed at startup are folded, and
+        // titled for their own tool — which is also how the two chunks' panels are
+        // shown not to have merged.
+        for title in ["old-tool", "new-tool"] {
+            assert!(
+                all.contains(&format!("{title} [+]")),
+                "`{title}` is on screen, folded and titled for its own tool, so the \
+                 two chunks' panels did not merge into one:\n{all}"
+            );
+        }
+        assert!(
+            !all.contains("old-output") && !all.contains("new-output"),
+            "and folded, so neither one's output fills the view:\n{all}"
+        );
+
+        // Clicking the window's panel still opens the window's panel. This is where
+        // the two index maps earn their keep: a panel id is only meaningful together
+        // with the message index it points at, and prepending history shifts every
+        // message index there is. Resolve the wrong message and the box opens with
+        // somebody else's output — or, landing on a plain message, not at all.
+        let row = all
+            .lines()
+            .position(|l| l.contains("new-tool"))
+            .expect("the window's panel is on screen") as u16;
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 6,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(
+            matches!(app.handle_mouse(click), Click::Toggled),
+            "a click on the window's panel toggles a panel"
+        );
+        let opened = app_screen(&mut app, 80, 40);
+        assert!(
+            opened.contains("new-output") && !opened.contains("old-output"),
+            "and opens the window's own output, not the older chunk's — the click \
+             resolved the right panel:\n{opened}"
         );
 
         let _ = std::fs::remove_file(&path);
@@ -2921,8 +3231,9 @@ mod tests {
             }
             mem.flush().unwrap();
         }
-        let (_, replayed) = cold_start(&path, 10);
-        let tool = replayed
+        let resumed = cold_start(&path, 10);
+        let request = replayed_request_history(&resumed.records);
+        let tool = request
             .iter()
             .find(|m| m["role"] == "tool")
             .expect("the result is still a message");
@@ -2944,7 +3255,7 @@ mod tests {
             content.len()
         );
         // The user turn is untouched: only results are rebuilt.
-        assert_eq!(replayed[0]["content"], "read the file");
+        assert_eq!(request[0]["content"], "read the file");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -3048,7 +3359,7 @@ mod tests {
     fn replay_history_returns_empty_for_a_missing_or_empty_log() {
         let gone = unique_log("replay-gone");
         assert!(
-            cold_start(&gone, 5).0.is_empty(),
+            cold_start(&gone, 5).records.is_empty(),
             "a missing log replays nothing"
         );
         let path = unique_log("replay-empty");
@@ -3056,7 +3367,7 @@ mod tests {
             let _mem = agent::memory::Memory::open(&path).unwrap(); // header only
         }
         assert!(
-            cold_start(&path, 5).0.is_empty(),
+            cold_start(&path, 5).records.is_empty(),
             "an empty log replays nothing"
         );
         let _ = std::fs::remove_file(&path);

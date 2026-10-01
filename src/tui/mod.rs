@@ -27,7 +27,7 @@ mod panel;
 // module's geometry and rendering are its own business.
 pub use highlight::{MarkdownHighlighter, Segment};
 pub use panel::Click;
-pub use panel::{BorderedRenderer, Message, Role, TurnPanel};
+pub use panel::{BorderedRenderer, HistoryItem, Message, Role, TurnPanel};
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -460,6 +460,16 @@ impl App {
     /// messages so their highlight segments are computed with it.
     pub fn set_highlight(&mut self, highlighter: Option<MarkdownHighlighter>) {
         self.panel.set_highlighter(highlighter);
+    }
+
+    /// The transcript's current width in content cells — what the panel measures and
+    /// wraps at.
+    ///
+    /// Available only after a [`Self::render`]: it is the area the panel was last
+    /// given, not a guess from the terminal, because the transcript shares the
+    /// screen with the input box and the status bar.
+    pub fn panel_content_w(&self) -> Option<usize> {
+        self.panel_area.map(|a| a.width.saturating_sub(1) as usize) // the scrollbar lane
     }
 
     /// Toggle markup concealment (rendering hides `#`/`**`/backtick markers;

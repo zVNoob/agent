@@ -576,6 +576,18 @@ fn pane_of(messages: &mut [Message], idx: usize, pane: usize) -> Option<&mut Pan
     messages[idx].panes.as_mut()?.get_mut(pi)
 }
 
+/// One replayed transcript record: a panel op, or a message.
+///
+/// The log interleaves them, and so does the transcript they rebuild into, so a
+/// paged-in chunk has to keep them in one ordered list rather than splitting them
+/// into "the panels" and "the messages" — the order is the history.
+pub enum HistoryItem {
+    /// A panel op, replayed against this transcript.
+    Op(crate::panels::PanelOp),
+    /// A plain conversation message.
+    Message(Role, String),
+}
+
 impl TurnPanel {
     /// Install (or clear) the markdown highlighter; call before pushing
     /// messages so their segments are computed with it.
@@ -589,6 +601,100 @@ impl TurnPanel {
     /// highlighter is `&mut self` — so the two steps are sequenced here instead.
     pub fn highlighter_mut(&mut self) -> Option<&mut MarkdownHighlighter> {
         self.highlighter.as_mut()
+    }
+
+    /// Whether the view is sitting on the oldest row it has, and there is more of the
+    /// log behind it.
+    ///
+    /// The condition is `!follow` as well as `scroll == 0`, and the difference
+    /// matters: when the whole transcript fits on screen the scroll offset is 0
+    /// *because there is nothing to scroll*, `follow` is still on, and asking for
+    /// more history there would page the log in for a user who never scrolled. Only
+    /// a deliberate scroll to the top is a request for more.
+    pub fn at_loaded_top(&self) -> bool {
+        !self.follow && self.scroll == 0
+    }
+
+    /// Whether the view is pinned to the newest content and will stay there.
+    ///
+    /// The companion to [`TurnPanel::at_loaded_top`]: that asks whether the user has
+    /// scrolled all the way back, this asks whether they are back at the live edge.
+    pub fn following(&self) -> bool {
+        self.follow
+    }
+
+    /// Put a chunk of older history in front of the transcript — records read back
+    /// from the log as the user scrolls towards them — and keep the view on what they
+    /// were looking at.
+    ///
+    /// Ops materialise messages by *appending*, and history has to go at the front,
+    /// so the chunk is built in a scratch transcript first and moved. That scratch
+    /// borrows this panel's grammars: a paged-in panel that rendered plain while the
+    /// ones already loaded are highlighted would make the transcript change
+    /// appearance halfway up the scroll, which is worse than either consistent look.
+    ///
+    /// Four things have to move together or the transcript silently corrupts:
+    ///
+    /// * **The panel index map.** `panels` maps a panel id to the index of its
+    ///   message, so every existing entry shifts down by the chunk's length, or a
+    ///   later op would address the wrong message.
+    /// * **The scroll offset.** Rows are counted from the top, so new rows at the top
+    ///   push the content down. Without the shift the view jumps — the worst outcome
+    ///   for someone reading, who would find the text they were on replaced by
+    ///   whatever the scroll landed on.
+    /// * **The row cache**, via `ensure_measured`: a paged-in message arrives with no
+    ///   measured height, and every row count from here on is a sum over them.
+    /// * **The measure width**, which `ensure_measured` re-derives when it changes —
+    ///   so a prepend across a resize re-measures everything rather than leaving two
+    ///   widths' worth of row counts mixed together.
+    ///
+    /// Returns the rows added, which is what the offset moved by.
+    pub fn prepend_history(&mut self, items: Vec<HistoryItem>, content_w: usize) -> usize {
+        if items.is_empty() {
+            return 0;
+        }
+        // `ChatRenderer` is not `Clone` (it owns a config), so it moves across and
+        // back like the highlighter. The scratch needs both: a panel that rendered
+        // with conceal off, or plain, would not match its neighbours.
+        let mut older = TurnPanel {
+            renderer: std::mem::take(&mut self.renderer),
+            highlighter: std::mem::take(&mut self.highlighter),
+            ..TurnPanel::default()
+        };
+        for item in items {
+            match item {
+                HistoryItem::Op(op) => older.apply_op(op),
+                HistoryItem::Message(role, text) => older.push(role, text),
+            }
+        }
+        self.highlighter = std::mem::take(&mut older.highlighter);
+        self.renderer = std::mem::take(&mut older.renderer);
+
+        let msgs = std::mem::take(&mut older.messages);
+        let added = msgs.len();
+        // Existing panels point at indices that just moved down by `added`…
+        for slot in self.panels.values_mut() {
+            if let Some(i) = slot.msg_index.as_mut() {
+                *i += added;
+            }
+        }
+        // …and the chunk's own are already indexed from zero, which is exactly right
+        // once it sits at the front.
+        self.panels.extend(older.panels);
+        self.messages.splice(0..0, msgs);
+        // Folded, exactly as a cold-start replay folds what it reconstructs: paged-in
+        // history is history, and a session with a tool per turn would otherwise bury
+        // the conversation in screens of output from a scroll away.
+        self.collapse_range(0..added);
+        self.ensure_measured(content_w);
+        let rows: usize = self.messages[..added].iter().map(|m| m.rows).sum();
+        // Only at the top, which is where paging is triggered: the new content is
+        // *above* what the user was looking at, so the view follows it up by exactly
+        // its height and the same line stays under the same row.
+        if self.scroll == 0 {
+            self.scroll += rows;
+        }
+        rows
     }
 
     /// Collapse everything in the transcript that a click can fold.
@@ -606,7 +712,19 @@ impl TurnPanel {
     /// A no-op on a message with nothing to fold, and idempotent, so calling it on
     /// an already-collapsed transcript changes nothing.
     pub fn collapse_all_boxes(&mut self) {
-        for msg in &mut self.messages {
+        let len = self.messages.len();
+        self.collapse_range(0..len);
+    }
+
+    /// Collapse the collapsible messages in `range`, leaving the rest alone.
+    ///
+    /// Scoped rather than whole-transcript because paging adds history to a
+    /// transcript the user has been reading: folding the whole thing would close
+    /// panels they had opened, and a transcript that rearranges itself under someone
+    /// mid-scroll is worse than one that is uniformly open.
+    pub fn collapse_range(&mut self, range: std::ops::Range<usize>) {
+        let range = range.start.min(self.messages.len())..range.end.min(self.messages.len());
+        for msg in &mut self.messages[range] {
             if is_collapsible(msg) && !msg.collapsed {
                 msg.collapsed = true;
                 msg.dirty = true;
