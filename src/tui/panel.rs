@@ -48,6 +48,44 @@ use crate::panels::{PanelOp, Remember};
 /// message's first row. Continuation rows are indented by the same amount.
 const TAG_COLS: usize = 10;
 
+/// Replace control characters with spaces, so every cell the layout counts is a
+/// cell the renderer draws.
+///
+/// **The invariant this protects.** The layout measures content in `chars()`
+/// and pads a row out to its column; ratatui **drops** control characters when it
+/// draws (`filter(|symbol| !symbol.contains(char::is_control))`). A tab is one
+/// char to the first and *nothing* to the second, so every one on a row is a cell
+/// the padding promised and the frame never filled. The box's right border then
+/// lands that many cells early — and the row spills past it, so the border is
+/// missing and the panel reads as ragged rather than boxed.
+///
+/// A tab-indented file in an `apply_patch` before/after panel did exactly this:
+/// the right border landed in **15 different columns**, one per distinct tab count
+/// on a row. Any control character does it — `\t`, a `\r` from a CRLF file, an
+/// escape byte out of command output.
+///
+/// **Why a space and not a deletion.** Byte offsets into panel text cross this
+/// boundary: `fs.apply_patch` computes `line_bytes` on the text it read and
+/// passes those offsets to `p:highlight` (`lua/fs.lua`), so the text stored here
+/// must be byte-for-byte the same length as the text the offsets were measured
+/// against. One space per control character keeps every later offset valid,
+/// while dropping the character would shift all of them. A tab therefore shows
+/// as one space rather than a tab stop — the one thing lost, and the price of
+/// offsets that still mean what the caller meant.
+///
+/// `\n` is left alone: it is structure, not content, and every wrapper here
+/// splits on it.
+fn renderable(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(
+        text.chars()
+            .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+            .collect(),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     User,
@@ -408,7 +446,7 @@ impl TurnPanel {
                     return;
                 };
                 let msg = &mut self.messages[idx];
-                msg.text.push_str(&text);
+                msg.text.push_str(&renderable(&text));
                 Self::rehighlight(&mut self.highlighter, msg);
             }
             PanelOp::Set { id, text } => {
@@ -416,7 +454,7 @@ impl TurnPanel {
                     return;
                 };
                 let msg = &mut self.messages[idx];
-                msg.text = text;
+                msg.text = renderable(&text).into_owned();
                 Self::rehighlight(&mut self.highlighter, msg);
             }
             PanelOp::Highlight {
@@ -488,7 +526,7 @@ impl TurnPanel {
                 let Some(p) = pane_of(&mut self.messages, idx, pane) else {
                     return;
                 };
-                p.text = text;
+                p.text = renderable(&text).into_owned();
                 Self::rehighlight_pane(&mut self.highlighter, p);
                 self.messages[idx].dirty = true;
             }
@@ -608,7 +646,7 @@ impl TurnPanel {
                 self.messages.last_mut().expect("just pushed")
             }
         };
-        msg.text.push_str(text);
+        msg.text.push_str(&renderable(text));
         Self::rehighlight(&mut self.highlighter, msg);
     }
 
@@ -629,7 +667,7 @@ impl TurnPanel {
                 self.messages.last_mut().expect("just pushed")
             }
         };
-        msg.text.push_str(text);
+        msg.text.push_str(&renderable(text));
         Self::rehighlight(&mut self.highlighter, msg);
     }
 
@@ -740,6 +778,11 @@ impl TurnPanel {
     }
 
     fn push_inner(&mut self, role: Role, text: String, boxed: Option<String>, conceal_box: bool) {
+        // Sanitized *before* the highlight runs, not after: the grammar sees
+        // the same bytes the message will hold, so its segments (byte ranges)
+        // stay aligned with the stored text. Doing it afterwards would leave
+        // every offset measured against text that no longer exists.
+        let text = renderable(&text).into_owned();
         let (segs, conceal) = match &mut self.highlighter {
             Some(hl) => {
                 let h = hl.highlight_message_with_conceal(&text);
@@ -1744,7 +1787,174 @@ fn clip_segments(text: &str, segs: &[Segment], bs: usize, be: usize) -> Vec<Span
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::panels::ALWAYS_LABEL;
+    use crate::panels::{ALWAYS_LABEL, PaneInit};
+
+    /// Every row of a boxed panel ends on the box's right border, so the frame reads
+    /// as a box instead of a ragged edge.
+    ///
+    /// Drawn into a real buffer and checked there, not on the rows the layout
+    /// produced, because the two can disagree: the layout measures content in
+    /// `chars()`, and ratatui **drops control characters** when it draws
+    /// (`filter(|symbol| !symbol.contains(char::is_control))`). A tab is one char
+    /// to the first and *nothing* to the second, so each one on a row is a cell
+    /// the padding promised and the frame never filled — the border lands that
+    /// many cells early and the row spills past it.
+    ///
+    /// Not hypothetical: a tab-indented Lua file in an `apply_patch` before/after
+    /// panel put the right border in **15 different columns**, one per distinct
+    /// tab count on a row.
+    ///
+    /// Driven through [`TurnPanel`] and [`PanelOp`] rather than by building a
+    /// `Message` by hand, because the ops are where text is sanitized
+    /// ([`renderable`]) and a hand-built message skips that — the test would
+    /// then be asserting about a path nothing uses.
+    fn assert_box_edge_holds(label: &str, body: &str, content_w: usize) {
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Split {
+            id: 1,
+            title: "apply_patch: config.lua".into(),
+            panes: vec![
+                PaneInit {
+                    caption: "before".into(),
+                    lang: None,
+                },
+                PaneInit {
+                    caption: "after".into(),
+                    lang: None,
+                },
+            ],
+        });
+        for pane in [1, 2] {
+            panel.apply_op(PanelOp::SetPane {
+                id: 1,
+                pane,
+                text: body.into(),
+            });
+        }
+        let lines = BorderedRenderer::lines(&panel.messages, content_w, true);
+        let area = ratatui::layout::Rect::new(0, 0, content_w as u16, lines.len() as u16);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        for (y, row) in lines.iter().enumerate() {
+            ratatui::buffer::Buffer::set_line(&mut buf, 0, y as u16, row, content_w as u16);
+        }
+        // Skip the two border rows; the body rows are the ones that must agree.
+        let wrong: Vec<usize> = (1..lines.len().saturating_sub(1))
+            .filter(|&y| buf[(content_w as u16 - 1, y as u16)].symbol() != "│")
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "{label} at {content_w} cells: {} of {} body rows do not end on the border \
+             (rows {wrong:?}); a control character is counted as a cell by the layout \
+             and dropped by the renderer, so the frame overflows",
+            wrong.len(),
+            lines.len() - 2,
+        );
+    }
+
+    /// A tab-indented file — what every `apply_patch`, `write_file` and `fs.read`
+    /// panel shows for Lua, Python, Go, C or Make — keeps its border.
+    #[test]
+    fn a_tab_indented_body_keeps_the_box_border_in_one_column() {
+        let body = "\t\tlocal x = 1\n\t\t\t\treturn x\n\t\tif x then\n\t\tend\nplain";
+        for content_w in [80usize, 100, 120, 160, 200] {
+            assert_box_edge_holds("tab-indented", body, content_w);
+        }
+    }
+
+    /// The same for the other control characters ratatui drops. A CRLF file is
+    /// the realistic one; the escape byte stands in for anything else that
+    /// arrives in tool output.
+    #[test]
+    fn other_control_characters_keep_the_box_border_in_one_column() {
+        let plain = "local x = 1\nreturn x";
+        for content_w in [80usize, 120, 160] {
+            assert_box_edge_holds("CRLF", &plain.replace('\n', "\r\n"), content_w);
+            assert_box_edge_holds("stray ESC", &plain.replace('\n', "\x1b\n"), content_w);
+            assert_box_edge_holds("BEL", &plain.replace('\n', "\u{7}\n"), content_w);
+        }
+    }
+
+    /// A single trailing tab is the smallest case that shows it: one dropped cell
+    /// on one row is enough to break that row's border, so a fix that only
+    /// handled runs of tabs would leave this behind.
+    #[test]
+    fn one_lone_tab_is_enough_to_break_the_border() {
+        assert_box_edge_holds("one tab", "local x = 1\n\treturn x", 120);
+    }
+
+    /// The sanitiser keeps the text's **byte length**, which is not cosmetic: it
+    /// is the whole reason it can live at this boundary. `fs.apply_patch` reads a
+    /// file, computes `line_bytes` against those exact bytes, and passes the
+    /// offsets to `p:highlight` — so a control character replaced by *nothing*
+    /// would shift every later offset and tint the wrong lines.
+    #[test]
+    fn sanitising_keeps_byte_offsets_meaning_the_same_thing() {
+        // A leading tab, a `\r` from a CRLF file, and an escape byte: the three
+        // that reach a panel in practice.
+        for raw in ["\tlocal x", "local x\r", "\x1b[0m", "a\tb\rc\x1b"] {
+            let clean = renderable(raw);
+            assert_eq!(
+                clean.len(),
+                raw.len(),
+                "byte length must survive, or every offset past it shifts: {raw:?}"
+            );
+            assert!(
+                !clean.chars().any(|c| c.is_control() && c != '\n'),
+                "no control character may reach the renderer: {raw:?}"
+            );
+        }
+        // A tab becomes a space, not a deletion — one cell, as the layout expects.
+        assert_eq!(renderable("\tx"), " x");
+        // Newline is structure, not content: every wrapper splits on it.
+        assert_eq!(renderable("a\nb"), "a\nb");
+        // Nothing to do is a no-op, and keeps the borrow.
+        assert!(matches!(
+            renderable("plain text"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// The offsets `apply_patch` passes still land on the lines it meant, which
+    /// is the property the byte-length rule exists to protect. Pane 1 holds a
+    /// tab-indented file and the tint is asked for a line *after* the tabs.
+    #[test]
+    fn a_highlight_after_tabs_lands_on_the_line_it_named() {
+        let mut panel = TurnPanel::default();
+        panel.apply_op(PanelOp::Split {
+            id: 1,
+            title: "apply_patch: config.lua".into(),
+            panes: vec![PaneInit {
+                caption: "before".into(),
+                lang: None,
+            }],
+        });
+        // Two tab-indented lines, then a third that is what gets tinted.
+        let body = "\t\tfirst\n\t\t\tsecond\n\t\tthird";
+        panel.apply_op(PanelOp::SetPane {
+            id: 1,
+            pane: 1,
+            text: body.into(),
+        });
+        let third = body.rfind("third").expect("third line");
+        panel.apply_op(PanelOp::HighlightPane {
+            id: 1,
+            pane: 1,
+            start: third,
+            end: third + "third".len(),
+            style: "bold.green".into(),
+        });
+
+        let pane = &panel.messages[0].panes.as_ref().expect("split")[0];
+        let seg = pane.user_segs.last().expect("the region was recorded");
+        let marked = &pane.text[seg.start..seg.end];
+        assert_eq!(
+            marked,
+            "third",
+            "the region still names the line the caller measured, even though the \
+             tabs ahead of it were sanitised: got {marked:?} at {:?}",
+            seg.start..seg.end
+        );
+    }
 
     #[test]
     fn content_height_counts_wrapped_rows() {
