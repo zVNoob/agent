@@ -442,6 +442,175 @@ mod tests {
         );
     }
 
+    /// A pane whose grammar arrives late must light up when it does.
+    ///
+    /// This is the shape `write_file` and `apply_patch` actually produce. Both
+    /// declare the file's language in the `PaneInit` — the panel is created with
+    /// its language, before it has any text — and every language except the three
+    /// preloaded ones (`markdown_inline`, `bash`, `json`) is absent at that
+    /// moment. `highlight_lang` records the language as wanted and returns no
+    /// segments, so the pane renders plain, and the loop fetches the grammar
+    /// afterwards.
+    ///
+    /// The bug: `rehighlight_all` re-highlighted whole *messages* and never the
+    /// *panes*, so that fetch improved nothing a pane could see. A Rust, Go or
+    /// Python patch panel — which is most files — stayed unhighlighted for the
+    /// rest of the session however many grammars arrived, while the message
+    /// quoting the same code lit up.
+    ///
+    /// It went unnoticed for two reasons, both worth recording: the existing pane
+    /// test used `json`, which *is* preloaded and therefore needed no second
+    /// pass; and it set the language with `SetPaneLang` — after the text, on a
+    /// panel that already had a grammar — rather than through the `PaneInit` the
+    /// tools emit. Neither assertion touched the case that matters.
+    ///
+    /// Needs the `lua` grammar cached (any machine that has run the agent has it)
+    /// and skips rather than failing without it, like its neighbours.
+    #[test]
+    fn a_split_panel_lights_up_when_its_grammar_arrives() {
+        // `LoadedGrammar` holds a mapped `Library` and is not `Clone`, so the
+        // catalog that owns it stays in scope for the whole test.
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("skipping: no runtime");
+                return;
+            }
+        };
+        let mut catalog = Catalog::new();
+        // The app's own three, and *not* lua — which is the whole point of the test.
+        // Order matters as well as content: `from_catalog` borrows the catalog
+        // immutably while `ensure` mutably, and the grammar handle borrows it for as
+        // long as it is held, so the highlighter has to be built before lua is taken.
+        let preloaded = runtime.block_on(async {
+            catalog
+                .ensure_many(&["markdown", "markdown_inline", "json"])
+                .await
+                .iter()
+                .all(|(_, r)| r.is_ok())
+        });
+        if !preloaded {
+            eprintln!("skipping: markdown/json grammars not cached on this machine");
+            return;
+        }
+        let hl = match MarkdownHighlighter::from_catalog(&catalog) {
+            Some(h) => h,
+            None => {
+                eprintln!("skipping: no highlighter");
+                return;
+            }
+        };
+        let lua = match runtime.block_on(catalog.ensure("lua")) {
+            Ok(g) => g,
+            Err(_) => {
+                eprintln!("skipping: the lua grammar is not cached on this machine");
+                return;
+            }
+        };
+
+        let mut panel = TurnPanel::default();
+        panel.set_highlighter(Some(hl));
+        panel.apply_op(PanelOp::Split {
+            id: 1,
+            title: "apply_patch: /srv/app/init.lua".into(),
+            panes: vec![
+                PaneInit {
+                    caption: "before".into(),
+                    lang: Some("lua".into()),
+                },
+                PaneInit {
+                    caption: "after".into(),
+                    lang: Some("lua".into()),
+                },
+            ],
+        });
+        panel.apply_op(PanelOp::SetPane {
+            id: 1,
+            pane: 1,
+            text: "local n = 1\n".into(),
+        });
+        panel.apply_op(PanelOp::SetPane {
+            id: 1,
+            pane: 2,
+            text: "local n = 2\n".into(),
+        });
+
+        // Before: nothing to style with, so both panes are plain — correct for an
+        // absent grammar, and the reason this is worth a test at all.
+        {
+            let panes = panel.messages[0].panes.as_ref().expect("split panes");
+            assert!(
+                panes.iter().all(|p| p.segs.is_empty()),
+                "an absent grammar styles nothing: {:?}",
+                panes.iter().map(|p| p.segs.len()).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            panel.messages[0].text, "",
+            "and a split panel carries no whole-message text, so the message pass \\
+         has nothing to work on either"
+        );
+
+        // The fetch was already being requested, which is exactly why this bug
+        // looked like a mystery: the panel declares `lua`, the highlighter finds
+        // no grammar for it, records it as wanted, and the loop dutifully goes and
+        // fetches it. The status bar even says so. Only the *applying* was
+        // missing, so every symptom pointed at the fetch.
+        {
+            let wanted = panel
+                .highlighter_mut()
+                .expect("a highlighter")
+                .take_wanted();
+            assert!(
+                wanted.contains(&"lua".to_string()),
+                "the pane's declared language was queued for fetching: {wanted:?}"
+            );
+        }
+
+        // The grammar arrives — off the loop's reactor task, exactly as it does
+        // in the app.
+        let added = panel
+            .highlighter_mut()
+            .map(|hl| hl.add_language("lua", lua))
+            .unwrap_or(false);
+        assert!(added, "the lua grammar was added to the highlighter");
+
+        // …and now the panes have to change, which is the whole point.
+        let changed = panel.rehighlight_all();
+        let panes = panel.messages[0].panes.as_ref().expect("split panes");
+        assert!(
+            panes.iter().all(|p| !p.segs.is_empty()),
+            "both panes highlighted once the grammar arrived: {:?}",
+            panes.iter().map(|p| p.segs.len()).collect::<Vec<_>>()
+        );
+        assert!(
+            changed >= 1,
+            "and the panel counted as changed, so the caller redraws: a grammar \\
+         that improves nothing on screen must not cost a redraw, and one that \\
+         does must be counted"
+        );
+
+        // A second pass has nothing left to do, so a settled transcript does not
+        // re-render on every grammar that lands afterwards.
+        assert_eq!(
+            panel.rehighlight_all(),
+            0,
+            "idempotent: once highlighted, a further grammar changes nothing"
+        );
+    }
+
+    /// A pane declares its language, and the declared grammar styles its text —
+    /// with the language set *after* the text, which is `SetPaneLang`'s shape.
+    ///
+    /// Narrower than it looks, and the reason the bug it missed went unnoticed:
+    /// it uses `json`, which is one of the three preloaded grammars, so the
+    /// second pass it would have needed never happens. The tools emit the
+    /// opposite order — `PaneInit` with a language, then the text — for a
+    /// language that is usually *not* preloaded. See
+    /// `a_split_panel_lights_up_when_its_grammar_arrives`.
     #[test]
     fn split_panel_pane_lang_highlights_with_the_declared_grammar() {
         let Some(CachedHl { _catalog, hl }) = cached_highlighter() else {

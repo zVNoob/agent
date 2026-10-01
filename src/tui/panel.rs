@@ -704,8 +704,34 @@ impl TurnPanel {
         let mut changed = 0;
         for msg in &mut self.messages {
             let before = (msg.segs.clone(), msg.conceal.clone());
+            let panes_before = msg
+                .panes
+                .as_ref()
+                .map(|p| p.iter().map(|pane| pane.segs.clone()).collect::<Vec<_>>());
             Self::rehighlight(&mut self.highlighter, msg);
-            if before.0 != msg.segs || before.1 != msg.conceal {
+            // **Panes too.** A `write_file` or `apply_patch` panel declares the
+            // file's language when the panel is created, and every language except
+            // the three preloaded ones (`markdown_inline`, `bash`, `json`) is
+            // absent at that moment: `highlight_lang` records the language as
+            // wanted and returns no segments, so the pane renders plain and then
+            // waits for the grammar.
+            //
+            // It used to wait for ever, because this loop only touched whole
+            // messages. So a Rust, Go or Python patch panel stayed unhighlighted
+            // for the rest of the session however many grammars arrived — while
+            // the *message* quoting the same code lit up. `rehighlight_pane` is
+            // the same code the pane's own `SetPane`/`SetPaneLang` ops run, so
+            // calling it here keeps one implementation rather than two.
+            if let Some(panes) = msg.panes.as_mut() {
+                for pane in panes {
+                    Self::rehighlight_pane(&mut self.highlighter, pane);
+                }
+            }
+            let panes_after = msg
+                .panes
+                .as_ref()
+                .map(|p| p.iter().map(|pane| pane.segs.clone()).collect::<Vec<_>>());
+            if before.0 != msg.segs || before.1 != msg.conceal || panes_before != panes_after {
                 changed += 1;
             }
         }

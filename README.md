@@ -110,7 +110,7 @@ plumbing are all still wired together.
 | **A seccomp sandbox that asks** | thirty-one syscalls intercepted; reads, writes, deletes and moves are questions about a *path*, and a move is two of them — plus the gates that would otherwise walk past every one of those paths, above all `io_uring` |
 | **Lua for everything above the API** | 36 locked bridge primitives, nine auto-required library modules, a mode system, an ask protocol with three answers, the sandbox policy, the tools |
 | **One thread** | one OS thread, a current-thread tokio runtime, no worker pool — tool calls, event handlers and HTTP are coroutines the event loop steps |
-| **Runtime syntax highlighting** | tree-sitter grammars fetched from a registry, compiled with your `cc`, and `dlopen`'d — and applied to text already on screen, mid-conversation |
+| **Runtime syntax highlighting** | tree-sitter grammars fetched from a registry, compiled with your `cc`, and `dlopen`'d — and applied to text already on screen, mid-conversation, including inside a `write_file` or `apply_patch` panel |
 | **MCP** | a pure-Lua client (`agent.mcp`) that talks to any transport you inject, with per-call progress streaming and its own panels |
 
 ---
@@ -647,7 +647,7 @@ make fmt           # cargo fmt
 `verify-sandbox.sh` must print `verify-sandbox: OK`. It runs the whole suite,
 fails on any clippy warning in a sandbox file — `src/seccomp/`, `src/lua/`,
 `src/mcp.rs`, `src/panels.rs` — and scans those for leftover instrumentation. It is
-the check that the sandbox is still there at all. The suite is 397 library tests
+the check that the sandbox is still there at all. The suite is 398 library tests
 and 14 in the `agent` binary, plus 4 `#[ignore]`d for want of the network or a C
 compiler (`-- --ignored` runs them).
 

@@ -524,6 +524,13 @@ local function write_file(args)
   -- declared grammar, so the highlighter runs that language over the content
   -- instead of treating it as prose. `lang_for` returning nil (an unknown
   -- extension) is not a failure — the pane renders as plain text.
+  --
+  -- Declaring the language up front means the grammar is usually *absent* when
+  -- the panel is created: only markdown_inline, bash and json are preloaded. The
+  -- highlighter records the language as wanted, the loop fetches it, and the
+  -- panel is re-highlighted when it arrives — so a Rust or Go file is plain for
+  -- a second or two and coloured after. That is the same path as any other
+  -- fenced language in the transcript.
   local p = agent.split_panel("write_file: " .. path, {
     { caption = plural(lines, "line") .. ", " .. plural(#content, "byte"),
       lang = lang_for(path) },
