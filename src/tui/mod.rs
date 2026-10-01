@@ -381,12 +381,21 @@ impl App {
     }
 
     /// Apply every op buffered in `sink` (Lua `agent.api.panel_*` emissions from
-    /// a tool round) to the transcript, oldest first. Safe to call once per
-    /// round (synchronous runs) or once per frame (once runs go async).
-    pub fn drain_panel_ops(&mut self, sink: &crate::panels::PanelSink) {
-        for op in sink.drain() {
-            self.panel.apply_op(op);
+    /// a tool round) to the transcript, oldest first, and hand them back.
+    ///
+    /// Returning them is what lets the drawing be archived: the ops are the panel,
+    /// and the agent loop logs them so a resumed session replays the panel rather
+    /// than showing a session that claims tools never drew anything. Safe to call
+    /// once per round (synchronous runs) or once per frame (once runs go async).
+    pub fn drain_panel_ops(
+        &mut self,
+        sink: &crate::panels::PanelSink,
+    ) -> Vec<crate::panels::PanelOp> {
+        let ops = sink.drain();
+        for op in &ops {
+            self.panel.apply_op(op.clone());
         }
+        ops
     }
 
     /// Consume the last submitted input (the text `Enter` sent), if the

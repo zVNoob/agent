@@ -23,8 +23,18 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 /// One panel operation emitted by Lua and applied by the TUI transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are what make a panel archivable: the conversation
+/// log stores them verbatim, and a resumed session replays them into the
+/// transcript, so a tool's drawing comes back instead of the session claiming
+/// (as it used to) that panels are simply not kept. The derived encoding is
+/// externally tagged (`{"SetPane": {"id": 1, "pane": 2, "text": "…"}}`), which
+/// is what the replay side matches on — so adding a variant is a format change
+/// and an old reader will reject it, deliberately, rather than half-understand it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PanelOp {
     /// Register panel `id` with its box title/options. The message only
     /// materializes on the first `Append`/`Set` (mirroring
@@ -149,10 +159,47 @@ pub fn remember_label(always: &mlua::Value) -> Remember {
 /// an optional declared highlighting language (each pane runs its own grammar
 /// independently, so a patch panel can show tree-sitter-highlighted code on
 /// both the "before" and "after" sides).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneInit {
     pub caption: String,
     pub lang: Option<String>,
+}
+
+/// The `kind` every archived panel record carries.
+///
+/// The conversation log is a flat JSONL stream of records that are *mostly*
+/// OpenAI-shaped messages, so the few that are not have to say so — otherwise a
+/// replay cannot tell a panel from a `user` turn, and a request built from the
+/// log would carry panel ops to the model as if they were conversation.
+pub const PANEL_RECORD: &str = "panel_op";
+
+/// Wrap an op as one log record.
+///
+/// `{"kind":"panel_op","op":{"SetPane":{…}}}`. The `kind` is what the replay
+/// side filters on; the op keeps its derived encoding inside `op`.
+pub fn panel_record(op: &PanelOp) -> serde_json::Value {
+    serde_json::json!({
+        "kind": PANEL_RECORD,
+        "op": serde_json::to_value(op).expect("a PanelOp is always encodable"),
+    })
+}
+
+/// The op inside an archived panel record, or `None` if this record is not one.
+///
+/// `None` for a message, and for a panel record this build cannot read — an op
+/// variant added after the log was written. A record it cannot decode is
+/// *skipped*, not guessed at: half a panel is worse than none, and the panel it
+/// belonged to is gone either way.
+pub fn panel_record_op(record: &serde_json::Value) -> Option<PanelOp> {
+    if record["kind"].as_str()? != PANEL_RECORD {
+        return None;
+    }
+    serde_json::from_value(record["op"].clone()).ok()
+}
+
+/// Whether this log record is a panel op rather than a message.
+pub fn is_panel_record(record: &serde_json::Value) -> bool {
+    record["kind"].as_str() == Some(PANEL_RECORD)
 }
 
 /// An order-preserving, thread-safe buffer of [`PanelOp`]s, plus the panel-id

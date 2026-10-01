@@ -2249,6 +2249,100 @@ mod tests {
         assert_eq!(rows.concat(), text);
     }
 
+    /// A panel rebuilt from archived ops draws exactly what the original drew.
+    ///
+    /// The archive test in `main.rs` proves the ops survive a round trip; this
+    /// proves the round trip is *worth* something — that a resumed session's
+    /// panel is the same box, row for row, and not merely the same data. That is
+    /// the claim the feature makes, and it is the one a user would notice.
+    #[test]
+    fn a_panel_rebuilt_from_archived_ops_draws_the_same_box() {
+        let ops = vec![
+            PanelOp::Split {
+                id: 7,
+                title: "apply_patch: /tmp/x.lua".into(),
+                panes: vec![
+                    PaneInit {
+                        caption: "before".into(),
+                        lang: None,
+                    },
+                    PaneInit {
+                        caption: "after".into(),
+                        lang: None,
+                    },
+                ],
+            },
+            PanelOp::SetPane {
+                id: 7,
+                pane: 1,
+                text: "\tlocal a = 1\n".into(),
+            },
+            PanelOp::SetPane {
+                id: 7,
+                pane: 2,
+                text: "  local a = 2\n".into(),
+            },
+            PanelOp::HighlightPane {
+                id: 7,
+                pane: 2,
+                start: 2,
+                end: 9,
+                style: "bold.green".into(),
+            },
+        ];
+
+        // The archive step, as the loop performs it.
+        let archived: Vec<serde_json::Value> =
+            ops.iter().map(crate::panels::panel_record).collect();
+        // The replay step, as a cold start performs it.
+        let decoded: Vec<PanelOp> = archived
+            .iter()
+            .filter_map(crate::panels::panel_record_op)
+            .collect();
+
+        let mut live = TurnPanel::default();
+        for op in &ops {
+            live.apply_op(op.clone());
+        }
+        let mut restored = TurnPanel::default();
+        for op in &decoded {
+            restored.apply_op(op.clone());
+        }
+
+        assert_eq!(
+            live.messages.len(),
+            restored.messages.len(),
+            "the rebuilt transcript holds the same messages"
+        );
+        for content_w in [80usize, 120, 200] {
+            let a = BorderedRenderer::lines(&live.messages, content_w, true);
+            let b = BorderedRenderer::lines(&restored.messages, content_w, true);
+            assert_eq!(a.len(), b.len(), "same height at {content_w}");
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                let at: String = x.spans.iter().map(|s| s.content.as_ref()).collect();
+                let bt: String = y.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert_eq!(at, bt, "row {i} at {content_w} cells");
+            }
+        }
+
+        // And it is the panel it claims to be: two captioned panes, with the
+        // tint the caller asked for.
+        let panes = restored.messages[0].panes.as_ref().expect("a split panel");
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].caption, "before");
+        assert_eq!(panes[1].caption, "after");
+        assert_eq!(panes[1].text, "  local a = 2\n");
+        assert_eq!(
+            panes[1].user_segs,
+            vec![Segment {
+                start: 2,
+                end: 9,
+                style: crate::tui::highlight::style_for_spec("bold.green"),
+            }],
+            "the tint came back with it"
+        );
+    }
+
     #[test]
     fn content_height_counts_wrapped_rows() {
         let mut panel = TurnPanel::default();

@@ -154,6 +154,27 @@ your configuration. That is what makes a path you answer `always` to still be
 trusted on the *next* tool call, and it is why the trust tables used to die with
 each call before they were moved.
 
+### Resuming a session
+
+The conversation log (`~/.config/agent/history.amem`, block-compressed and
+append-only) is what a fresh session continues from. It holds two kinds of
+record: the OpenAI-shaped messages, and — since panels are archived — the
+`PanelOp`s that drew the transcript.
+
+So a resumed session shows the tools again. Each past patch comes back as its
+before/after panel, each command as its output, positioned where they sat in the
+transcript: spliced into the log between the words that introduced them and the
+request that started them. This used to *not* happen, and the code said so
+outright — *"panels are not archived, so a resumed session shows neither the
+summary nor the tool's own drawing"* — leaving a turn's reasoning visible with
+the work it was reasoning about missing.
+
+Panel records are not conversation and are never sent to the model. A log
+written before panels were archived has none and resumes as it always did; there
+is no second reconstruction from the call's arguments and result, because a
+panel rebuilt from those would be a plausible impostor of one that was archived,
+and a drawing that is not the drawing is worse than an absent one.
+
 ---
 
 ## Security model

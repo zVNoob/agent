@@ -58,6 +58,13 @@
 //! [`MEMORY_REPLAY_LATEST`] messages are replayed into the transcript and the
 //! request history (the watermark starts past them, so nothing is
 //! re-archived).
+//!
+//! Tool panels are archived too — as the [`agent::panels::PanelOp`]s that drew
+//! them, spliced into the log where they sat in the transcript — so a resumed
+//! session shows the before/after of every past patch rather than the model's
+//! words with the tools that produced them silently missing. A log written
+//! before that existed has no panel records and resumes as it always did; there
+//! is no second, guess-at-it reconstruction.
 //! All server-communicating logic lives in `api`; rendering and interaction
 //! state live in `agent::tui`; the terminal setup mirrors `bin/chat.rs`.
 
@@ -282,38 +289,14 @@ async fn main() -> Result<()> {
 
     // Render any resumed history before the welcome so the transcript reads
     // chronologically (old conversation first, "agent ready" status after).
-    for msg in &replayed {
-        let Some(role) = msg["role"].as_str() else {
-            continue;
-        };
-        match role {
-            "user" => {
-                if let Some(content) = msg["content"].as_str() {
-                    app.push(Role::User, content.to_string());
-                }
-            }
-            "assistant" => {
-                if let Some(content) = msg["content"].as_str() {
-                    app.push(Role::Assistant, content.to_string());
-                }
-                // A tool round is silent on resume, exactly as it is live. There
-                // was a summary box here — `invoked tools: read_file, bash` —
-                // reconstructed from the archive's call names, and it was the
-                // last thing in the loop that admitted a tool had run. Live
-                // turns say nothing, so a resumed turn that said something would
-                // be describing history the user cannot otherwise see. Keeping
-                // it would have made a tool's visibility depend on whether the
-                // session was fresh.
-                //
-                // The gap this leaves is real and worth naming: panels are not
-                // archived, so a resumed session shows neither the summary nor
-                // the tool's own drawing. Tools that report themselves will
-                // report themselves again on the next turn; what is lost is
-                // only the *visual* of what a past turn did.
-            }
-            _ => {} // tool results: invisible, as they are live
-        }
-    }
+    //
+    // Tool panels come back with it. They are archived in transcript order (see
+    // `splice_panel_records`), so walking the records once rebuilds what the user
+    // was looking at — the before/after of every patch, every command's output —
+    // rather than a session that shows the model's words with the tools that
+    // produced them silently missing. A log written before panels were archived
+    // simply has no panel records, and resumes as it always did.
+    replay_transcript(&mut app, &replayed);
     let system_prompt = match agent::lua::system_prompt(&config_vm) {
         Ok(p) if !p.trim().is_empty() => " · system prompt set".to_string(),
         Ok(_) => " · no system prompt".to_string(),
@@ -342,7 +325,10 @@ async fn main() -> Result<()> {
         &config,
         &config_vm,
         &mut catalog,
-        replayed,
+        // Messages only, and rebuilt: `replayed` also carries the archived panel
+        // records, which the transcript above has already replayed and which must
+        // not be sent to the model as if they were conversation.
+        replayed_request_history(&replayed),
     )
     .await;
 
@@ -732,6 +718,7 @@ fn fold_tool_outcome(
     history: &mut Vec<serde_json::Value>,
     outcome: ToolOutcome,
     round_sink: Option<&agent::panels::PanelSink>,
+    panel_log: &mut Vec<serde_json::Value>,
 ) {
     let ToolOutcome { id, result, .. } = outcome;
     let content = match result {
@@ -744,8 +731,64 @@ fn fold_tool_outcome(
         "content": content,
     }));
     if let Some(s) = round_sink {
-        app.drain_panel_ops(s);
+        archive_panels(app.drain_panel_ops(s), panel_log);
     }
+}
+
+/// Collect drained panel ops as log records, in the order they were applied.
+///
+/// Buffering rather than writing is deliberate: the ops belong in the log
+/// *between* the model's words and the tool-call request that produced them, and
+/// the two are written by different code at different moments. [`save_history`]
+/// splices the buffer in at that point; see [`PANEL_INSERT_NOTE`].
+fn archive_panels(ops: Vec<agent::panels::PanelOp>, into: &mut Vec<serde_json::Value>) {
+    into.extend(ops.iter().map(agent::panels::panel_record));
+}
+
+/// Why the panel records are spliced rather than appended, in one place.
+///
+/// Live, a tool round reads: the model speaks, the tool's panel appears, and the
+/// request that started it sits with the round that drew it. In the log the two
+/// messages around the panel are written by `save_history` and the panel is
+/// written here, and the panel drains *before* that frame's `save_history` — so
+/// appending would put every panel before the words that introduced it, and a
+/// resumed session would open with a wall of tool output and then the requests
+/// that caused it.
+///
+/// The index is recorded where the request is written (`push_assistant_turn`
+/// pushes text then calls, so the calls message is last) and the records are
+/// spliced in as `save_history` writes the slice that contains it. `None` until a
+/// round has recorded one, which is also the honest "no panel belongs to a
+/// position yet".
+type PanelInsertAt = Option<usize>;
+
+/// Splice `records` into the log so they land immediately before `history[at]`
+/// — `at` being the index of the assistant message that carried the tool calls.
+///
+/// Returns the messages to write in order, with the records between the two
+/// halves. Pure, so the ordering is testable without a log.
+fn splice_panel_records(
+    slice: &[serde_json::Value],
+    saved_upto: usize,
+    at: PanelInsertAt,
+    records: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::with_capacity(slice.len() + records.len());
+    // Only splice into a slice that actually contains the position; a stale index
+    // (compaction shortened the history) must not put a panel in the wrong place,
+    // and dropping it is better than that.
+    let cut = at
+        .filter(|&i| i >= saved_upto && i <= saved_upto + slice.len())
+        .map(|i| i - saved_upto);
+    match cut {
+        Some(i) => {
+            out.extend_from_slice(&slice[..i]);
+            out.extend_from_slice(records);
+            out.extend_from_slice(&slice[i..]);
+        }
+        None => out.extend_from_slice(slice),
+    }
+    out
 }
 
 /// A question the tool is waiting on, as the loop holds it: the wording to show
@@ -957,7 +1000,13 @@ fn start_event_timer(ms: u64) -> mpsc::UnboundedReceiver<()> {
 /// logged; the compacted summary is never re-archived). `turn_over` (no stream
 /// or tool in flight) triggers the group-commit flush so each finished turn is
 /// durably on disk. No log open (disabled, or a failed open) → no-op.
-fn save_history(history: &[Value], saved_upto: &mut usize, turn_over: bool) {
+fn save_history(
+    history: &[Value],
+    saved_upto: &mut usize,
+    turn_over: bool,
+    panel_records: &mut Vec<Value>,
+    panel_at: PanelInsertAt,
+) {
     if !agent::lua::memory_is_bound() {
         return;
     }
@@ -965,18 +1014,73 @@ fn save_history(history: &[Value], saved_upto: &mut usize, turn_over: bool) {
     // end, and don't re-archive what the log already has.
     *saved_upto = (*saved_upto).min(history.len());
     if *saved_upto < history.len() {
-        match agent::lua::memory_append_many(&history[*saved_upto..]) {
-            Ok(_) => *saved_upto = history.len(),
+        // The round's drawings go in among the messages, not after them: see
+        // `splice_panel_records`.
+        let batch = splice_panel_records(
+            &history[*saved_upto..],
+            *saved_upto,
+            panel_at,
+            panel_records,
+        );
+        match agent::lua::memory_append_many(&batch) {
+            Ok(_) => {
+                *saved_upto = history.len();
+                // Written, so not to be spliced again on the next frame — the
+                // log has them, and a repeat would duplicate every panel.
+                panel_records.clear();
+            }
             // A persistent I/O error must not stall the loop: advance past the
             // failing block (it would only fail again next frame) and report.
             Err(e) => {
                 eprintln!("[agent] save to disk failed: {e}");
                 *saved_upto = history.len();
+                panel_records.clear();
             }
         }
     }
     if turn_over && let Err(e) = agent::lua::memory_flush() {
         eprintln!("[agent] save to disk failed (flush): {e}");
+    }
+}
+
+/// Rebuild the transcript from archived records, oldest first.
+///
+/// Tool panels come back with it. They are archived in transcript order (see
+/// [`splice_panel_records`]), so one pass rebuilds what the user was looking at —
+/// the before/after of every past patch, every command's output — rather than a
+/// session that shows the model's words with the tools that produced them
+/// silently missing, which is what this used to do.
+///
+/// A log written before panels were archived has no panel records and resumes as
+/// it always did. There is deliberately no second reconstruction from the call's
+/// arguments and result: a panel rebuilt from those would be a plausible
+/// impostor of one that was archived, and a drawing that is not the drawing is
+/// worse than an absent one.
+///
+/// A free function so a test can drive the same path `main` does — the loop
+/// inside `main` is otherwise untestable, and untestable is how this stayed
+/// broken for so long.
+fn replay_transcript(app: &mut App, records: &[Value]) {
+    for msg in records {
+        if let Some(op) = agent::panels::panel_record_op(msg) {
+            app.panel.apply_op(op);
+            continue;
+        }
+        let Some(role) = msg["role"].as_str() else {
+            continue;
+        };
+        let Some(content) = msg["content"].as_str() else {
+            continue;
+        };
+        match role {
+            "user" => app.push(Role::User, content.to_string()),
+            // No summary box, deliberately: there was one here once —
+            // `invoked tools: read_file, bash` — and a tool round now brings its
+            // own panel back, so a summary would be a second, vaguer copy of
+            // what the transcript already shows.
+            "assistant" => app.push(Role::Assistant, content.to_string()),
+            _ => {} // tool results: invisible, as they are live
+        }
     }
 }
 
@@ -988,13 +1092,68 @@ fn save_history(history: &[Value], saved_upto: &mut usize, turn_over: bool) {
 /// Tool results come back as a one-line record of *what ran* rather than what
 /// it printed. See [`rebuild_tool_results`] for why, and for what is kept.
 fn replay_history(path: &std::path::Path, n: usize) -> Vec<Value> {
-    match agent::memory::read_tail(path, n) {
+    replayed_request_history(&replay_records(path, n))
+}
+
+/// The request half of a replay: the messages, with each tool result reduced to
+/// one line.
+///
+/// Two things are dropped or rewritten here, and both matter for what gets
+/// *sent*. Panel records are not conversation and must never reach the model; and
+/// [`rebuild_tool_results`] replaces each tool result with a one-line record of
+/// the call, because a tool result is the bulkiest thing in the log by a wide
+/// margin and replaying it verbatim would spend the context on output the model
+/// can read again more cheaply.
+fn replayed_request_history(records: &[Value]) -> Vec<Value> {
+    let messages: Vec<Value> = records
+        .iter()
+        .filter(|r| !agent::panels::is_panel_record(r))
+        .cloned()
+        .collect();
+    rebuild_tool_results(messages)
+}
+
+/// Every record of the newest `n` **messages**, in log order, panels included.
+///
+/// The window is counted in messages and not in lines, because the two no longer
+/// agree: a tool round contributes one assistant message, one `tool` message per
+/// call, and now a run of panel records between them. Counting lines would make
+/// the resumed window shrink as panels were added — the same code, less context
+/// each time — so the tail is read generously and then trimmed back to `n`
+/// messages from the newest end, which is what the window has always meant.
+///
+/// Corrupt lines are skipped, never fatal. A panel record this build cannot
+/// decode is dropped by [`agent::panels::panel_record_op`], so an op variant
+/// added after the log was written costs that one panel and nothing else.
+fn replay_records(path: &std::path::Path, n: usize) -> Vec<Value> {
+    // Generous, then trimmed: a round with a parallel group and a panel can be
+    // a dozen lines for one message.
+    let read = n.saturating_mul(8).max(n);
+    match agent::memory::read_tail(path, read) {
         Ok(lines) => {
-            let msgs: Vec<Value> = lines
+            let parsed: Vec<Value> = lines
                 .into_iter()
                 .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
                 .collect();
-            rebuild_tool_results(msgs)
+            // Trim from the newest end until only `n` messages remain, so the
+            // window keeps its meaning and the panels it brackets come with it.
+            let mut kept_from = parsed.len();
+            let mut messages = 0usize;
+            for (i, r) in parsed.iter().enumerate().rev() {
+                if !agent::panels::is_panel_record(r) {
+                    messages += 1;
+                    if messages == n {
+                        kept_from = i;
+                        break;
+                    }
+                }
+                kept_from = i;
+            }
+            let mut out = parsed[kept_from..].to_vec();
+            if out.is_empty() {
+                out = parsed;
+            }
+            out
         }
         Err(e) => {
             eprintln!("[agent] memory replay failed: {e}");
@@ -1178,6 +1337,10 @@ async fn run<W: Write>(
     // that never ends: cleared at every new user turn, and checked wherever a
     // turn would otherwise chain into another round.
     let mut stop_turn = false;
+    // Panel ops drained this round, and where they belong in the log. The buffer
+    // is spliced in by `save_history`; see `splice_panel_records`.
+    let mut panel_records: Vec<Value> = Vec::new();
+    let mut panel_at: PanelInsertAt = None;
     let mut round_sink: Option<agent::panels::PanelSink> = None;
     // The highest panel id handed out so far, carried across tool rounds: see
     // `PanelSink::continuing_from` for why an id has to outlive its sink.
@@ -1223,7 +1386,13 @@ async fn run<W: Write>(
             // no panel at all — as it did when every call had a VM of its own.
             pending_question = None;
             let _ = agent::lua::clear_sink(vm);
-            fold_tool_outcome(app, &mut history, outcome, round_sink.as_ref());
+            fold_tool_outcome(
+                app,
+                &mut history,
+                outcome,
+                round_sink.as_ref(),
+                &mut panel_records,
+            );
             if !tool_queue.is_empty() {
                 let (started, refused) = start_next_tool(
                     vm,
@@ -1738,6 +1907,13 @@ async fn run<W: Write>(
                 // `push_assistant_turn`.
                 push_assistant_turn(&mut history, &turn, continuing);
                 if continuing {
+                    // The round's panels will be spliced in immediately before
+                    // the request that started them, which `push_assistant_turn`
+                    // has just written last (text, then calls). Recording it here
+                    // — rather than assuming a position when the ops drain — is
+                    // what makes the placement follow the transcript instead of
+                    // the archive schedule.
+                    panel_at = Some(history.len() - 1);
                     // Queue the round's calls and start the first one. A tool
                     // is a coroutine on the config VM that the loop steps (see
                     // `start_next_tool`), so it only runs between frames; panel
@@ -1795,7 +1971,7 @@ async fn run<W: Write>(
         // running bash command appends its stdout chunks to the round's sink
         // as the loop steps it, so the box fills live.
         if let Some(s) = &round_sink {
-            app.drain_panel_ops(s);
+            archive_panels(app.drain_panel_ops(s), &mut panel_records);
         }
 
         // Grammars, in three steps: notice what the transcript asked for, start
@@ -1872,6 +2048,8 @@ async fn run<W: Write>(
             &history,
             &mut saved_upto,
             stream.is_none() && tool_flight.is_none() && pending_outcome.is_none(),
+            &mut panel_records,
+            panel_at,
         );
 
         terminal.autoresize()?;
@@ -2067,6 +2245,277 @@ mod tests {
     /// untouched — a `tool` message is only legal after the assistant message
     /// that requested it, so rewriting it into a `user` message would make the
     /// request invalid rather than merely terse.
+    /// Panel records round-trip through the log and come back as a panel.
+    ///
+    /// The whole feature in one test: build what a tool round draws, archive it
+    /// the way the loop does, read it back the way a cold start does, and render
+    /// it. If any link in that chain is wrong the panel does not come back, and
+    /// the failure is a silently absent panel rather than a visible one — which
+    /// is exactly what it was before this existed.
+    #[test]
+    fn a_panel_is_archived_and_replayed_as_a_panel() {
+        // What `apply_patch` emits, in order.
+        let ops = vec![
+            agent::panels::PanelOp::Split {
+                id: 7,
+                title: "apply_patch: /tmp/x.lua".into(),
+                panes: vec![
+                    agent::panels::PaneInit {
+                        caption: "before".into(),
+                        lang: Some("lua".into()),
+                    },
+                    agent::panels::PaneInit {
+                        caption: "after".into(),
+                        lang: Some("lua".into()),
+                    },
+                ],
+            },
+            agent::panels::PanelOp::SetPane {
+                id: 7,
+                pane: 1,
+                text: "\tlocal a = 1\n".into(),
+            },
+            agent::panels::PanelOp::SetPane {
+                id: 7,
+                pane: 2,
+                text: "  local a = 2\n".into(),
+            },
+            agent::panels::PanelOp::HighlightPane {
+                id: 7,
+                pane: 2,
+                start: 2,
+                end: 9,
+                style: "bold.green".into(),
+            },
+        ];
+
+        // Archived: each op becomes one log record.
+        let archived: Vec<serde_json::Value> =
+            ops.iter().map(agent::panels::panel_record).collect();
+        assert!(
+            archived.iter().all(agent::panels::is_panel_record),
+            "every record identifies itself as a panel"
+        );
+
+        // Read back: the ops come back exactly, which is what "the drawing is
+        // archived" has to mean for it to be worth anything.
+        let decoded: Vec<agent::panels::PanelOp> = archived
+            .iter()
+            .filter_map(agent::panels::panel_record_op)
+            .collect();
+        assert_eq!(decoded, ops, "the drawing survives the round trip");
+    }
+
+    /// Panel records are *not* conversation: they must never be sent to the model.
+    #[test]
+    fn panel_records_are_kept_out_of_the_request() {
+        let panel = agent::panels::panel_record(&agent::panels::PanelOp::Split {
+            id: 1,
+            title: "apply_patch".into(),
+            panes: vec![agent::panels::PaneInit {
+                caption: "after".into(),
+                lang: None,
+            }],
+        });
+        let records = vec![
+            json!({"role": "user", "content": "do the thing"}),
+            panel,
+            json!({"role": "assistant", "content": "done"}),
+        ];
+        let sent = replayed_request_history(&records);
+        assert!(
+            sent.iter().all(|m| m.get("role").is_some()),
+            "everything sent has a role: {sent:?}"
+        );
+        assert_eq!(sent.len(), 2, "the panel is gone: {sent:?}");
+    }
+
+    /// The splice: a round's drawings go in *between* the model's words and the
+    /// request that produced them, which is where they sit live.
+    #[test]
+    fn the_drawing_is_spliced_in_before_the_request_that_produced_it() {
+        let panel = agent::panels::panel_record(&agent::panels::PanelOp::Create {
+            id: 1,
+            title: "bash".into(),
+            boxed: true,
+            conceal_box: false,
+        });
+        // history: [user, assistant text, assistant calls, tool result]
+        let slice = vec![
+            json!({"role": "user", "content": "u"}),
+            json!({"role": "assistant", "content": "on it"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "c1"}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "{}"}),
+        ];
+        // `push_assistant_turn` pushes text then calls, so the calls message is
+        // last so far: index 2.
+        let out = splice_panel_records(&slice, 0, Some(2), std::slice::from_ref(&panel));
+        let kinds: Vec<&str> = out
+            .iter()
+            .map(|r| {
+                if agent::panels::is_panel_record(r) {
+                    "panel"
+                } else {
+                    r["role"].as_str().unwrap_or("?")
+                }
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["user", "assistant", "panel", "assistant", "tool"],
+            "the panel sits between the words and the request: {out:?}"
+        );
+    }
+
+    /// A stale or absent position must not misplace a panel: it is dropped, and
+    /// the messages still go out in order.
+    #[test]
+    fn a_position_outside_the_slice_drops_the_panel_rather_than_misplacing_it() {
+        let panel = agent::panels::panel_record(&agent::panels::PanelOp::Create {
+            id: 1,
+            title: "bash".into(),
+            boxed: true,
+            conceal_box: false,
+        });
+        let slice = vec![json!({"role": "user", "content": "u"})];
+        // `None` (no round has claimed a position) and a position past the end
+        // (compaction shortened the history) both mean the panel cannot be placed.
+        for at in [None, Some(2), Some(99)] {
+            let out = splice_panel_records(&slice, 0, at, std::slice::from_ref(&panel));
+            assert_eq!(out, slice, "no panel spliced at {at:?}: {out:?}");
+        }
+        // The ends of the slice are *inside* it, and both are legal positions.
+        let first = splice_panel_records(&slice, 0, Some(0), std::slice::from_ref(&panel));
+        assert!(
+            agent::panels::is_panel_record(&first[0]),
+            "before the first message is a real place: {first:?}"
+        );
+        // A position inside the slice is honoured.
+        let slice = vec![
+            json!({"role": "user", "content": "u"}),
+            json!({"role": "x"}),
+        ];
+        let out = splice_panel_records(&slice, 0, Some(1), std::slice::from_ref(&panel));
+        assert!(
+            agent::panels::is_panel_record(&out[1]),
+            "spliced at 1: {out:?}"
+        );
+    }
+
+    /// The whole chain against a real log *file*: write one the way the loop writes
+    /// it, then read it back the way a cold start does.
+    ///
+    /// Uses [`agent::memory::Memory`] directly rather than the Lua bridge,
+    /// because the bridge binds a process-global (`OnceLock`) that another test
+    /// already claims — a second bind would be a flaky test, not a real one.
+    #[test]
+    fn a_panel_survives_a_real_log_file_and_comes_back_on_a_cold_start() {
+        let path = unique_path("panel-archive");
+        let _ = std::fs::remove_file(&path);
+
+        // --- write: one user turn, a round's panel, the request, the result ---
+        {
+            let mut mem = agent::memory::Memory::open(&path).expect("log opens");
+            let mut lines: Vec<serde_json::Value> = vec![json!({
+                "role": "user", "content": "add the python entry",
+            })];
+            for op in [
+                agent::panels::PanelOp::Split {
+                    id: 1,
+                    title: "apply_patch: /tmp/x.lua".into(),
+                    panes: vec![
+                        agent::panels::PaneInit {
+                            caption: "before".into(),
+                            lang: Some("lua".into()),
+                        },
+                        agent::panels::PaneInit {
+                            caption: "after".into(),
+                            lang: Some("lua".into()),
+                        },
+                    ],
+                },
+                agent::panels::PanelOp::SetPane {
+                    id: 1,
+                    pane: 1,
+                    text: "\t\tlocal a = 1\n".into(),
+                },
+                agent::panels::PanelOp::SetPane {
+                    id: 1,
+                    pane: 2,
+                    text: "        local a = 2\n".into(),
+                },
+            ] {
+                lines.push(agent::panels::panel_record(&op));
+            }
+            lines.push(json!({"role": "assistant", "content": "on it"}));
+            lines.push(json!({
+                "role": "assistant",
+                "tool_calls": [{"id": "c1", "type": "function",
+                                "function": {"name": "fs.apply_patch", "arguments": "{}"}}],
+            }));
+            lines.push(json!({"role": "tool", "tool_call_id": "c1", "content": "{\"ok\":true}"}));
+            for line in &lines {
+                mem.append(&serde_json::to_string(line).unwrap())
+                    .expect("append");
+            }
+            mem.flush().expect("flush");
+        }
+
+        // --- read: the transcript half puts the panel back ---
+        let records = replay_records(&path, 20);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| agent::panels::is_panel_record(r))
+                .count(),
+            3,
+            "all three ops are in the log: {records:?}"
+        );
+
+        // Through the same function `main` calls, not a copy of it.
+        let mut app = App::default();
+        replay_transcript(&mut app, &records);
+        let panel = &mut app.panel;
+
+        // Asserted through what a resumed session's user actually sees.
+        let (w, h) = (100u16, 20u16);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+        terminal
+            .draw(|frame| panel.render(frame, ratatui::layout::Rect::new(0, 0, w, h)))
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        let screen: String = (0..h)
+            .flat_map(|y| (0..w).map(move |x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ")))
+            .collect();
+        for needle in [
+            "apply_patch: /tmp/x.lua",
+            "before",
+            "after",
+            "local a = 1",
+            "local a = 2",
+        ] {
+            assert!(
+                screen.contains(needle),
+                "the resumed transcript shows {needle:?}:\n{screen}"
+            );
+        }
+
+        // --- and the request half must not see any of it ---
+        let sent = replayed_request_history(&records);
+        assert!(
+            !sent.iter().any(agent::panels::is_panel_record),
+            "a panel is not conversation: {sent:?}"
+        );
+        assert_eq!(
+            sent.iter().filter(|m| m["role"] == "tool").count(),
+            1,
+            "and the tool result is still there, still reduced: {sent:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_replayed_tool_result_becomes_one_line_about_the_call() {
         let bulky = "x".repeat(40_000);
@@ -2806,6 +3255,7 @@ mod tests {
                     result: Ok((r#"{"ok":true,"result":{"n":3}}"#.into(), "{}".into())),
                 },
                 Some(&sink),
+                &mut Vec::new(),
             );
             assert_eq!(
                 history.len(),
@@ -2840,6 +3290,7 @@ mod tests {
                 result: Err("the sandbox refused to start".into()),
             },
             Some(&sink),
+            &mut Vec::new(),
         );
         assert_eq!(history.len(), 1);
         assert!(
