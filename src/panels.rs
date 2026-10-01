@@ -202,6 +202,23 @@ pub fn is_panel_record(record: &serde_json::Value) -> bool {
     record["kind"].as_str() == Some(PANEL_RECORD)
 }
 
+/// The `kind` of an archived reasoning record.
+///
+/// Reasoning is streamed into its own borderless block and, unlike the answer,
+/// was never in the request history — so with nothing archived, a resumed session
+/// showed the conclusions and none of the thinking. It is archived for the same
+/// reason panels are, and is *not* sent to the model: see [`is_transcript_record`].
+pub const REASONING_RECORD: &str = "reasoning";
+
+/// Wrap one streamed reasoning chunk as a log record.
+///
+/// `{"kind":"reasoning","text":"…"}` — the chunk verbatim, because the block is
+/// an append of whatever arrived and re-joining the pieces must not invent
+/// spacing that was never there.
+pub fn reasoning_record(text: &str) -> serde_json::Value {
+    serde_json::json!({ "kind": REASONING_RECORD, "text": text })
+}
+
 /// An order-preserving, thread-safe buffer of [`PanelOp`]s, plus the panel-id
 /// allocator. Ids are drawn here rather than per-producer because they are
 /// scoped to the transcript's id→message map, which outlives a single tool

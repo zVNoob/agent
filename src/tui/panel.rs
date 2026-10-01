@@ -536,6 +536,28 @@ impl TurnPanel {
         self.highlighter.as_mut()
     }
 
+    /// Collapse every framed box in the transcript.
+    ///
+    /// For a resumed session, where the boxes are *history*: a long session has
+    /// a panel per tool call, and expanding them all buries the conversation that
+    /// is actually being resumed under screens of old output. Collapsed, each is
+    /// its title and a `[+]`, and the transcript reads as the outline it is.
+    ///
+    /// Only framed boxes: the borderless streamed blocks (`reasoning`,
+    /// `response`) have no frame and no collapse affordance — see
+    /// [`is_borderless_box`] — so they are left exactly as replayed them.
+    ///
+    /// A no-op on a message with nothing to collapse, and idempotent, so calling
+    /// it on a transcript that is already collapsed changes nothing.
+    pub fn collapse_all_boxes(&mut self) {
+        for msg in &mut self.messages {
+            if msg.boxed.is_some() && !is_borderless_box(msg) && !msg.collapsed {
+                msg.collapsed = true;
+                msg.dirty = true;
+            }
+        }
+    }
+
     /// Apply one Lua panel op ([`PanelOp`]) to the transcript. Panels render
     /// through exactly the same pipelines as every other message — `boxed`
     /// panels are the click-collapsible bordered boxes, plain panels are
@@ -2340,6 +2362,121 @@ mod tests {
                 style: crate::tui::highlight::style_for_spec("bold.green"),
             }],
             "the tint came back with it"
+        );
+    }
+
+    /// Collapsing everything a resumed transcript drew is the difference between
+    /// an outline and a wall.
+    ///
+    /// The property that makes it safe: the *drawing* is untouched. A collapsed
+    /// box is two rows and keeps every span, so opening it gives back exactly
+    /// what the session showed — which is what the resumed session is for.
+    #[test]
+    fn collapsing_the_transcript_keeps_the_drawing_behind_the_title() {
+        let mut panel = TurnPanel::default();
+        for op in [
+            PanelOp::Create {
+                id: 1,
+                title: "ls -la".into(),
+                boxed: true,
+                conceal_box: false,
+            },
+            PanelOp::Append {
+                id: 1,
+                text: "README.md\nlua\n".into(),
+            },
+        ] {
+            panel.apply_op(op);
+        }
+        let before = BorderedRenderer::lines(&panel.messages, 60, true);
+        assert!(
+            before.len() > 3,
+            "expanded, the panel has a body: {} rows",
+            before.len()
+        );
+
+        panel.collapse_all_boxes();
+        let collapsed = BorderedRenderer::lines(&panel.messages, 60, true);
+        assert_eq!(
+            collapsed.len(),
+            2,
+            "a collapsed box is its title and its bottom border, and nothing else"
+        );
+        let text: String = collapsed.iter().map(|l| l.to_string()).collect();
+        assert!(text.contains("ls -la"), "the title survives: {text}");
+        assert!(
+            text.contains("[+]"),
+            "and offers itself for expansion: {text}"
+        );
+
+        // The drawing is still there. `collapsed` is the only thing that changed,
+        // so flipping it back gives the original rows back byte for byte.
+        panel.messages[0].collapsed = false;
+        panel.messages[0].dirty = true;
+        let reopened = BorderedRenderer::lines(&panel.messages, 60, true);
+        let at = |rows: &[Line<'static>]| -> Vec<String> {
+            rows.iter()
+                .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+                .collect()
+        };
+        assert_eq!(
+            at(&reopened),
+            at(&before),
+            "expanding gives back exactly what was there"
+        );
+    }
+
+    /// The borderless streamed blocks are left alone.
+    ///
+    /// `reasoning` and `response` have no frame and no collapse affordance —
+    /// [`is_borderless_box`] — so there is nothing to collapse them *to*, and
+    /// dimming a collapsed row would be the only visible effect. More to the
+    /// point: collapsing must not become a way to hide a resumed turn's thinking,
+    /// which is the one thing the user asked to have back.
+    #[test]
+    fn collapsing_leaves_the_borderless_blocks_alone() {
+        let mut panel = TurnPanel::default();
+        panel.stream_append_boxed("thinking about it", "reasoning".into());
+        panel.stream_append_boxed("the answer", "response".into());
+        panel.apply_op(PanelOp::Create {
+            id: 1,
+            title: "ls".into(),
+            boxed: true,
+            conceal_box: false,
+        });
+        panel.apply_op(PanelOp::Append {
+            id: 1,
+            text: "out".into(),
+        });
+
+        panel.collapse_all_boxes();
+        let state: Vec<(Option<&str>, bool)> = panel
+            .messages
+            .iter()
+            .map(|m| (m.boxed.as_deref(), m.collapsed))
+            .collect();
+        assert_eq!(
+            state,
+            vec![
+                (Some("reasoning"), false),
+                (Some("response"), false),
+                (Some("ls"), true),
+            ],
+            "only the framed box collapsed — the borderless ones have no frame and \
+             no affordance to collapse to"
+        );
+        let screen: String = BorderedRenderer::lines(&panel.messages, 60, true)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            screen.contains("thinking about it"),
+            "and the reasoning is still readable: {screen}"
         );
     }
 

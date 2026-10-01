@@ -762,6 +762,47 @@ fn archive_panels(ops: Vec<agent::panels::PanelOp>, into: &mut Vec<serde_json::V
 /// position yet".
 type PanelInsertAt = Option<usize>;
 
+/// Buffer one streamed reasoning chunk for the log, and say whether it was worth
+/// buffering at all.
+///
+/// Returns false for an empty delta, which is the same test the stream applies
+/// before drawing: an all-empty reasoning stream must leave neither a block on
+/// screen nor records in the log. The two halves are one function so they cannot
+/// disagree — a chunk drawn but not archived is a resumed session missing its
+/// thinking, which is the bug this exists to fix.
+fn archive_reasoning(chunk: &str, into: &mut Vec<Value>) -> bool {
+    if chunk.is_empty() {
+        return false;
+    }
+    into.push(agent::panels::reasoning_record(chunk));
+    true
+}
+
+/// The log batch for one frame, in the order the transcript had it.
+///
+/// **Reasoning first.** It streamed before any of these messages — the model
+/// thinks, then answers — and it never entered the conversation history, so
+/// there is nothing to interleave it *with*; putting it at the front of the batch
+/// puts it before the answer, which is where it was. The user's own message is
+/// already on disk by then: it is pushed and saved before the request goes out,
+/// so the front of this batch is the turn's own messages.
+///
+/// Then the messages, with the round's drawings spliced in among them.
+///
+/// Pure, so the shape of the log is testable without writing one.
+fn archive_batch(
+    slice: &[Value],
+    saved_upto: usize,
+    at: PanelInsertAt,
+    panels: &[Value],
+    reasoning: &[Value],
+) -> Vec<Value> {
+    let mut out = Vec::with_capacity(slice.len() + panels.len() + reasoning.len());
+    out.extend_from_slice(reasoning);
+    out.extend(splice_panel_records(slice, saved_upto, at, panels));
+    out
+}
+
 /// Splice `records` into the log so they land immediately before `history[at]`
 /// — `at` being the index of the assistant message that carried the tool calls.
 ///
@@ -1018,6 +1059,7 @@ fn save_history(
     turn_over: bool,
     panel_records: &mut Vec<Value>,
     panel_at: PanelInsertAt,
+    reasoning: &mut Vec<Value>,
 ) {
     if !agent::lua::memory_is_bound() {
         return;
@@ -1026,13 +1068,14 @@ fn save_history(
     // end, and don't re-archive what the log already has.
     *saved_upto = (*saved_upto).min(history.len());
     if *saved_upto < history.len() {
-        // The round's drawings go in among the messages, not after them: see
-        // `splice_panel_records`.
-        let batch = splice_panel_records(
+        // Reasoning first, then the round's drawings among the messages: see
+        // `archive_batch`.
+        let batch = archive_batch(
             &history[*saved_upto..],
             *saved_upto,
             panel_at,
             panel_records,
+            reasoning,
         );
         match agent::lua::memory_append_many(&batch) {
             Ok(_) => {
@@ -1040,6 +1083,7 @@ fn save_history(
                 // Written, so not to be spliced again on the next frame — the
                 // log has them, and a repeat would duplicate every panel.
                 panel_records.clear();
+                reasoning.clear();
             }
             // A persistent I/O error must not stall the loop: advance past the
             // failing block (it would only fail again next frame) and report.
@@ -1047,6 +1091,7 @@ fn save_history(
                 eprintln!("[agent] save to disk failed: {e}");
                 *saved_upto = history.len();
                 panel_records.clear();
+                reasoning.clear();
             }
         }
     }
@@ -1078,6 +1123,12 @@ fn replay_transcript(app: &mut App, records: &[Value]) {
             app.panel.apply_op(op);
             continue;
         }
+        if msg["kind"].as_str() == Some(agent::panels::REASONING_RECORD) {
+            if let Some(text) = msg["text"].as_str() {
+                app.stream_append_boxed(text, "reasoning".into());
+            }
+            continue;
+        }
         let Some(role) = msg["role"].as_str() else {
             continue;
         };
@@ -1094,6 +1145,12 @@ fn replay_transcript(app: &mut App, records: &[Value]) {
             _ => {} // tool results: invisible, as they are live
         }
     }
+    // Collapsed, because they are history: a session with a tool per turn has a
+    // panel per turn, and expanding them all buries the conversation being
+    // resumed under screens of old output. Each is a title and a `[+]`, and the
+    // transcript reads as the outline it is. Live panels stay expanded — this
+    // runs only on the replay path.
+    app.panel.collapse_all_boxes();
 }
 
 /// Cold start: the archived records, split into the two things that want them.
@@ -1126,10 +1183,25 @@ fn cold_start(path: &std::path::Path, n: usize) -> (Vec<Value>, Vec<Value>) {
 fn replayed_request_history(records: &[Value]) -> Vec<Value> {
     let messages: Vec<Value> = records
         .iter()
-        .filter(|r| !agent::panels::is_panel_record(r))
+        .filter(|r| !is_transcript_record(r))
         .cloned()
         .collect();
     rebuild_tool_results(messages)
+}
+
+/// Whether a record is something the transcript *draws* and the request must not
+/// carry: a panel op, or a chunk of streamed reasoning.
+///
+/// Both are archived so a resumed session looks like the one that ended, and
+/// neither belongs in a request. Reasoning is the sharper case — it was never in
+/// the conversation history either ("observed only; not kept in history"), so
+/// there is no risk of sending it twice; archiving it is purely so the thinking
+/// can be read back.
+fn is_transcript_record(record: &Value) -> bool {
+    matches!(
+        record["kind"].as_str(),
+        Some(agent::panels::PANEL_RECORD) | Some(agent::panels::REASONING_RECORD)
+    )
 }
 
 /// Every record of the newest `n` **messages**, in log order, panels included.
@@ -1360,6 +1432,10 @@ async fn run<W: Write>(
     // is spliced in by `save_history`; see `splice_panel_records`.
     let mut panel_records: Vec<Value> = Vec::new();
     let mut panel_at: PanelInsertAt = None;
+    // Streamed reasoning, buffered the same way. It never entered the
+    // conversation history, so without this a resumed session shows the
+    // conclusions and none of the thinking that reached them.
+    let mut reasoning_log: Vec<Value> = Vec::new();
     let mut round_sink: Option<agent::panels::PanelSink> = None;
     // The highest panel id handed out so far, carried across tool rounds: see
     // `PanelSink::continuing_from` for why an id has to outlive its sink.
@@ -1876,7 +1952,7 @@ async fn run<W: Write>(
                         // reasoning text renders dimmed, darker than the
                         // answer. Empty deltas are skipped so an all-empty
                         // reasoning stream never draws an empty block.
-                        if !d.is_empty() {
+                        if archive_reasoning(d, &mut reasoning_log) {
                             app.stream_append_boxed(d, "reasoning".into());
                         }
                     }
@@ -2069,6 +2145,7 @@ async fn run<W: Write>(
             stream.is_none() && tool_flight.is_none() && pending_outcome.is_none(),
             &mut panel_records,
             panel_at,
+            &mut reasoning_log,
         );
 
         terminal.autoresize()?;
@@ -2084,6 +2161,27 @@ async fn run<W: Write>(
 mod tests {
     use super::*;
     use agent::testutil::unique_path;
+
+    /// The transcript as a user would see it: the whole panel drawn into a
+    /// buffer and read back as text. Assertions about "is it on screen" have to be
+    /// made against the drawn cells — a message being *in* `messages` says nothing
+    /// about whether it is collapsed out of view.
+    fn panel_screen(panel: &mut agent::tui::TurnPanel, w: u16, h: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+        terminal
+            .draw(|frame| panel.render(frame, ratatui::layout::Rect::new(0, 0, w, h)))
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     /// The `key` event end to end, from a `KeyEvent` to the action the loop will
     /// perform: the spec the table matches on, the parsing, and the two ways it
@@ -2556,15 +2654,6 @@ mod tests {
         // and splitting them by hand here is what let the startup half go on using
         // the messages-only path while every test below it stayed green.
         let (records, sent) = cold_start(&path, 20);
-        assert_eq!(
-            records
-                .iter()
-                .filter(|r| agent::panels::is_panel_record(r))
-                .count(),
-            6,
-            "every op is in the log, the streamed chunks included: {records:?}"
-        );
-
         let mut app = App::default();
         replay_transcript(&mut app, &records);
 
@@ -2582,24 +2671,38 @@ mod tests {
         let screen: String = (0..h)
             .flat_map(|y| (0..w).map(move |x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ")))
             .collect();
-        for needle in [
-            "apply_patch: /tmp/x.lua",
-            "before",
-            "after",
-            "local a = 1",
-            "local a = 2",
-            // The streamed tool: its title *and* what it printed. The chunks
-            // arrive after the round that opened it was archived, which is the
-            // case that used to drop them and leave a bare box.
-            "ls -F",
-            "README.md",
-            "lua/",
-        ] {
+        // A resumed box is *history*, so it comes back collapsed: the title and a
+        // `[+]` are what is on screen, and the output is behind a click. Asserting
+        // the contents here would pin the opposite of what was asked for.
+        for needle in ["apply_patch: /tmp/x.lua", "ls -F"] {
             assert!(
                 screen.contains(needle),
-                "the resumed transcript shows {needle:?}:\n{screen}"
+                "the collapsed panel still names itself: {needle:?}\n{screen}"
             );
         }
+        assert!(
+            screen.contains("[+]"),
+            "and offers itself for expansion:\n{screen}"
+        );
+        for hidden in ["local a = 1", "local a = 2", "README.md", "lua/"] {
+            assert!(
+                !screen.contains(hidden),
+                "collapsed, so {hidden:?} is behind the click, not on screen:\n{screen}"
+            );
+        }
+
+        // The drawing is still there — collapsed, not lost. Opening one back up
+        // must give the panel exactly as it was archived, which is what
+        // `a_panel_rebuilt_from_archived_ops_draws_the_same_box` pins on the
+        // rendering side.
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| agent::panels::is_panel_record(r))
+                .count(),
+            6,
+            "every op is in the log, the streamed chunks included: {records:?}"
+        );
 
         // --- and the request half must not see any of it ---
         assert!(
@@ -2622,6 +2725,179 @@ mod tests {
     /// request that started it, so it can be spliced in beside it; a *streamed*
     /// tool's chunks arrive over the frames after, when that request is already
     /// on disk and the recorded position is behind the watermark. Writing the log
+    /// The archive step, and the rule that keeps an empty stream from leaving a mark
+    /// anywhere.
+    ///
+    /// Empty deltas are common and must leave neither a block on screen nor a
+    /// record in the log — and the stream and the archive are one function so they
+    /// cannot disagree, because a chunk drawn but not archived is a resumed session
+    /// missing its thinking.
+    #[test]
+    fn a_reasoning_chunk_is_buffered_unless_it_is_empty() {
+        let mut buf: Vec<serde_json::Value> = Vec::new();
+        assert!(
+            !archive_reasoning("", &mut buf),
+            "an empty delta is not worth drawing"
+        );
+        assert!(buf.is_empty(), "and leaves nothing in the log: {buf:?}");
+
+        assert!(archive_reasoning("thinking", &mut buf), "a real chunk is");
+        assert_eq!(
+            buf.len(),
+            1,
+            "and is buffered as a reasoning record: {buf:?}"
+        );
+        assert_eq!(buf[0]["kind"], "reasoning");
+        assert_eq!(buf[0]["text"], "thinking", "verbatim: {buf:?}");
+
+        // Reconstructable from the record alone — which is the point — and never
+        // part of a request.
+        assert!(is_transcript_record(&buf[0]));
+        assert!(
+            !serde_json::to_string(&replayed_request_history(std::slice::from_ref(&buf[0])))
+                .unwrap()
+                .contains("thinking"),
+            "but it never reaches the model"
+        );
+    }
+
+    /// Reasoning comes back on resume, in its own block and in the right order.
+    ///
+    /// Reasoning never entered the conversation history — it is "observed only"
+    /// — so with nothing archived a resumed session showed the conclusions and
+    /// none of the thinking that reached them. It is archived as its own record
+    /// kind and replayed through the same block the live stream draws.
+    #[test]
+    fn reasoning_is_archived_and_replayed_in_its_own_block() {
+        let path = unique_path("reasoning-archive");
+        let _ = std::fs::remove_file(&path);
+
+        // A turn that thinks, then answers, then calls a tool.
+        let mut lines = vec![
+            json!({"role": "user", "content": "why is it slow?"}),
+            agent::panels::reasoning_record("the stat syscall runs per keystroke.\n"),
+            agent::panels::reasoning_record("that is the whole answer.\n"),
+            json!({"role": "assistant", "content": "because it re-reads it."}),
+        ];
+        lines.push(agent::panels::panel_record(
+            &agent::panels::PanelOp::Create {
+                id: 1,
+                title: "wc -l".into(),
+                boxed: true,
+                conceal_box: false,
+            },
+        ));
+        lines.push(agent::panels::panel_record(
+            &agent::panels::PanelOp::Append {
+                id: 1,
+                text: "  42\n".into(),
+            },
+        ));
+        lines.push(json!({"role": "tool", "tool_call_id": "c1", "content": "{}"}));
+        {
+            let mut mem = agent::memory::Memory::open(&path).expect("log opens");
+            for line in &lines {
+                mem.append(&serde_json::to_string(line).unwrap())
+                    .expect("append");
+            }
+            mem.flush().expect("flush");
+        }
+
+        let (records, sent) = cold_start(&path, 20);
+        let mut app = App::default();
+        replay_transcript(&mut app, &records);
+
+        // The blocks are in the order the turn had them: the question, the
+        // thinking, the answer, the tool's box.
+        let screen: String = panel_screen(&mut app.panel, 100, 40);
+        assert!(
+            screen.contains("the stat syscall runs per keystroke."),
+            "the thinking is readable again:\n{screen}"
+        );
+        // In the order the turn had it: the question, the thinking, the answer.
+        let at = |needle: &str| {
+            screen.find(needle).unwrap_or_else(|| {
+                panic!("{needle:?} is not on screen at all:\n{screen}");
+            })
+        };
+        assert!(
+            at("why is it slow?") < at("the stat syscall runs per keystroke.")
+                && at("the stat syscall runs per keystroke.") < at("because it re-reads it."),
+            "thinking before the answer, not after it:\n{screen}"
+        );
+        assert!(
+            screen.contains("because it re-reads it."),
+            "and the answer is still there:\n{screen}"
+        );
+
+        // Reasoning is drawn, not sent. It was never conversation, and archiving
+        // it must not change that.
+        assert!(
+            !sent.iter().any(is_transcript_record),
+            "neither panels nor reasoning reach the model: {sent:?}"
+        );
+        assert!(
+            !serde_json::to_string(&sent)
+                .unwrap()
+                .contains("per keystroke"),
+            "the thinking is not in the request at all; the answer's own words are, \
+             and only those: {sent:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A frame's log batch is reasoning first, then the messages, with the
+    /// round's drawings among them.
+    ///
+    /// The reasoning order is not cosmetic: the model thinks *before* it answers,
+    /// and a resumed transcript that put the answer above the thinking would read
+    /// backwards.
+    #[test]
+    fn a_batched_frame_logs_its_reasoning_before_its_messages() {
+        let reasoning = vec![
+            agent::panels::reasoning_record("first thought\n"),
+            agent::panels::reasoning_record("second thought\n"),
+        ];
+        let panel = agent::panels::panel_record(&agent::panels::PanelOp::Create {
+            id: 1,
+            title: "ls".into(),
+            boxed: true,
+            conceal_box: false,
+        });
+        let batch = archive_batch(
+            &[
+                json!({"role": "assistant", "content": "the answer"}),
+                json!({"role": "assistant", "tool_calls": [{"id": "c1"}]}),
+            ],
+            0,
+            Some(1),
+            std::slice::from_ref(&panel),
+            &reasoning,
+        );
+        let kinds: Vec<&str> = batch
+            .iter()
+            .map(|r| {
+                if is_transcript_record(r) {
+                    r["kind"].as_str().unwrap_or("?")
+                } else {
+                    r["role"].as_str().unwrap_or("?")
+                }
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "reasoning",
+                "reasoning",
+                "assistant",
+                "panel_op",
+                "assistant"
+            ],
+            "thinking, then the answer, then the box beside the request: {batch:?}"
+        );
+    }
+
     #[test]
     fn a_replayed_tool_result_becomes_one_line_about_the_call() {
         let bulky = "x".repeat(40_000);
