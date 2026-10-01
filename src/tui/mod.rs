@@ -68,6 +68,13 @@ pub struct App {
     /// Where the panel was drawn last frame, so mouse clicks can be mapped
     /// to panel rows between frames.
     panel_area: Option<Rect>,
+    /// Set when a scroll towards older content could not be satisfied, so the loop
+    /// knows the user asked for history the transcript does not have.
+    ///
+    /// Demand, not state. Paging keyed on "the view is at the top" instead would read
+    /// the whole log in one go the moment the offset sat at 0 — which is also its
+    /// resting place whenever the transcript fits on screen.
+    wants_history: bool,
     /// Demo echo: when on (the default, so `bin/chat.rs` stays a pure demo),
     /// `Enter` also appends a canned assistant echo of the input. The agent
     /// sets this off: the submitted text instead goes to the LLM client.
@@ -88,6 +95,7 @@ impl Default for App {
             panel: TurnPanel::default(),
             input: String::new(),
             panel_area: None,
+            wants_history: false,
             echo: true,
             submitted: None,
             status: StatusLine::new(),
@@ -174,6 +182,14 @@ pub enum Action {
     /// rebindable.
     ScrollUp,
     ScrollDown,
+    /// Scroll the transcript by one screen. `PageUp`/`PageDown`.
+    ///
+    /// Separate from [`Action::ScrollUp`] because they are different quantities, and
+    /// binding both to a one-row scroll left no key anywhere that moved a page: going
+    /// back through a long transcript took one keypress per line, which is not
+    /// scrolling.
+    PageUp,
+    PageDown,
     /// Jump to the start or end of the transcript. `Home`/`End`.
     Top,
     Bottom,
@@ -190,6 +206,8 @@ impl Action {
         Action::Conceal,
         Action::ScrollUp,
         Action::ScrollDown,
+        Action::PageUp,
+        Action::PageDown,
         Action::Top,
         Action::Bottom,
     ];
@@ -204,6 +222,8 @@ impl Action {
             Action::Conceal => "conceal",
             Action::ScrollUp => "scroll_up",
             Action::ScrollDown => "scroll_down",
+            Action::PageUp => "page_up",
+            Action::PageDown => "page_down",
             Action::Top => "top",
             Action::Bottom => "bottom",
         }
@@ -431,6 +451,7 @@ impl App {
             // The wheel only moves the transcript, so it decides nothing and
             // reports nothing.
             MouseEventKind::ScrollUp if self.pointer_over_panel(ev.row) => {
+                self.note_history_wanted();
                 for _ in 0..WHEEL_SCROLL_ROWS {
                     self.panel.scroll_up();
                 }
@@ -470,6 +491,31 @@ impl App {
     /// screen with the input box and the status bar.
     pub fn panel_content_w(&self) -> Option<usize> {
         self.panel_area.map(|a| a.width.saturating_sub(1) as usize) // the scrollbar lane
+    }
+
+    /// Whether a scroll towards older history could be satisfied, consuming the
+    /// answer.
+    ///
+    /// Read once per drawn frame by the loop, which is what keeps paging tied to the
+    /// user asking for it: a flag set by input and cleared here cannot fire on its own.
+    pub fn take_history_wanted(&mut self) -> bool {
+        std::mem::take(&mut self.wants_history)
+    }
+
+    /// Record that a scroll upwards found nothing left to scroll to.
+    fn note_history_wanted(&mut self) {
+        if self.panel.at_loaded_top() {
+            self.wants_history = true;
+        }
+    }
+
+    /// The transcript's height in rows, for a scroll by one screen.
+    ///
+    /// A full screen before the first [`Self::render`], since a key can arrive before
+    /// anything has been drawn. One row would be the alternative, and that is the
+    /// mistake this exists to avoid.
+    pub fn panel_viewport_h(&self) -> usize {
+        self.panel_area.map_or(24, |a| a.height as usize)
     }
 
     /// Toggle markup concealment (rendering hides `#`/`**`/backtick markers;
@@ -671,6 +717,7 @@ impl App {
                 Effect::Continue
             }
             Action::ScrollUp => {
+                self.note_history_wanted();
                 self.panel.scroll_up();
                 Effect::Continue
             }
@@ -678,7 +725,19 @@ impl App {
                 self.panel.scroll_down();
                 Effect::Continue
             }
+            Action::PageUp => {
+                self.note_history_wanted();
+                self.panel.page_up(self.panel_viewport_h());
+                Effect::Continue
+            }
+            Action::PageDown => {
+                self.panel.page_down(self.panel_viewport_h());
+                Effect::Continue
+            }
             Action::Top => {
+                // "Show me the beginning" is a request for whatever is at the
+                // beginning, which is behind the window when the log is longer than it.
+                self.wants_history = true;
                 self.panel.jump_top();
                 Effect::Continue
             }

@@ -159,8 +159,10 @@ fn the_shipped_binding_table_resolves_to_real_actions() {
         ("up", Some("scroll_up")),
         ("home", Some("top")),
         ("end", Some("bottom")),
-        ("pageup", Some("scroll_up")),
-        ("pagedown", Some("scroll_down")),
+        // A screen, not a line: these were bound to the one-row scroll, which left
+        // no key anywhere that moved a page.
+        ("pageup", Some("page_up")),
+        ("pagedown", Some("page_down")),
     ] {
         assert_eq!(ask(spec).as_deref(), want, "{spec} is bound to {want:?}");
     }

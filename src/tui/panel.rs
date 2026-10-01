@@ -624,8 +624,7 @@ impl TurnPanel {
     }
 
     /// Put a chunk of older history in front of the transcript — records read back
-    /// from the log as the user scrolls towards them — and keep the view on what they
-    /// were looking at.
+    /// from the log as the user scrolls towards them.
     ///
     /// Ops materialise messages by *appending*, and history has to go at the front,
     /// so the chunk is built in a scratch transcript first and moved. That scratch
@@ -633,22 +632,28 @@ impl TurnPanel {
     /// ones already loaded are highlighted would make the transcript change
     /// appearance halfway up the scroll, which is worse than either consistent look.
     ///
-    /// Four things have to move together or the transcript silently corrupts:
+    /// Two things have to move together or the transcript silently corrupts:
     ///
     /// * **The panel index map.** `panels` maps a panel id to the index of its
     ///   message, so every existing entry shifts down by the chunk's length, or a
     ///   later op would address the wrong message.
-    /// * **The scroll offset.** Rows are counted from the top, so new rows at the top
-    ///   push the content down. Without the shift the view jumps — the worst outcome
-    ///   for someone reading, who would find the text they were on replaced by
-    ///   whatever the scroll landed on.
     /// * **The row cache**, via `ensure_measured`: a paged-in message arrives with no
-    ///   measured height, and every row count from here on is a sum over them.
-    /// * **The measure width**, which `ensure_measured` re-derives when it changes —
-    ///   so a prepend across a resize re-measures everything rather than leaving two
-    ///   widths' worth of row counts mixed together.
+    ///   measured height, and every row count from here on is a sum over them. The
+    ///   measure width comes with it, so a prepend across a resize re-measures
+    ///   everything rather than leaving two widths' worth of row counts mixed
+    ///   together.
     ///
-    /// Returns the rows added, which is what the offset moved by.
+    /// The scroll offset is deliberately left alone. Paging happens only when the
+    /// view is at the top of what is loaded, so the offset is 0 and the chunk lands
+    /// *above* the content on screen. Restoring the offset — adding the chunk's
+    /// height, so the same line stayed under the same row — is the courteous choice
+    /// and the wrong one here: the user scrolled to the end of what existed because
+    /// they wanted what was behind it, and putting the offset back means the gesture
+    /// that fetched the history shows none of it. They would have to scroll up through
+    /// the whole page again to reach what they just asked for.
+    ///
+    /// Returns the rows added, so a caller can tell a page that drew from one that
+    /// did not.
     pub fn prepend_history(&mut self, items: Vec<HistoryItem>, content_w: usize) -> usize {
         if items.is_empty() {
             return 0;
@@ -688,12 +693,6 @@ impl TurnPanel {
         self.collapse_range(0..added);
         self.ensure_measured(content_w);
         let rows: usize = self.messages[..added].iter().map(|m| m.rows).sum();
-        // Only at the top, which is where paging is triggered: the new content is
-        // *above* what the user was looking at, so the view follows it up by exactly
-        // its height and the same line stays under the same row.
-        if self.scroll == 0 {
-            self.scroll += rows;
-        }
         rows
     }
 
@@ -1145,6 +1144,25 @@ impl TurnPanel {
     /// once the view reaches the bottom (see `Self::resolve_scroll`).
     pub fn scroll_down(&mut self) {
         self.scroll += 1;
+    }
+
+    /// Scroll one viewport toward the top.
+    ///
+    /// The unit a reader actually reaches for when going back through a
+    /// transcript. `viewport` is the height in rows, which the caller knows and the
+    /// panel does not — it is given an area per frame and never told what it was.
+    /// Scrolling a screenful is not the same as scrolling `viewport` rows: the last
+    /// line of the screen has to stay on screen, so the view moves by one row less,
+    /// or consecutive presses skip a line at the seam and no scroll position can
+    /// show both pages.
+    pub fn page_up(&mut self, viewport: usize) {
+        self.follow = false;
+        self.scroll = self.scroll.saturating_sub(viewport.max(1) - 1);
+    }
+
+    /// Scroll one viewport toward the bottom.
+    pub fn page_down(&mut self, viewport: usize) {
+        self.scroll += viewport.max(1) - 1;
     }
 
     pub fn jump_top(&mut self) {

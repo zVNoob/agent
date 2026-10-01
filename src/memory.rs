@@ -282,159 +282,107 @@ impl Memory {
 /// messages, and walks backward. A torn trailing record (crash mid-append)
 /// is skipped via a bounded backward scan for the newest intact boundary.
 pub fn read_tail(path: impl AsRef<Path>, n: usize) -> io::Result<Vec<String>> {
-    Ok(read_before(path, Cursor::end(), n)?.records)
-}
-
-/// Where a backward read resumes.
-///
-/// Two fields, because the log's addressable unit is a **block** — a compressed
-/// payload holding however many records fitted under `Options::block_target` — and
-/// a caller rarely wants to stop on a block boundary. A page that stops on a record
-/// count usually stops *inside* a block, and a byte offset alone cannot say where
-/// inside.
-///
-/// `at` is a position to *search backwards from*, not a block's own start. A
-/// backward walk finds the block ending at or before `at`, so a block is found by
-/// the start of the block *after* it: handing back a block's start would find the
-/// block *before* it and skip everything between.
-///
-/// `take` bounds how much of the block found at `at` belongs to the read, and it
-/// counts *leading records wanted*, not records to drop. Resuming just after one
-/// record means the leading `take` records of that block are wanted and the rest are
-/// not — the opposite of skipping them, and the difference between paging over a gap
-/// in the history and paging over it twice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cursor {
-    /// The position to search backwards from.
-    pub at: u64,
-    /// Records to take from the front of the block found at `at`; [`usize::MAX`] for
-    /// all of them.
-    pub take: usize,
-}
-
-impl Cursor {
-    /// Search back from the very end of the log, taking everything.
-    pub fn end() -> Self {
-        Cursor {
-            at: u64::MAX,
-            take: usize::MAX,
-        }
+    let mut f = File::open(path)?;
+    let size = f.metadata()?.len();
+    if n == 0 || size <= HEADER_LEN {
+        return Ok(Vec::new());
     }
 
-    /// Whether there is nothing older at this point.
-    ///
-    /// A page that stops on the oldest record of the first block reaches the header,
-    /// which is the floor nothing older can sit behind.
-    pub fn exhausted(&self) -> bool {
-        self.at <= HEADER_LEN
+    // Collected newest-first (index 0 = newest message), then reversed. Read
+    // directly rather than through [`read_before`]: a tail is the newest `n`
+    // *records*, which lands inside a block, and nothing here needs to resume from
+    // where it stopped — only the transcript's paging does, and that pages whole
+    // blocks.
+    let mut newest_first: Vec<String> = Vec::new();
+    let mut pos = size;
+    while pos > HEADER_LEN && newest_first.len() < n {
+        let Some((start, blen)) = newest_valid_record(&mut f, pos)? else {
+            break;
+        };
+        // Block lines are chronological; prepend them newest-first.
+        newest_first.extend(read_block_lines(&mut f, start, blen)?.into_iter().rev());
+        pos = start;
     }
+    newest_first.truncate(n);
+    newest_first.reverse();
+    Ok(newest_first)
 }
 
-/// One backward page out of the log, with enough bookkeeping to resume from *any*
-/// record in it rather than only from its oldest.
+/// One backward page out of the log: the newest `blocks` blocks, and where to
+/// continue from.
 ///
-/// That bookkeeping is not decoration. A caller that keeps a subset — and one has to:
-/// the newest `n` **messages** come with the panel records interleaved among them,
-/// so the page boundary is not a record count — otherwise has no way to say where
-/// the subset ends, and can only resume from the page's own edge. That is either a
-/// repeat of records already shown or a hole between them, and nothing downstream
-/// can tell which happened.
+/// **Whole blocks, always.** A block is the log's unit of storage — a compressed
+/// payload holding however many records fitted under `Options::block_target`, and
+/// sealed at a turn boundary — so it is the only unit a byte offset can name, and
+/// the only unit worth reading as a unit: records inside a block share one
+/// allocation, so a page boundary inside one would have to address records that
+/// have no separate address to give.
+///
+/// That is what lets the cursor be a single offset again. A page that stopped on a
+/// record count would land inside a block, and resuming would need both an offset
+/// and a count of how much of that block had been taken — a position in the log
+/// that no byte offset can express, and the source of records appearing twice or
+/// not at all between two pages.
 #[derive(Debug, Clone)]
 pub struct Page {
     /// The records read, oldest → newest.
     pub records: Vec<String>,
-    /// `resume[i]` reads the record immediately older than `records[i]`.
-    pub resume: Vec<Cursor>,
-    /// Where to read the next older page from.
-    pub next: Cursor,
+    /// The offset to search backwards from for the next older page. Pass back as
+    /// `end`. [`at_log_start`] once there is nothing older.
+    pub next: u64,
 }
 
-impl Page {
-    /// Where to resume if the caller kept `records[index..]` and dropped everything
-    /// before it.
-    ///
-    /// `index >= records.len()` means everything was kept, which is [`Page::next`].
-    pub fn resume_after(&self, index: usize) -> Cursor {
-        self.resume.get(index).copied().unwrap_or(self.next)
-    }
-}
-
-/// Read up to `n` records ending at `cursor`, walking backwards.
+/// Read the newest `blocks` blocks ending at byte offset `end`, walking backwards.
 ///
-/// The cursor is a [`Cursor`] rather than a bare byte offset because the log stores
-/// records in compressed blocks and stops pages on a record count; see [`Cursor`].
+/// `end` is a search *from* position, not a block's own start: a backward walk
+/// finds the block ending at or before `end`, so a block is found by the start of
+/// the block after it, and [`Page::next`] is that start. Passing a block's own
+/// start would therefore find the block *before* it and step over everything in
+/// between.
 ///
-/// Only the block the cursor points into is bounded by its `take`; blocks older than
-/// it are read whole, so a page that ends inside a block still reaches past it.
-///
-/// The file's size is consulted rather than trusted from the cursor: the file grows
-/// as the session writes, and a cursor from a stale read must not read past what is
+/// The file's size is consulted rather than trusted from `end`: the file grows as
+/// the session writes, and an offset from a stale read must not read past what is
 /// there now.
-pub fn read_before(path: impl AsRef<Path>, cursor: Cursor, n: usize) -> io::Result<Page> {
+pub fn read_before(path: impl AsRef<Path>, end: u64, blocks: usize) -> io::Result<Page> {
     let mut f = File::open(path)?;
     let empty = Page {
         records: Vec::new(),
-        resume: Vec::new(),
-        next: cursor,
+        next: end,
     };
-    if n == 0 || cursor.exhausted() {
+    if blocks == 0 || at_log_start(end) {
         return Ok(empty);
     }
 
-    // Collected newest-first (index 0 = newest), then reversed. `resume` is the
-    // matching cursor per record, so the point to continue an *arbitrary* subset
-    // from is read off by index rather than guessed as the walk goes.
+    // Collected newest-first (index 0 = newest), then reversed.
     let mut newest_first: Vec<String> = Vec::new();
-    let mut resume: Vec<Cursor> = Vec::new();
-    let mut pos = cursor.at.min(f.metadata()?.len());
-    let mut budget = cursor.take;
-    while pos > HEADER_LEN && newest_first.len() < n {
-        // `pos` is where this block is searched from, so it is also how the block
-        // itself is found again — which every record after the first in it needs.
-        let search_from = pos;
+    let mut pos = end.min(f.metadata()?.len());
+    for _ in 0..blocks {
+        if pos <= HEADER_LEN {
+            break;
+        }
         let Some((start, blen)) = newest_valid_record(&mut f, pos)? else {
             break;
         };
         let block = read_block_lines(&mut f, start, blen)?;
-        let count = block.len().min(budget);
-        budget = usize::MAX; // blocks older than the cursor's are read whole
-        for k in (0..count).rev() {
-            newest_first.push(block[k].clone());
-            resume.push(if k == 0 {
-                // Nothing in this block is older than its first record, so continue
-                // from the block's own start — which finds the block before it.
-                Cursor {
-                    at: start,
-                    take: usize::MAX,
-                }
-            } else {
-                // The records older than this one, inside this block, are exactly the
-                // leading `k` of them.
-                Cursor {
-                    at: search_from,
-                    take: k,
-                }
-            });
-        }
+        // Block lines are chronological; prepend them newest-first.
+        newest_first.extend(block.into_iter().rev());
         pos = start;
     }
-
-    // Resume just before the oldest record being returned. Read off the array, not
-    // from `pos`: `pos` is the start of the oldest block *walked*, which still holds
-    // records this page is about to discard. It is the *last* entry, because the
-    // array runs newest-first and `truncate` keeps the newest `n`.
-    newest_first.truncate(n);
-    resume.truncate(n);
-    let next = resume.last().copied().unwrap_or(cursor);
     newest_first.reverse();
-    resume.reverse();
     Ok(Page {
         records: newest_first,
-        resume,
-        next,
+        next: pos.max(HEADER_LEN),
     })
 }
 
+/// Whether an offset from [`read_before`] has reached the front of the log, so
+/// there is nothing older to page in.
+///
+/// The header is the floor: the first block starts there, and a walk that reaches it
+/// has seen every record ever written.
+pub fn at_log_start(offset: u64) -> bool {
+    offset <= HEADER_LEN
+}
 /// Locate the payload start + length of the most recent intact record that
 /// ends at or before `end`.
 ///
@@ -586,15 +534,14 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// Paging backwards through a whole log hands back every record exactly once,
-    /// in order, and stops.
+    /// Paging backwards through a whole log hands back every record exactly once, in
+    /// order, and stops.
     ///
-    /// The unit of storage is a block and the unit of a page is a record count, so
-    /// every page boundary lands *inside* a block and the cursor has to say both
-    /// where to look and how much of what it finds to throw away. Getting the skip
-    /// wrong repeats records; getting it always-zero skips them; failing to advance
-    /// loops forever. All three are invisible to a single-call test and obvious to
-    /// walking the whole log.
+    /// A page is whole blocks, so this walks the log the way the transcript does: a
+    /// block at a time from the end, each page's cursor carried into the next. Every
+    /// failure mode is invisible to a single-call test and obvious here — a cursor
+    /// that repeats a block shows a record twice, one that skips shows a gap, one
+    /// that never advances never returns.
     #[test]
     fn a_backward_walk_returns_every_record_once_and_stops() {
         let p = temp_path("paging");
@@ -602,6 +549,8 @@ mod tests {
             let mut m = Memory::with_options(
                 &p,
                 Options {
+                    // Small enough that 100 messages make a dozen-odd blocks, so the
+                    // walk crosses boundaries on nearly every page.
                     block_target: 256,
                     working_set: 64,
                 },
@@ -613,30 +562,67 @@ mod tests {
             m.flush().expect("flush");
         }
 
-        let mut cursor = Cursor::end();
+        let mut at = u64::MAX;
         let mut pages: Vec<Vec<String>> = Vec::new();
         let mut steps = 0;
-        while !cursor.exhausted() {
-            let page = read_before(&p, cursor, 8).expect("read");
+        while !at_log_start(at) {
+            let page = read_before(&p, at, 2).expect("read");
             assert!(
                 !page.records.is_empty(),
-                "a cursor that is not exhausted must return something"
-            );
-            assert!(
-                page.records.len() <= 8,
-                "a page is the count asked for, not more: {}",
-                page.records.len()
+                "an offset that is not at the log's start must return something"
             );
             pages.push(page.records);
-            cursor = page.next;
+            at = page.next;
             steps += 1;
             assert!(steps < 40, "the walk terminates");
         }
-        // Pages arrive newest-first and each one is oldest-to-newest, so the log
-        // reads back out by walking the pages in reverse.
+        // Pages arrive newest-first and each is oldest-to-newest, so the log reads
+        // back out by walking the pages in reverse.
         let collected: Vec<String> = pages.iter().rev().flat_map(|p| p.iter().cloned()).collect();
         let expected: Vec<String> = (1..=100).map(msg).collect();
         assert_eq!(collected, expected, "every record, once, oldest first");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A page is whole blocks, so two pages cover whole turns and the boundary
+    /// between them is a place the log was actually sealed.
+    #[test]
+    fn a_page_is_whole_blocks_so_a_window_starts_on_a_seal() {
+        let p = temp_path("paging-blocks");
+        {
+            let mut m = Memory::with_options(
+                &p,
+                Options {
+                    block_target: 256,
+                    working_set: 64,
+                },
+            )
+            .expect("open");
+            for i in 1..=60 {
+                m.append(&msg(i)).expect("append");
+            }
+            m.flush().expect("flush");
+        }
+        let whole = read_before(&p, u64::MAX, 300).expect("read everything");
+        let window = read_before(&p, u64::MAX, 2).expect("read two blocks");
+        assert!(
+            window.records.len() < whole.records.len(),
+            "two blocks of a dozen are not the whole log: {} of {}",
+            window.records.len(),
+            whole.records.len()
+        );
+        assert_eq!(
+            &whole.records[whole.records.len() - window.records.len()..],
+            &window.records[..],
+            "the two-block window is the newest two blocks of the log, exactly"
+        );
+        // And the cursor points where the next block begins, not at a record inside
+        // one: continuing from it yields precisely what the window left out.
+        let rest = read_before(&p, window.next, 2).expect("read older");
+        assert!(
+            !rest.records.is_empty() && !window.records.contains(&rest.records[0]),
+            "the page before the window's oldest record, not a repeat of the window"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

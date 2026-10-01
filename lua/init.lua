@@ -556,7 +556,8 @@ end)
 --   "quit"        leave
 --   "interrupt"   stop the running tool
 --   "conceal"     toggle markup concealment
---   "scroll_up" / "scroll_down"    scroll the transcript
+--   "scroll_up" / "scroll_down"    scroll the transcript one line
+--   "page_up" / "page_down"        scroll the transcript one screen
 --   "top" / "bottom"               jump to the start or end
 --
 -- So the smallest useful binding is a lookup:
@@ -609,8 +610,8 @@ local BIND = {
   ["up"]       = "scroll_up",
   ["home"]     = "top",
   ["end"]      = "bottom",
-  ["pageup"]   = "scroll_up",
-  ["pagedown"] = "scroll_down",
+  ["pageup"]   = "page_up",
+  ["pagedown"] = "page_down",
 }
 
 agent.on_event("key", function(k)

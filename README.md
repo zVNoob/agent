@@ -175,24 +175,33 @@ is no second reconstruction from the call's arguments and result, because a
 panel rebuilt from those would be a plausible impostor of one that was archived,
 and a drawing that is not the drawing is worse than an absent one.
 
-What resumes is a *window*: the newest twenty messages, which is the cold-start
-context and everything resident at once. That is not the extent of the history —
-scrolling up past the window pages older records out of the log as they are
-reached, a few at a time, and they reconstruct the same way: panels and all,
-folded. Two things make that more than a bigger read. Paging does **not** touch
-the request history — scrolling back to read something is not asking to send it
-to a model, and silently growing the context on a scroll gesture is a surprise in
-the expensive direction. And each page's panel ids are moved into a range of its
-own, because ids are allocated per tool round, so every chunk of a long session
-has a panel numbered 1 and merged unchecked the older chunk's `Create` would
+What resumes is a *window*: the newest two blocks of the log, which is the
+cold-start context and everything resident at once. **Blocks, not messages** —
+records are appended into a compressed block and sealed at a turn boundary, so a
+block is a turn or two of conversation, whole, and it is the only unit a byte
+offset can name. Counting messages instead cut the window mid-block, so it began
+partway through a turn — a tool's panel with no sentence introducing it.
+
+That window is not the extent of the history. Scrolling up past it pages older
+blocks out of the log as they are reached, and they reconstruct the same way:
+panels and all, folded. `PageUp` moves a screen, `Home` jumps to the start of
+what is loaded, and a scroll that has nowhere left to go fetches what is behind
+it — one page per gesture, shown rather than tucked away, because a page you
+cannot see is a page you have to scroll up through again to read.
+
+Two things make that more than a bigger read. Paging does **not** touch the
+request history — scrolling back to read something is not asking to send it to a
+model, and silently growing the context on a scroll gesture is a surprise in the
+expensive direction. And each page's panel ids are moved into a range of its
+own, because ids are allocated per tool round, so every block of a long session
+has a panel numbered 1 and merged unchecked the older page's `Create` would
 retitle the newer one's box.
 
 The log is the only thing that has to be resident, and it is not: pages are read
-backwards from the end, one compressed block at a time, which is also the log's
-own unit of storage — so a page boundary lands *inside* a block, and the resume
-point has to name a block and how much of its front belongs to the page rather
-than a byte offset. Getting that wrong shows a record twice or skips one, and
-either looks like a rendering fault rather than a paging one.
+backwards from the end, whole blocks at a time, so the resume point is a single
+byte offset and no page can land inside the block it is paging. Getting that
+boundary wrong shows a record twice or skips one, and either looks like a
+rendering fault rather than a paging one.
 
 ---
 
@@ -367,7 +376,8 @@ agent.on_event("key", function(k) return BIND[k.spec] end)   -- see lua/init.lua
 The handler is given `spec` (the chord as a table writes it — `alt+enter`,
 `ctrl+c`, `f5`), `char`, and the three modifier booleans, and returns an action
 name — `newline`, `send`, `quit`, `interrupt`, `conceal`, `scroll_up`,
-`scroll_down`, `top`, `bottom` — or nothing, meaning the key keeps its default.
+`scroll_down`, `page_up`, `page_down`, `top`, `bottom` — or nothing, meaning the key
+keeps its default.
 
 **Returning a name is a shorthand, not the limit.** A handler can also call
 `agent.api.input_insert(text)` (or `input_backspace` / `input_clear`) and change
