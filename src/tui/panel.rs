@@ -1878,8 +1878,22 @@ fn to_display(conceal: &[(usize, usize)], src: usize) -> usize {
     for &(r0, r1) in conceal {
         if r1 <= src {
             hidden += r1 - r0;
+        } else if src < r0 {
+            break; // before this run, and so before every later one
         } else {
-            break;
+            // **Inside** a concealed run. `src` has no display position of its
+            // own — those bytes are not drawn at all — so it maps to where the
+            // run *starts*.
+            //
+            // Falling through to `src - hidden` here is what put a colour
+            // boundary in the wrong place. A segment that begins on a hidden
+            // delimiter — which every grammar segment over an inline span does,
+            // because the span's Source range includes them — came back mapped
+            // to a position *inside* the concealment instead of at its edge, so
+            // the first characters of the span drew in the surrounding style.
+            // In `- **`init.lua`**:` that was the `in` of `init.lua`, left in the
+            // default colour while `it.lua` took the code span's.
+            return r0 - hidden;
         }
     }
     src - hidden
@@ -2519,6 +2533,122 @@ mod tests {
         assert_eq!(to_display(&conceal, 30), 23);
         // Ordering is preserved across markers (monotone mapping).
         assert!(to_display(&conceal, 6) <= to_display(&conceal, 13));
+
+        // An offset *inside* a concealed run has no display position of its own,
+        // so it maps to where the run starts. This is the case the boundary
+        // checks above miss, and it is the common one: a grammar segment for an
+        // inline span starts on the span's opening delimiter, which concealment
+        // has hidden.
+        for inside in 0..2 {
+            assert_eq!(
+                to_display(&conceal, inside),
+                0,
+                "offset {inside} is inside the first concealed run"
+            );
+        }
+        assert_eq!(to_display(&conceal, 10), 8, "the run's first byte");
+        assert_eq!(to_display(&conceal, 11), 8, "and its second");
+        assert_eq!(to_display(&conceal, 20), 16, "same at the third run");
+        assert_eq!(to_display(&conceal, 22), 16);
+        // Still monotone across the whole thing, which the segments rely on.
+        let mapped: Vec<usize> = (0..30).map(|i| to_display(&conceal, i)).collect();
+        assert!(
+            mapped.windows(2).all(|w| w[0] <= w[1]),
+            "the mapping must never go backwards: {mapped:?}"
+        );
+    }
+
+    /// The rendered line is coloured by one style from end to end — the bug this
+    /// whole pair of functions exists to prevent, in the shape it actually took.
+    ///
+    /// `- **`init.lua`**:` hides `**` + the opening backtick as one run and the
+    /// closing backtick + `**` as another, and the code span's segment starts on
+    /// the opening backtick. `to_display` used to map that offset *inside* the
+    /// concealment rather than to its edge, so the segment was clipped two
+    /// characters late: `in` drew in the surrounding style and `it.lua` in the
+    /// code colour.
+    #[test]
+    fn an_inline_span_takes_its_style_across_the_whole_word() {
+        let text = "- **`init.lua`**: x";
+        // The concealment the merge produces: `**\`` and `` `** ``.
+        let mut msg = Message {
+            role: Role::Assistant,
+            text: text.into(),
+            segs: Vec::new(),
+            conceal: vec![(2, 5), (13, 16)],
+            user_segs: Vec::new(),
+            boxed: None,
+            conceal_box: false,
+            collapsed: false,
+            lang: None,
+            overlay: None,
+            panes: None,
+            rows: 0,
+            dirty: true,
+        };
+        let plain = Style::default().add_modifier(Modifier::BOLD);
+        let code = Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD);
+        // What the highlighter produces: a default run for the text before,
+        // the delimiters bold, the code span as one green run *starting on the
+        // opening backtick*, the closing delimiters bold, and a default tail.
+        msg.segs = vec![
+            Segment {
+                start: 0,
+                end: 2,
+                style: Style::default(),
+            },
+            Segment {
+                start: 2,
+                end: 4,
+                style: plain,
+            },
+            Segment {
+                start: 4,
+                end: 14,
+                style: code,
+            },
+            Segment {
+                start: 14,
+                end: 16,
+                style: plain,
+            },
+            Segment {
+                start: 16,
+                end: 19,
+                style: Style::default(),
+            },
+        ];
+
+        let display = display_text(&msg);
+        assert_eq!(display, "- init.lua: x", "the markers are hidden");
+
+        let rows = wrap_concealed(&msg, 40);
+        // One row at 40 cells, so these are that row's spans in order.
+        let row = &rows[0];
+        let line: String = row.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(line, "- init.lua: x", "the visible text, in order");
+
+        // The word is one span in the code style. It used to be two: `in` in the
+        // surrounding default and `it.lua` in the code colour, the boundary
+        // landing two characters into the word.
+        let word: Vec<&Span> = row
+            .iter()
+            .filter(|s| s.content.contains("init") || s.content.contains("lua"))
+            .collect();
+        let word_text: String = word.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            word_text, "init.lua",
+            "and it is contiguous, not split: {word:?}"
+        );
+        for span in &word {
+            assert_eq!(
+                span.style, code,
+                "`{}` must carry the code span's style, not {:?}",
+                span.content, span.style
+            );
+        }
     }
 
     #[test]
