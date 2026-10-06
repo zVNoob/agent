@@ -3,8 +3,9 @@
 # conversation log to ~/.config/agent/ by default.
 /target
 
-# Editor and OS noise.
+# Editor, debugger and OS noise.
 *~
 *.swp
 *.swo
+.gdb_history
 .DS_Store
