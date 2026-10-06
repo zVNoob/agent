@@ -3,62 +3,50 @@
 use super::*;
 
 use crate::testutil::unique_path;
-/// The LuaLS annotation file (`lua/agent_api.meta.lua`) claims a type for
-/// every primitive in the bridge, and a claim like that is only worth
-/// anything if it stays true — an unannotated primitive is exactly what the
-/// file exists to prevent, and a stale one sends a reader after a signature
-/// that no longer exists.
+/// `lua/agent_api.meta.lua` documents the whole bridge, and the loader refuses to
+/// build a VM when the two disagree — so the interesting fact left to pin here is
+/// the one the loader's check cannot see.
 ///
-/// So the two sets are compared, both ways. (`lua/api.lua` is checked
-/// separately, and more strictly, by the loader's drift check at startup: it
-/// is prose the bridge validates. This one is the editor's view of the same
-/// 36, and it is cheap to keep honest.)
+/// The loader compares *sets*: it answers "is every primitive declared?" and "is
+/// every declaration real?". A declaration written twice passes both, because a
+/// `BTreeSet` keeps one. That is worth catching, since the duplicated stub is the
+/// kind of edit that looks like tidying, and it leaves two places to update the next
+/// time the signature changes.
+///
+/// The declared side comes from [`declared_primitives`] rather than a scan written
+/// here: a second implementation of the marker would agree with the loader until the
+/// day it did not, and then it would be the thing disagreeing while claiming to
+/// check it.
 #[test]
-fn the_lua_ls_annotations_cover_exactly_the_bridge() {
+fn the_lua_ls_annotations_cover_exactly_the_bridge_once_each() {
+    // The bridge, from the function the loader itself builds it with — `agent.api` is
+    // a locked proxy whose `pairs` yields nothing on purpose, so the names are not
+    // reachable from Lua at all.
     let lua = new_vm().expect("vm");
-    // `agent.api` itself cannot be enumerated from Lua: it is a *locked*
-    // table, a proxy whose `pairs` yields nothing on purpose, so that a typo
-    // in a primitive name raises instead of reading as nil. Its names are
-    // enumerated through `agent.api_docs` instead — which is sound because
-    // the loader refuses to build a VM whose `api_docs` and the real bridge
-    // disagree, so this VM existing is already the proof they match.
-    let joined: String = lua
-        .load(
-            r#"
-        local names = {}
-        for name in pairs(agent.api_docs) do names[#names + 1] = name end
-        table.sort(names)
-        return table.concat(names, "\n")
-    "#,
-        )
-        .eval()
-        .expect("enumerate the bridge");
-    let bridge: Vec<&str> = joined.lines().collect();
+    let api = crate::lua::bridge::install_api(&lua, None, None).expect("bridge");
+    let mut bridge: Vec<String> = Vec::new();
+    for pair in api.pairs::<String, mlua::Value>() {
+        bridge.push(pair.expect("a bridge entry").0);
+    }
+    bridge.sort();
     assert_eq!(
         bridge.len(),
         36,
         "the bridge's size is part of the contract"
     );
 
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua/agent_api.meta.lua"),
-    )
-    .expect("read the annotation file");
-    let declared: Vec<&str> = source
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("function agent.api."))
-        .filter_map(|rest| rest.split('(').next())
-        .collect();
+    let meta = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua/agent_api.meta.lua");
+    let declared = crate::lua::bridge::declared_primitives(&meta).expect("read the meta file");
 
     let untyped: Vec<&str> = bridge
         .iter()
-        .filter(|b| !declared.iter().any(|d| d == *b))
-        .copied()
+        .filter(|b| !declared.contains(*b))
+        .map(String::as_str)
         .collect();
     let invented: Vec<&str> = declared
         .iter()
         .filter(|d| !bridge.contains(d))
-        .copied()
+        .map(String::as_str)
         .collect();
     assert!(
         untyped.is_empty(),
@@ -68,7 +56,19 @@ fn the_lua_ls_annotations_cover_exactly_the_bridge() {
         invented.is_empty(),
         "lua/agent_api.meta.lua annotates these, which are not primitives: {invented:?}"
     );
-    assert_eq!(declared.len(), 36, "and it declares each one exactly once");
+
+    // The set comparison above cannot see a duplicate; the line count can.
+    let occurrences = std::fs::read_to_string(&meta)
+        .expect("read the meta file")
+        .lines()
+        .filter(|l| l.trim_start().starts_with("function agent.api."))
+        .count();
+    assert_eq!(
+        occurrences,
+        bridge.len(),
+        "each primitive is declared exactly once — the loader compares sets, so a \
+         second stub for one primitive would pass it"
+    );
 }
 
 /// `lua/mcps.lua` is the shipped connection set as one registry — the same

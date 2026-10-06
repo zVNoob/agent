@@ -17,7 +17,7 @@ use mlua::{AnyUserData, Lua, Table, UserData};
 
 use crate::panels::PanelSink;
 
-use super::bridge::{install_api, load_api_docs, lock_table, verify_api_annotations};
+use super::bridge::{install_api, lock_table, verify_api_annotations};
 use super::config::{ConfigOrigin, ConfigSource, ensure_config};
 use super::tree::{install_require, load_init, load_init_at, load_lib_modules, lua_dir};
 use super::usage::install_usage;
@@ -289,12 +289,6 @@ pub(super) fn setup_tree(
             agent.set("llm", lua.create_table()?)?;
         }
     }
-    // The bridge's annotations, required by the *loader* rather than by the
-    // configuration script. The drift check below is a statement about the
-    // bridge, so it cannot depend on a file the user is invited to edit: making
-    // `agent.api_docs` the configuration's job meant that deleting one line from
-    // your own config stopped the agent with a message about a missing require.
-    load_api_docs(lua)?;
     // The configuration script: the user's, seeded from the tree's on first run
     // (see `ConfigSource`). Exactly one script runs — the user's file is not an
     // overlay on top of the shipped one, it *is* the configuration.
@@ -310,9 +304,13 @@ pub(super) fn setup_tree(
     // inside `agent.llm`, which is why this runs after the entry script created
     // it.
     install_usage(lua)?;
-    // The annotations were loaded above; they and the bridge must not drift
-    // apart.
-    verify_api_annotations(lua, &api)?;
+    // The bridge and its documentation must not drift apart. Read from the tree
+    // rather than from the configuration, and that is deliberate: the check is a
+    // statement about the bridge, so it cannot depend on a file the user is
+    // invited to edit. It used to be a `require("api")` and a table walk, when the
+    // annotations were a Lua file of prose data; they are a `---@meta` file now,
+    // which cannot be executed and so is read as text.
+    verify_api_annotations(&api, &dir.join("agent_api.meta.lua"))?;
     Ok(())
 }
 

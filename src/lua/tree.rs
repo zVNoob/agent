@@ -15,7 +15,9 @@ use mlua::{Lua, Table};
 // The tree ships alongside the binary:
 //
 //   lua/init.lua      the entry script — the only top-level script, run last
-//   lua/api.lua       annotations for the `agent.api` bridge
+//   agent_api.meta.lua  the `agent.api` bridge: types for a language server,
+//                       and the documentation the loader checks against the
+//                       real bridge at startup
 //   lua/fs.lua …      top-level modules, required on demand
 //   lua/lib/**.lua    the module directory: every one is required (and cached)
 //                     at VM setup, and any of them can require the others

@@ -31,13 +31,11 @@ fn a_fixture_tree_loads_nested_root_and_entry_in_order() {
     std::fs::write(dir.join("shadowed.lua"), "return { from = 'root' }").expect("root module");
     std::fs::write(dir.join("only_root.lua"), "return { from = 'root' }")
         .expect("root-only module");
-    // The entry script records which of the fixture modules were already
-    // loaded by the time it ran, and publishes the bridge annotations
-    // exactly as the shipped `lua/init.lua` does.
+    // The entry script records which of the fixture modules were already loaded
+    // by the time it ran.
     std::fs::write(
         dir.join("init.lua"),
         r#"
-            agent.api_docs = require("api")
             __init_saw = {}
             for _, name in ipairs({ "net.http", "only_root", "shadowed", "widgets" }) do
               __init_saw[name] = package.loaded[name] ~= nil
@@ -47,8 +45,12 @@ fn a_fixture_tree_loads_nested_root_and_entry_in_order() {
     )
     .expect("entry script");
     // The real annotation file: a fixture tree has to satisfy the same
-    // bridge/annotation check the shipped one does.
-    std::fs::copy(tree().join("api.lua"), dir.join("api.lua")).expect("copy api.lua");
+    // bridge/documentation check the shipped one does.
+    std::fs::copy(
+        tree().join("agent_api.meta.lua"),
+        dir.join("agent_api.meta.lua"),
+    )
+    .expect("copy agent_api.meta.lua");
 
     let lua = Lua::new();
     setup_tree(&lua, None, None, &dir, &ConfigSource::Tree).expect("fixture tree setup");
@@ -95,7 +97,11 @@ fn a_fixture_tree_loads_nested_root_and_entry_in_order() {
 fn a_silent_tool_and_a_failing_tool_both_reach_the_model_and_draw_nothing() {
     let dir = fixture("quiet");
     std::fs::create_dir_all(dir.join("lib")).expect("fixture dir");
-    std::fs::copy(tree().join("api.lua"), dir.join("api.lua")).expect("api.lua");
+    std::fs::copy(
+        tree().join("agent_api.meta.lua"),
+        dir.join("agent_api.meta.lua"),
+    )
+    .expect("agent_api.meta.lua");
     // The tool table written out rather than built with `agent.utils.tool`:
     // a fixture tree has no `lib/` modules, so `agent.utils` is nil. This is
     // the shape `utils.tool` produces (`lua/lib/utils.lua`), spelled here so
@@ -103,7 +109,6 @@ fn a_silent_tool_and_a_failing_tool_both_reach_the_model_and_draw_nothing() {
     std::fs::write(
         dir.join("init.lua"),
         r#"
-            agent.api_docs = require("api")
             local function tool(description, callback)
               return { description = description,
                        signature = { type = "object", properties = {} },
@@ -359,4 +364,57 @@ fn shipped_tree_has_an_entry_script_and_lib_modules() {
         .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("lua"))
         .count();
     assert!(modules > 0, "no lua/lib/*.lua modules shipped");
+}
+
+/// The bridge's documentation is checked against the real bridge, both ways, and
+/// each direction is its own way to be wrong: a primitive nobody wrote down is
+/// folklore, and a declaration for a primitive that is gone is a promise the agent
+/// cannot keep.
+///
+/// The check reads `lua/agent_api.meta.lua` rather than `require`ing it — a
+/// `---@meta` file is comments, and running it would define functions against the
+/// *locked* bridge table. So these drive a fixture tree with a doctored copy of that
+/// file, which is the only way to reach the failure at all.
+#[test]
+fn a_primitive_with_no_declaration_stops_the_vm() {
+    let dir = fixture("undocumented");
+    std::fs::create_dir_all(dir.join("lib")).expect("fixture dir");
+    std::fs::write(dir.join("init.lua"), "-- nothing\n").expect("init");
+    let meta = std::fs::read_to_string(tree().join("agent_api.meta.lua")).expect("read meta");
+    // Drop `step`: a real edit would be adding a Rust primitive and forgetting this.
+    let doctored = meta
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("function agent.api.step("))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dir.join("agent_api.meta.lua"), doctored).expect("meta");
+
+    let lua = Lua::new();
+    let err = setup_tree(&lua, None, None, &dir, &ConfigSource::Tree)
+        .expect_err("an undocumented primitive must not build");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no declaration") && msg.contains("step"),
+        "the message names the primitive and the reason, not just a failure: {msg}"
+    );
+}
+
+#[test]
+fn a_declaration_for_a_primitive_that_is_gone_stops_the_vm() {
+    let dir = fixture("stale-decl");
+    std::fs::create_dir_all(dir.join("lib")).expect("fixture dir");
+    std::fs::write(dir.join("init.lua"), "-- nothing\n").expect("init");
+    let meta = std::fs::read_to_string(tree().join("agent_api.meta.lua")).expect("read meta");
+    // A renamed primitive: the declaration outlived the function.
+    let doctored = format!("{meta}\nfunction agent.api.spawn_v2(cmdline) end\n");
+    std::fs::write(dir.join("agent_api.meta.lua"), doctored).expect("meta");
+
+    let lua = Lua::new();
+    let err = setup_tree(&lua, None, None, &dir, &ConfigSource::Tree)
+        .expect_err("a declaration for a primitive that does not exist must not build");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("do not exist") && msg.contains("spawn_v2"),
+        "the message names the stale declaration: {msg}"
+    );
 }

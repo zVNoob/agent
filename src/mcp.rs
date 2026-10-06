@@ -747,8 +747,8 @@ fn lua_sleep(_: &Lua, ms: i64) -> mlua::Result<()> {
 /// `json_decode(text) -> value`, `http_req` / `http_step` / `http_close`,
 /// `sse_open` / `sse_step` / `sse_close`, and `sleep(ms)` — the internal
 /// thread-sleep fallback for the public `agent.on_timeout` timer. Each is
-/// annotated in `lua/api.lua`; the loader refuses a VM whose annotations and
-/// this table disagree.
+/// declared in `lua/agent_api.meta.lua`; the loader refuses a VM whose
+/// documentation and this table disagree.
 pub fn install_bridge(lua: &Lua, api: &Table) -> mlua::Result<()> {
     api.set("json_encode", lua.create_function(lua_json_encode)?)?;
     api.set("json_decode", lua.create_function(lua_json_decode)?)?;

@@ -1,19 +1,27 @@
 ---@meta
 --
--- agent_api.meta.lua — Lua Language Server types for the locked `agent.api`
--- bridge, the Rust primitives every Lua module is built on.
+-- agent_api.meta.lua — the documentation of the locked `agent.api` bridge: the
+-- Rust primitives every Lua module is built on.
 --
--- `agent.api` is not a Lua file: Rust installs it as a **locked** table at VM
--- setup (`src/lua/bridge.rs`, `install_api`), and the loader refuses to start if its
--- contents and `lua/api.lua` disagree. So there is nothing for LuaLS to read
--- from the module itself, and every `agent.api.step(h)` in the tree is an
--- unknown global to a language server without this file. It is the type view of
--- the same 36 primitives, and it is a *view*: the authority is `lua/api.lua`,
--- which is prose the loader checks against the real bridge at startup.
+-- `agent.api` is not a Lua file. Rust installs it as a **locked** table at VM
+-- setup (`src/lua/bridge.rs`, `install_api`), so there is nothing for LuaLS — or
+-- for `require` — to read from the bridge itself, and every `agent.api.step(h)`
+-- in the tree is an unknown global without this file. That is what it is for.
+--
+-- **This file is the authority, and the loader checks it.** A second file used to
+-- hold the same 36 primitives as prose data (`lua/api.lua`) for the loader to
+-- `require` and compare against the real bridge. It was a worse copy of what is
+-- here — less detail, and two files to keep in step by hand — so it is gone, and
+-- `verify_api_annotations` reads *this* file instead. Because a `---@meta` file is
+-- comments and must never be executed, that check is a text scan for
+-- `function agent.api.<name>(`: a primitive with no declaration here, or a
+-- declaration naming a primitive that no longer exists, is a startup error rather
+-- than folklore. **So the `function agent.api.x(...) end` stubs are load-bearing,
+-- not illustrative** — deleting one to tidy the file breaks the agent.
 --
 -- Loading: `runtime.metaFiles` in `.luarc.json` names this file (and the
 -- `.meta.lua` suffix means LuaLS also picks it up on its own). Nothing here
--- executes — it is declarations only, which is what `---@meta` means.
+-- executes, which is what `---@meta` means and also why it cannot be `require`d.
 --
 -- Conventions below:
 --   * `agent.SandboxHandle` is the seccomp run's userdata; an HTTP/SSE handle is
@@ -32,7 +40,6 @@
 
 ---@class agent
 ---@field api agent.api The locked Rust bridge. Assigning to it raises; every field is a primitive.
----@field api_docs table The annotations in `lua/api.lua`, as data.
 ---@field ask table Permission questions and the trust tables (`lua/lib/ask.lua`).
 ---@field allow fun(): boolean Allow a frozen syscall (`agent.allow()`).
 ---@field deny fun(reason?: string): table Deny one, with a reason (`agent.deny(reason)`).
@@ -243,6 +250,7 @@ agent = agent or {}
 ---Start a sandboxed `bash -c`. `mask` is the syscall-name interception mask:
 ---only those are trapped, and anything unlisted runs straight through the kernel.
 ---An unknown name is an error, so a typo cannot silently trace nothing.
+---Prefer `agent.bash`.
 ---@param cmdline string What bash runs (`bash -c <cmdline>`).
 ---@param mask string[]? Syscall names to intercept. `nil`/absent traps nothing but the always-on fork family.
 ---@return agent.SandboxHandle
@@ -250,6 +258,7 @@ function agent.api.spawn(cmdline, mask) end
 
 ---Advance the run by one step. Blocks in `poll` when off the reactor (the wait
 ---is here), and returns `idle` immediately on one.
+---The pump loop inside `agent.bash` (`s.pump` / `s:run`) is this.
 ---@param handle agent.SandboxHandle
 ---@return agent.StepEvent
 function agent.api.step(handle) end
@@ -261,15 +270,18 @@ function agent.api.step(handle) end
 function agent.api.decide(handle, verdict) end
 
 ---Kill the run now.
+---Prefer `s:kill()` on the stream object.
 ---@param handle agent.SandboxHandle
 function agent.api.kill(handle) end
 
 ---Write to the tracee's stdin.
+---Prefer `s:write_stdin(data)`.
 ---@param handle agent.SandboxHandle
 ---@param data string
 function agent.api.write(handle, data) end
 
 ---Close the tracee's stdin, so a command reading it sees EOF.
+---Prefer `s:close_stdin()`.
 ---@param handle agent.SandboxHandle
 function agent.api.close_stdin(handle) end
 
@@ -280,6 +292,7 @@ function agent.api.close_stdin(handle) end
 ---argument, it continues the current conversation. Returns whether it queued —
 ---`false` when no loop is bound to drain the command, which is the probe and the
 ---tests.
+---Prefer `agent.trigger`.
 ---@param args string|table|any
 ---@return boolean
 function agent.api.trigger(args) end
@@ -294,6 +307,7 @@ function agent.api.trigger(args) end
 ---command has already been chosen.
 ---
 ---Returns whether it queued; `false` when no loop is bound to drain it.
+---The route an `agent.on_event("key")` handler uses to *type*.
 ---@param text string What to append.
 ---@return boolean
 function agent.api.input_insert(text) end
@@ -305,6 +319,7 @@ function agent.api.input_insert(text) end
 function agent.api.input_backspace() end
 
 ---Empty the input line, as `Ctrl+u` does in readline.
+---The clearing counterpart to `input_insert`.
 ---@return boolean
 function agent.api.input_clear() end
 
@@ -313,6 +328,7 @@ function agent.api.input_clear() end
 ---
 ---With no handler bound — headless, the tests, the probe — this returns `false`,
 ---so an asking policy always terminates rather than hanging.
+---Prefer `agent.ask` (yield-based, for policies driven from the event loop).
 ---@param text string The question, as shown.
 ---@param always boolean? Whether remembering the answer is on offer.
 ---@return agent.Verdict
@@ -322,26 +338,31 @@ function agent.api.ask_user(text, always) end
 
 ---Append a message to the open log. A string is stored verbatim; a table is
 ---stored as JSON. Raises when nothing is open.
+---Prefer `agent.memory.append(message)`.
 ---@param msg string|table
 ---@return integer The sequence number it was filed under.
 function agent.api.memory_append(msg) end
 
 ---Seal everything buffered to disk now. Harmless when nothing is open.
+---Prefer `agent.memory.flush()`.
 ---@return boolean
 function agent.api.memory_flush() end
 
 ---The newest `n` messages as JSON strings, oldest first. Raises when nothing is open.
+---Prefer `agent.memory.latest(n)`.
 ---@param n integer
 ---@return table
 function agent.api.memory_latest(n) end
 
 ---Where the log is, or `nil` when nothing is open — informational either way.
+---Prefer `agent.memory.path()`.
 ---@return string?
 function agent.api.memory_path() end
 
 -- -- the JSON boundary ---------------------------------------------------------
 
 ---Encode a Lua value as JSON text.
+---The JSON-RPC framing inside `agent.mcp` is this.
 ---@param value any
 ---@return string
 function agent.api.json_encode(value) end
@@ -356,6 +377,7 @@ function agent.api.json_decode(text) end
 
 ---Fire a request. The response is *polled*, never waited on: `headers`, then
 ---one or more `chunk`s, then `done` or `error`.
+---Prefer `agent.http(method, url, opts)` — the request route.
 ---@param method string
 ---@param url string Absolute.
 ---@param headers table<string, string>?
@@ -376,6 +398,7 @@ function agent.api.http_step(handle) end
 function agent.api.http_close(handle) end
 
 ---Open an event stream.
+---Prefer `agent.http(url, { on_event = fn })` — the stream route.
 ---@param url string
 ---@param headers table<string, string>?
 ---@return agent.Transport
@@ -393,6 +416,7 @@ function agent.api.sse_close(handle) end
 
 ---The name for a literal address, or `nil` when it has none. A miss is normal and
 ---cheap, so a question can always fall back to showing the address alone.
+---`agent.seccomp.host_of(sys)` — the name a connect question shows.
 ---@param ip string
 ---@return string?
 function agent.api.reverse_dns(ip) end
@@ -412,12 +436,14 @@ function agent.api.sleep(ms) end
 -- through the handle's methods.
 
 ---Create a panel and return its id.
+---Prefer `agent.panel(title, opts)`.
 ---@param title string
 ---@param opts { boxed: boolean?, conceal_box: boolean? }?
 ---@return integer
 function agent.api.panel_create(title, opts) end
 
 ---Append to a panel.
+---Prefer `p:append(text)`.
 ---@param id integer
 ---@param text string
 function agent.api.panel_append(id, text) end
@@ -428,6 +454,7 @@ function agent.api.panel_append(id, text) end
 function agent.api.panel_set(id, text) end
 
 ---Tint a byte range, e.g. `"bold.red"`. Past the end of the text it is ignored.
+---Prefer `p:highlight(start, finish, style)`.
 ---@param id integer
 ---@param start integer Byte offset, inclusive.
 ---@param finish integer Byte offset, exclusive.
@@ -435,6 +462,7 @@ function agent.api.panel_set(id, text) end
 function agent.api.panel_highlight(id, start, finish, style) end
 
 ---Drop every highlight.
+---Prefer `p:clear_regions()`.
 ---@param id integer
 function agent.api.panel_clear_regions(id) end
 
@@ -445,18 +473,21 @@ function agent.api.panel_clear_regions(id) end
 function agent.api.panel_overlay(id, text, always) end
 
 ---Create a two-pane panel and return its id.
+---Prefer `agent.split_panel(title, panes)`.
 ---@param title string
 ---@param panes (string|{ caption: string?, lang: string? })[] One entry per pane, in order.
 ---@return integer
 function agent.api.panel_split(title, panes) end
 
 ---Set one pane's contents.
+---Prefer `p:set_pane(pane, text)`.
 ---@param id integer
 ---@param pane integer 1-based.
 ---@param text string
 function agent.api.panel_pane_set(id, pane, text) end
 
 ---Set one pane's grammar; `nil` for plain text.
+---Prefer `p:set_pane_lang(pane, lang)`.
 ---@param id integer
 ---@param pane integer 1-based.
 ---@param lang string?

@@ -187,43 +187,6 @@ fn api_namespace_is_locked_and_annotated() {
     );
 }
 
-/// `agent.api_docs` documents the whole bridge: one entry per primitive,
-/// each with a summary — which the loader already enforces at startup, so
-/// this pins the *shape* a consumer (or `agent.help`) can rely on.
-#[test]
-fn api_docs_cover_the_bridge() {
-    let lua = vm();
-    let (count, problems): (usize, String) = lua
-        .load(
-            r#"
-            local bad, n = {}, 0
-            for name, entry in pairs(agent.api_docs) do
-              n = n + 1
-              if type(entry) ~= "table" or type(entry.summary) ~= "string"
-                 or entry.summary == "" then
-                bad[#bad + 1] = name
-              end
-              for _, arg in ipairs(entry.args or {}) do
-                if type(arg) ~= "table" or type(arg[1]) ~= "string"
-                   or type(arg[2]) ~= "string" or type(arg[3]) ~= "string" then
-                  bad[#bad + 1] = name .. ".args"
-                end
-              end
-            end
-            return n, table.concat(bad, ",")
-        "#,
-        )
-        .eval()
-        .expect("api_docs eval");
-    // Every primitive is documented: the VM would not have built otherwise,
-    // so the count is the bridge's size.
-    assert_eq!(count, 36, "lua/api.lua should annotate all 36 primitives");
-    assert!(
-        problems.is_empty(),
-        "malformed annotation entries: {problems}"
-    );
-}
-
 /// A bridge primitive still works through the namespace (the JSON boundary
 /// is the cheapest one to exercise end to end).
 #[test]

@@ -35,8 +35,12 @@ fn lib_modules_capture_siblings_with_require_not_agent() {
         "return { via_agent = agent.seccomp ~= nil }",
     )
     .expect("late module");
-    std::fs::copy(tree().join("api.lua"), dir.join("api.lua")).expect("api.lua");
-    std::fs::write(dir.join("init.lua"), "agent.api_docs = require(\"api\")\n").expect("init");
+    std::fs::copy(
+        tree().join("agent_api.meta.lua"),
+        dir.join("agent_api.meta.lua"),
+    )
+    .expect("agent_api.meta.lua");
+    std::fs::write(dir.join("init.lua"), "-- nothing to do\n").expect("init");
 
     let lua = Lua::new();
     setup_tree(&lua, None, None, &dir, &ConfigSource::Tree).expect("fixture tree setup");

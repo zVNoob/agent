@@ -7,6 +7,8 @@
 //! the `agent.api.panel_*` entry points are bridge primitives like any other.
 //!
 use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::rc::Rc;
 
 use mlua::{Lua, Table};
@@ -25,17 +27,17 @@ use super::vm::{AskHandler, SinkSlot};
 // (the namespace carries the "this is the substrate" signal, so there is no `_`
 // prefix left to carry as well). Three properties:
 //
-//   * **one place**: `agent.api.<name>`, annotated in `lua/api.lua` and
-//     published as `agent.api_docs` — so the surface is discoverable instead
-//     of folklore spread over the driver.
+//   * **one place**: `agent.api.<name>`, declared in
+//     `lua/agent_api.meta.lua` — so the surface is discoverable instead of
+//     folklore spread over the driver.
 //   * **read-only**: `agent.api` is a proxy whose metatable raises on any
 //     assignment and hides itself from `getmetatable`/`setmetatable`
 //     ([`lock_table`]), so a policy cannot rewrite the bridge it is judged by.
 //     (The `agent.api` slot itself is still an ordinary key on `agent`; the
 //     sandbox's real security boundary is seccomp, not this table.)
 //   * **annotated or it does not ship**: [`verify_api_annotations`] fails the
-//     VM when a primitive has no entry in `lua/api.lua`, or an entry names a
-//     function that does not exist.
+//     VM when a primitive has no declaration in `lua/agent_api.meta.lua`, or a
+//     declaration names a function that does not exist.
 //
 // Lua-side fields deliberately stay on `agent` (they are not the bridge):
 // `agent._events` (the hook registry), `agent.__on_reactor` (a flag Rust sets
@@ -150,50 +152,80 @@ pub(super) fn lock_table(lua: &Lua, real: Table, name: &str) -> mlua::Result<Tab
     Ok(proxy)
 }
 
-pub(super) fn load_api_docs(lua: &Lua) -> mlua::Result<()> {
-    let require: mlua::Function = lua.globals().get("require")?;
-    let docs: mlua::Value = require
-        .call("api")
-        .map_err(|e| mlua::Error::RuntimeError(format!("agent.api: require(\"api\"): {e}")))?;
-    let agent: Table = lua.globals().get("agent")?;
-    agent.set("api_docs", docs)
+/// The primitives `lua/agent_api.meta.lua` declares, read as text.
+///
+/// A `---@meta` file is comments and must never be executed — `require`ing it would
+/// run `function agent.api.x() end` against a *locked* table and raise — so the
+/// declarations are read rather than loaded. `function agent.api.<name>(` is the
+/// marker, required to start the line so a mention inside a comment is not mistaken
+/// for a declaration.
+///
+/// That marker is a contract, and the file says so: the stubs look illustrative and
+/// are not. `std::fs::read_to_string` failing is an error rather than an empty set,
+/// because "this file declared no primitives" and "this file was not found" would
+/// otherwise report the same way — as thirty-six undocumented primitives, which
+/// sends the reader to the bridge instead of to the file that went missing.
+pub(super) fn declared_primitives(meta: &Path) -> std::io::Result<BTreeSet<String>> {
+    const MARKER: &str = "function agent.api.";
+    let text = std::fs::read_to_string(meta)?;
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix(MARKER)?;
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect())
 }
 
-pub(super) fn verify_api_annotations(lua: &Lua, api: &Table) -> mlua::Result<()> {
-    let agent: Table = lua.globals().get("agent")?;
-    let docs: Table = agent.get("api_docs").map_err(|_| {
-        mlua::Error::RuntimeError("agent.api: no api_docs — lua/api.lua did not load".to_string())
+/// Fail the VM unless `lua/agent_api.meta.lua` and the real bridge name the same
+/// primitives.
+///
+/// Both directions, because both are ways to be wrong: a primitive nobody wrote
+/// down is folklore, and a declaration for a primitive that is gone is a
+/// documentation promise the agent cannot keep.
+///
+/// Compared as two sets rather than by probing the table. Probing is what this used
+/// to do — `api.get(name).is_err()` — and it does not work here: `api` is the plain
+/// table [`install_api`] built, not the locked proxy, and on a plain table a missing
+/// key reads as `Ok(Null)` rather than an error. So the stale direction silently
+/// never fired, and a declaration for a renamed primitive passed. The proxy is the
+/// thing that raises, and by then there is nothing left to check.
+pub(super) fn verify_api_annotations(api: &Table, meta: &Path) -> mlua::Result<()> {
+    let declared = declared_primitives(meta).map_err(|e| {
+        mlua::Error::RuntimeError(format!("agent.api: cannot read {}: {e}", meta.display()))
     })?;
-    let mut undocumented: Vec<String> = Vec::new();
+
+    let mut installed: BTreeSet<String> = BTreeSet::new();
     for pair in api.pairs::<String, mlua::Value>() {
-        let (name, _) = pair?;
-        match docs.get::<Table>(name.as_str()) {
-            Ok(entry) => {
-                if entry.get::<String>("summary").is_err() {
-                    undocumented.push(name);
-                }
-            }
-            Err(_) => undocumented.push(name),
-        }
+        installed.insert(pair?.0);
     }
-    undocumented.sort();
+
+    let undocumented: Vec<&str> = installed
+        .iter()
+        .filter(|name| !declared.contains(*name))
+        .map(String::as_str)
+        .collect();
     if !undocumented.is_empty() {
         return Err(mlua::Error::RuntimeError(format!(
-            "agent.api: no entry in lua/api.lua for: {}",
+            "agent.api: no declaration in {} for: {}",
+            meta.display(),
             undocumented.join(", ")
         )));
     }
-    let mut stale: Vec<String> = Vec::new();
-    for pair in docs.pairs::<String, mlua::Value>() {
-        let (name, _) = pair?;
-        if api.get::<mlua::Value>(name.as_str()).is_err() {
-            stale.push(name);
-        }
-    }
-    stale.sort();
+
+    let stale: Vec<&str> = declared
+        .iter()
+        .filter(|name| !installed.contains(*name))
+        .map(String::as_str)
+        .collect();
     if !stale.is_empty() {
         return Err(mlua::Error::RuntimeError(format!(
-            "agent.api: lua/api.lua documents functions that do not exist: {}",
+            "agent.api: {} declares functions that do not exist: {}",
+            meta.display(),
             stale.join(", ")
         )));
     }
