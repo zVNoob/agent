@@ -75,11 +75,13 @@ pub fn memory_config(lua: &Lua) -> Result<MemoryConfig, String> {
         .globals()
         .get("agent")
         .map_err(|e| format!("memory config: agent table: {e}"))?;
-    let config: Table = agent
-        .get("llm")
-        .map_err(|e| format!("memory config: agent.llm: {e}"))?;
+    // `agent.llm` is a convention Rust reads and never creates, so its absence is a
+    // config that enabled nothing rather than a broken one. Defaults either way.
     let mut cfg = MemoryConfig::default();
-    let Ok(t) = config.get::<Table>("memory") else {
+    let Ok(llm) = agent.get::<Table>("llm") else {
+        return Ok(cfg); // not configured: defaults
+    };
+    let Ok(t) = llm.get::<Table>("memory") else {
         return Ok(cfg); // not configured: defaults
     };
     if let Some(enabled) =

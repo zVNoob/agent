@@ -333,8 +333,20 @@ pub struct Chat {
 
 impl Chat {
     pub fn connect(config: &ChatConfig, tools: Vec<ToolDef>) -> Self {
+        Self::connect_with(Client::new(), config, tools)
+    }
+
+    /// [`Chat::connect`] over a caller-supplied HTTP client.
+    ///
+    /// `reqwest::Client` owns a connection pool and a client is meant to outlive a
+    /// request, so building one per turn throws the pool away every time — which is
+    /// invisible for the main loop's one client and wasteful for a nested turn, where
+    /// a client is constructed per request precisely because model, endpoint and tool
+    /// set are arguments. `Client` is a handle over shared state, so cloning one per
+    /// turn is cheap and the connections are kept.
+    pub fn connect_with(client: Client, config: &ChatConfig, tools: Vec<ToolDef>) -> Self {
         Self {
-            client: Client::new(),
+            client,
             url: format!("{}/chat/completions", config.base_url.trim_end_matches('/')),
             api_key: config.api_key.clone(),
             model: config.model.clone(),

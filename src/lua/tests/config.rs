@@ -292,18 +292,87 @@ fn the_users_config_is_seeded_from_the_shipped_one_and_then_belongs_to_them() {
              the configuration, which is the point of it being the user's"
     );
 
-    // And a config may be as short as the one thing it wants to change. The
-    // loader creates `agent.llm` before the config runs, precisely so that
-    // a three-line file is a working configuration — a user who writes their
-    // own from scratch should not have to reproduce a table constructor to
-    // set a field on it.
-    std::fs::write(&cfg, "agent.llm.model = 'short'\n").expect("a minimal config");
-    let short = run(&home).expect("a one-line config loads");
+    // A config may be as short as declaring the table and changing one field. The
+    // declaration is the whole of the boilerplate: `agent.llm` is a convention the
+    // configuration owns, and Rust only reads it, so the file that wants to change
+    // a field is also the file that brings the field into being.
+    std::fs::write(
+        &cfg,
+        "agent.llm = agent.llm or {}\nagent.llm.model = 'short'\n",
+    )
+    .expect("a minimal config");
+    let short = run(&home).expect("a two-line config loads");
     assert_eq!(llm_config(&short).expect("llm").model, "short");
     assert_eq!(
         llm_config(&short).expect("llm").base_url,
         "https://api.openai.com/v1",
         "and the fields it does not mention fall back to the default"
+    );
+
+    // Which is the cost of the convention, so it is pinned rather than left to be
+    // discovered: assigning a field of a table nobody declared is a Lua error, and
+    // the error says exactly that. A config written against the old arrangement —
+    // where the loader pre-created `agent.llm` — needs the one extra line.
+    std::fs::write(&cfg, "agent.llm.model = 'undeclared'\n").expect("an undeclared config");
+    let err = run(&home).expect_err("a config that never declares the table cannot load");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("llm") && msg.contains("nil value"),
+        "and the failure names the table rather than arriving as something else \
+         downstream: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `agent.llm` and `agent.mcps` are conventions: tables the configuration owns, and
+/// Rust only reads. So a configuration that declares neither is a *working*
+/// configuration — every field takes its default and the tool set is empty — rather
+/// than a broken one.
+///
+/// This is the property that makes them conventions rather than tables Rust happens
+/// to have allocated, so it is pinned from the other side too: a loader that
+/// created `agent.llm` before the configuration ran would still pass every other test
+/// here, because every other one declares it.
+#[test]
+fn a_config_that_declares_neither_table_is_still_a_working_config() {
+    let home = unique_path("agent-conventions");
+    let cfg = home.join(".config").join("agent").join("init.lua");
+    std::fs::create_dir_all(cfg.parent().expect("a parent")).expect("config dir");
+    std::fs::write(&cfg, "-- nothing declared at all\n").expect("write the config");
+
+    let lua = Lua::new_with(STDLIB, mlua::LuaOptions::default()).expect("lua");
+    setup_tree(
+        &lua,
+        None,
+        None,
+        &tree(),
+        &ConfigSource::UserHome(Some(home.clone())),
+    )
+    .expect("a config with no tables still loads");
+    let llm = llm_config(&lua).expect("llm defaults with no agent.llm");
+    assert_eq!(llm.base_url, "https://api.openai.com/v1");
+    assert_eq!(llm.model, "gpt-4o-mini");
+    assert_eq!(llm.api_key, "");
+    assert_eq!(
+        system_prompt(&lua).expect("prompt"),
+        "",
+        "no table means no system message, which is what an absent prompt has always \
+         meant"
+    );
+    let mem = memory_config(&lua).expect("memory defaults");
+    assert_eq!(
+        (mem.enabled, mem.path),
+        (
+            crate::lua::memory::MemoryConfig::default().enabled,
+            crate::lua::memory::MemoryConfig::default().path
+        ),
+        "and no `agent.llm.memory` block means the memory defaults, which is the \
+         same answer as a config that sets nothing about it"
+    );
+    assert!(
+        mcps_tool_defs(&lua).expect("reindex").is_empty(),
+        "no registry means no tools advertised — which is a legitimate answer, and \
+         the one `compact` depends on"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

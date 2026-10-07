@@ -36,11 +36,15 @@
 -- scripted invocation keeps working. The TUI does not.)
 --
 -- So: the three lines below are the whole of it.
--- Fields, not the table. The loader creates `agent.llm` before this file runs,
--- so a whole-table assignment here would either be ignored (an empty table is
--- truthy) or throw away every field this file did not mention. Assigning
--- fields is also what makes a *short* config work: a file that sets one of them
--- needs no boilerplate, and a key left out falls back to the default.
+-- `agent.llm` is a **convention**: a plain table this file declares, which Rust
+-- reads and never creates or reshapes. The `or {}` is what makes a *short* config
+-- work — a file that sets one field needs no boilerplate, and a key left out falls
+-- back to the default (`llm_config`). Assigning fields rather than the table is
+-- also what keeps a user's override from throwing away a field this file set: a
+-- whole-table assignment is a replacement, not a merge.
+--
+-- The same convention as `agent.mcps` further down.
+agent.llm      = agent.llm      or {}
 agent.llm.base_url = "https://api.openai.com/v1"  -- >>> the API endpoint
 agent.llm.model    = "gpt-4o-mini"                -- >>> the model
 agent.llm.api_key  = ""                           -- >>> "" sends no Authorization header

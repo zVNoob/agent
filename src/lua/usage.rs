@@ -115,6 +115,14 @@ pub(super) fn usage_backing(lua: &Lua) -> Option<Table> {
     }
 }
 
+/// Attach the read-only usage view to `agent.llm`, if the configuration declared
+/// one.
+///
+/// Runs *after* the configuration, and deliberately does not create `agent.llm` to
+/// have somewhere to put it: `agent.llm` is a convention the configuration owns, and
+/// a config that never mentions it cannot read `agent.llm.usage` either — naming the
+/// field is what creates the table, by assignment. So a config that says nothing
+/// about the model gets no usage view, which is consistent rather than lossy.
 pub(super) fn install_usage(lua: &Lua) -> mlua::Result<()> {
     let Ok(agent) = lua.globals().get::<Table>("agent") else {
         return Ok(());

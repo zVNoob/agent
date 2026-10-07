@@ -305,9 +305,13 @@ pub fn system_prompt(lua: &Lua) -> Result<String, String> {
         .globals()
         .get("agent")
         .map_err(|e| format!("config: agent table: {e}"))?;
-    let config: Table = agent
-        .get("llm")
-        .map_err(|e| format!("config: agent.llm: {e}"))?;
+    // An absent `agent.llm` is not a broken config, it is a config that set no
+    // model settings — and `""` is the documented meaning of "no system message".
+    // Erroring here instead would make the table's *existence* load-bearing, which
+    // is the one thing the convention is for.
+    let Ok(config) = agent.get::<Table>("llm") else {
+        return Ok(String::new());
+    };
     Ok(config.get("system_prompt").unwrap_or_default())
 }
 
@@ -352,9 +356,12 @@ pub fn mcps_tool_defs(lua: &Lua) -> Result<Vec<McpToolDef>, String> {
         .globals()
         .get("agent")
         .map_err(|e| format!("mcps: agent table: {e}"))?;
-    let mcps: Table = agent
-        .get("mcps")
-        .map_err(|e| format!("mcps: agent.mcps: {e}"))?;
+    // Same convention as `agent.llm`: a registry nobody declared holds no tools,
+    // which is a legitimate answer and not a broken config. `compact` is the
+    // shipped case that cares — a mode with no connections must advertise none.
+    let Ok(mcps) = agent.get::<Table>("mcps") else {
+        return Ok(Vec::new());
+    };
     let mut defs = Vec::new();
     for pair in mcps.pairs::<String, Table>() {
         let (conn_name, conn) = pair.map_err(|e| format!("mcps: conn: {e}"))?;

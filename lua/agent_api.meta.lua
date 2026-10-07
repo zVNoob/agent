@@ -46,9 +46,9 @@
 ---@field bash fun(cmdline: string, policy: table, opts?: table): table A sandboxed run (`lua/lib/bash.lua`).
 ---@field fs table The file-tool connection (`lua/fs.lua`).
 ---@field http table HTTP and SSE streams (`lua/lib/http.lua`).
----@field llm table Endpoint, prompt, context window, usage (`lua/init.lua`).
+---@field llm table Endpoint, prompt, context window, usage. A convention: `lua/init.lua` declares it and Rust only reads it (`lua/init.lua`).
 ---@field mcp fun(name: string, func: function, opts?: table): table Open an MCP connection.
----@field mcps table<string, table> The connection registry: name -> `{ name, tools }`.
+---@field mcps table<string, table> The connection registry: name -> `{ name, tools }`. Also a convention Rust reads, never creates.
 ---@field memory table The conversation log (`lua/init.lua`).
 ---@field mode table Named prompt + tool-set pairs: new / set / current / get / names / forget (`lua/lib/mode.lua`).
 ---@field on_timeout fun(ms: integer, fn?: function) Suspend, or sleep off the reactor.
@@ -420,6 +420,52 @@ function agent.api.sse_close(handle) end
 ---@param ip string
 ---@return string?
 function agent.api.reverse_dns(ip) end
+
+-- -- a nested model request ----------------------------------------------------
+--
+-- One request, not a conversation: there is no tool loop here, no inheritance, and
+-- no policy. Deciding what to send and what to send next is the caller's, and
+-- nothing on this path reads `agent.llm`, `agent.mcps` or the active mode — a
+-- caller that wants those defaults supplies them, so which defaults apply is a
+-- decision rather than a surprise. A missing argument is an error, not a default.
+--
+-- The handle shape is the transport's, for the transport's reason: one reactor, one
+-- thread, and a tool is already a coroutine the loop steps. `nil` from the step
+-- means "nothing yet" — wait on `agent.on_timeout` and come back, as every other
+-- pump in the tree does.
+--
+-- A refusal, an unreachable host, a non-2xx, a body that stops part-way: all of
+-- them arrive as an `error` **event**, because the caller is mid-turn inside a
+-- coroutine and a raise would unwind it past the tool that asked. Argument errors
+-- do raise — nothing is in flight yet, and there is nothing to unwind.
+
+---Fire one chat-completion request and stream the response. Returns immediately;
+---the events come from `agent.api.stream_turn_step`.
+---@param base_url string Absolute API root; `/chat/completions` is appended. Required.
+---@param api_key string Bearer credential. `""` sends no `Authorization` header.
+---@param model string Model name to ask for. Required.
+---@param messages table[] OpenAI-shaped messages, oldest first.
+---@param tools table[] `{ name, description, parameters? }`; `{}` for none. **Not** the wire shape — `function` is a Lua keyword, so `{ type = "function", function = { … } }` cannot be written in a table constructor; the `"type": "function"` wrapper is added here. `description` is required: it is how the model knows it may call the tool.
+---@return integer A handle for `agent.api.stream_turn_step` / `stream_turn_close`.
+function agent.api.stream_turn(base_url, api_key, model, messages, tools) end
+
+---The next event, or `nil` when none has arrived. A `done` or `error` event is
+---terminal and unregisters the handle.
+---@param handle integer From `agent.api.stream_turn`.
+---@return { kind: "content", text: string }?
+---| { kind: "reasoning", text: string }?
+---| { kind: "tool_call", index: integer, id?: string, name?: string, arguments?: string }?
+---| { kind: "usage", usage: table }?
+---| { kind: "timings", timings: table }?
+---| { kind: "done" }?
+---| { kind: "error", message: string }?
+function agent.api.stream_turn_step(handle) end
+
+---Abort the request and drop its queue. Prompt: the task notices before its next
+---event, so this does not wait out a timeout that is still running. Safe on a
+---handle that already finished.
+---@param handle integer
+function agent.api.stream_turn_close(handle) end
 
 -- -- the cooperative wait ------------------------------------------------------
 

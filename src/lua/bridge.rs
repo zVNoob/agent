@@ -87,6 +87,7 @@ pub(super) fn install_api(
     install_panel_primitives(lua, &api, &sink_slot)?;
     install_print(lua)?;
     crate::mcp::install_bridge(lua, &api)?;
+    crate::lua::turn::install(lua, &api)?;
     Ok(api)
 }
 

@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-use mlua::{AnyUserData, Lua, Table, UserData};
+use mlua::{AnyUserData, Lua, UserData};
 
 use crate::panels::PanelSink;
 
@@ -142,7 +142,7 @@ pub fn new_vm_with_ask(sink: Option<&PanelSink>, on_ask: Option<AskHandler>) -> 
 /// approximation of it.
 #[cfg(test)]
 pub(crate) async fn eval_reactor<T: mlua::FromLuaMulti>(lua: &Lua, chunk: &str) -> mlua::Result<T> {
-    let agent: Table = lua.globals().get("agent")?;
+    let agent: mlua::Table = lua.globals().get("agent")?;
     agent.set("__on_reactor", true)?;
     let thread = lua.load(chunk).into_function()?;
     let thread = lua.create_thread(thread)?;
@@ -273,22 +273,20 @@ pub(super) fn setup_tree(
     }
     install_require(lua, dir)?;
     load_lib_modules(lua, dir)?;
-    // The settings table, created empty, before any configuration runs.
+    // `agent.llm` and `agent.mcps` are **conventions**, not tables Rust owns.
     //
-    // A configuration assigns *fields* of it and never the table itself, and it
-    // has to be able to: the user's `~/.config/agent/init.lua` may be three
-    // lines long, and a file that cannot set `agent.llm.base_url` without
-    // first inventing the table is not a configuration. Every field defaults
-    // independently on the Rust side (`llm_config`, `memory_config`), so an
-    // absent key means "the default", and the starter config can still spell
-    // every value out where a user would go to change it.
-    {
-        let agent: Table = lua.globals().get("agent")?;
-        let existing: mlua::Value = agent.get("llm")?;
-        if !matches!(existing, mlua::Value::Table(_)) {
-            agent.set("llm", lua.create_table()?)?;
-        }
-    }
+    // The configuration decides their shape; Rust only reads them, and every field
+    // defaults independently (`llm_config`, `memory_config`, `mcps_tool_defs`), so
+    // an absent key means "the default" and an absent table means "all defaults".
+    // Nothing here creates either one, because a table Rust allocated is a table
+    // Rust has to keep tolerating: it would have to decide which keys exist, and a
+    // configuration assigning a key Rust had not thought of would land on a table
+    // Rust had built for a different set of keys.
+    //
+    // What Rust *does* do is attach the read-only usage view, after the
+    // configuration has run (`install_usage`) — and only if the configuration
+    // declared `agent.llm` at all, because a config that never mentions it has no
+    // reason to grow one, and cannot read `agent.llm.usage` without it.
     // The configuration script: the user's, seeded from the tree's on first run
     // (see `ConfigSource`). Exactly one script runs — the user's file is not an
     // overlay on top of the shipped one, it *is* the configuration.
