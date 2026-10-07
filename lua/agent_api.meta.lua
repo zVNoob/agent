@@ -348,6 +348,14 @@ function agent.api.memory_append(msg) end
 ---@return boolean
 function agent.api.memory_flush() end
 
+---Start a new conversation log: flush and close the current one, move it aside, and
+---open a fresh file where it was. A session boundary is a file boundary, so each
+---session is its own archive; the old scrollback stays on disk as
+---`<old>-<YYYYMMDD-HHMMSS>.amem` next to the active path.
+---Prefer `agent.memory.new()`.
+---@return string Where the old log moved to.
+function agent.api.memory_new() end
+
 ---The newest `n` messages as JSON strings, oldest first. Raises when nothing is open.
 ---Prefer `agent.memory.latest(n)`.
 ---@param n integer

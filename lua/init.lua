@@ -110,6 +110,13 @@ end
 function agent.memory.flush()
   return agent.api.memory_flush()
 end
+-- Start a fresh conversation log. The current one is flushed, closed and moved
+-- aside (`<old>-<timestamp>.amem`), and a new file opens where it was. Each session
+-- is its own archive: scrolling pages the new file from its start, and the old
+-- session's history is still on disk next to it.
+function agent.memory.new()
+  return agent.api.memory_new()
+end
 function agent.memory.path()
   return agent.api.memory_path()
 end

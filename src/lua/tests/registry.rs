@@ -31,9 +31,8 @@ fn the_lua_ls_annotations_cover_exactly_the_bridge_once_each() {
     bridge.sort();
     assert_eq!(
         bridge.len(),
-        39,
-        "the bridge's size is part of the contract — 36, plus the three \
-         `stream_turn` primitives"
+        40,
+        "the bridge's size is part of the contract"
     );
 
     let meta = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua/agent_api.meta.lua");

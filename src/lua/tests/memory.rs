@@ -94,6 +94,52 @@ fn memory_primitives_append_read_flush_path() {
         4,
         "flushed messages are on disk"
     );
+
+    // `memory_new` rotates: flush + close the current log, move it aside, open a
+    // fresh one at the same active path. The old scrollback stays on disk.
+    //
+    // One record is left *unflushed* on purpose: if `memory_new` did not flush
+    // before moving the file, it would vanish with the segment that was still
+    // buffered, and nothing in the rotated file would ever show it.
+    let _: u64 = lua
+        .load("return agent.memory.append({ role='user', content='still buffered' })")
+        .eval()
+        .expect("an unflushed message");
+    let rotated: String = lua
+        .load("return agent.memory.new()")
+        .eval()
+        .expect("memory.new");
+    assert!(
+        rotated.contains("history-") && rotated.ends_with(".amem"),
+        "the old log moved to a timestamped sibling: {rotated}"
+    );
+    // The new log is open and empty — a fresh session starts at its own front.
+    let p2: String = lua.load("return agent.memory.path()").eval().expect("path");
+    assert!(
+        p2.ends_with("history.amem"),
+        "the active path is the same one it always was: {p2}"
+    );
+    let empty: usize = lua
+        .load("return #agent.memory.latest(10)")
+        .eval()
+        .expect("fresh log is empty");
+    assert_eq!(empty, 0, "a new conversation starts with no scrollback");
+    // …but the old one is still on disk, whole, at the rotated path. Five records:
+    // the four flushed before, plus the one that was still buffered — the one that
+    // proves `memory_new` flushed before it moved the file.
+    let mut old = Memory::open(&rotated).expect("open the old log");
+    assert_eq!(
+        old.latest(10).expect("latest").len(),
+        5,
+        "the old session's scrollback is preserved next to the active file, \
+         including the record that was still buffered when it rotated"
+    );
+    // And writing resumes into the new log, cleanly.
+    let seq: u64 = lua
+        .load("return agent.memory.append({ role='user', content='fresh start' })")
+        .eval()
+        .expect("append to the new log");
+    assert_eq!(seq, 1, "sequences restart with the new file");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
