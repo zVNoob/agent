@@ -440,32 +440,32 @@ function agent.api.reverse_dns(ip) end
 -- do raise — nothing is in flight yet, and there is nothing to unwind.
 
 ---Fire one chat-completion request and stream the response. Returns immediately;
----the events come from `agent.api.stream_turn_step`.
+---the events come from `agent.api.turn_step`.
 ---@param base_url string Absolute API root; `/chat/completions` is appended. Required.
 ---@param api_key string Bearer credential. `""` sends no `Authorization` header.
 ---@param model string Model name to ask for. Required.
 ---@param messages table[] OpenAI-shaped messages, oldest first.
 ---@param tools table[] `{ name, description, parameters? }`; `{}` for none. **Not** the wire shape — `function` is a Lua keyword, so `{ type = "function", function = { … } }` cannot be written in a table constructor; the `"type": "function"` wrapper is added here. `description` is required: it is how the model knows it may call the tool.
----@return integer A handle for `agent.api.stream_turn_step` / `stream_turn_close`.
-function agent.api.stream_turn(base_url, api_key, model, messages, tools) end
+---@return integer A handle for `agent.api.turn_step` / `turn_close`.
+function agent.api.turn(base_url, api_key, model, messages, tools) end
 
 ---The next event, or `nil` when none has arrived. A `done` or `error` event is
 ---terminal and unregisters the handle.
----@param handle integer From `agent.api.stream_turn`.
+---@param handle integer From `agent.api.turn`.
 ---@return { kind: "content", text: string }?
 ---| { kind: "reasoning", text: string }?
 ---| { kind: "tool_call", index: integer, id?: string, name?: string, arguments?: string }?
 ---| { kind: "usage", usage: table }?
 ---| { kind: "timings", timings: table }?
----| { kind: "done" }?
+---| { kind: "done", content: string, reasoning: string, tool_calls: { id: string, name: string, arguments: string }[], usage?: table, timings?: table }?
 ---| { kind: "error", message: string }?
-function agent.api.stream_turn_step(handle) end
+function agent.api.turn_step(handle) end
 
 ---Abort the request and drop its queue. Prompt: the task notices before its next
 ---event, so this does not wait out a timeout that is still running. Safe on a
 ---handle that already finished.
 ---@param handle integer
-function agent.api.stream_turn_close(handle) end
+function agent.api.turn_close(handle) end
 
 -- -- the cooperative wait ------------------------------------------------------
 

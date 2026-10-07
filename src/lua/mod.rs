@@ -365,7 +365,7 @@
 //! | [`run`] | a tool call and an event handler as coroutines the loop steps |
 //! | [`memory`] | the `agent.memory.*` binding to the conversation log |
 //! | [`usage`] | `agent.llm.usage`, the read-only snapshot of the last request's token counts |
-//! | [`turn`] | `agent.api.stream_turn` and its poll/close: one model request as a stream |
+//! | [`turn`] | `agent.api.turn` and its poll/close: one model request as a polled stream |
 //! | [`mcp`](crate::mcp) | the JSON and HTTP/SSE text boundary (implemented outside this tree) |
 //!
 //! The tests live in [`tests`], split by the *shipped Lua surface* they exercise

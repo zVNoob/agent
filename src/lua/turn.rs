@@ -1,4 +1,4 @@
-//! `agent.api.stream_turn` — one model request, as a polled stream.
+//! `agent.api.turn` — one model request, as a polled stream.
 //!
 //! The substrate half of running a conversation. It sends **one** chat-completion
 //! request with everything it needs as arguments and yields the response as events.
@@ -45,7 +45,21 @@ enum TurnEv {
     ToolCall(ToolCallDelta),
     Usage(serde_json::Value),
     Timings(serde_json::Value),
-    Done,
+    /// The assembled result, so the caller does not have to re-derive it.
+    ///
+    /// Rust emits the deltas *and* the finished turn, because the two are for
+    /// different consumers: the deltas are for drawing (into a panel, chunk by
+    /// chunk), and the assembled turn is for *history* — and a route that assembled
+    /// its own would be a second `TurnBuilder`, in Lua, that the Rust one would have
+    /// to stay in step with forever. Reasoning travels separately, for the same
+    /// reason `Turn` drops it: it is observed, not conversation.
+    Done {
+        content: String,
+        reasoning: String,
+        tool_calls: Vec<crate::api::ToolCall>,
+        usage: Option<serde_json::Value>,
+        timings: Option<serde_json::Value>,
+    },
     Error(String),
 }
 
@@ -78,7 +92,7 @@ fn http_client() -> &'static reqwest::Client {
 }
 
 fn err(msg: impl Into<String>) -> mlua::Error {
-    mlua::Error::RuntimeError(format!("agent.api.stream_turn: {}", msg.into()))
+    mlua::Error::RuntimeError(format!("agent.api.turn: {}", msg.into()))
 }
 
 /// A Lua value as JSON, for the request body.
@@ -158,11 +172,11 @@ fn tools_from_lua(t: &Table) -> Result<Vec<ToolDef>, mlua::Error> {
     Ok(out)
 }
 
-/// `agent.api.stream_turn(base_url, api_key, model, messages, tools) -> handle`
+/// `agent.api.turn(base_url, api_key, model, messages, tools) -> handle`
 ///
 /// Sends the request and returns immediately; the response is drained by
-/// [`lua_stream_turn_step`].
-pub(super) fn lua_stream_turn(
+/// [`lua_turn_step`].
+pub(super) fn lua_turn(
     _lua: &Lua,
     (base_url, api_key, model, messages, tools): (String, String, String, Table, Table),
 ) -> mlua::Result<i64> {
@@ -220,6 +234,11 @@ async fn drive(
     session: Session,
 ) {
     let push = |ev: TurnEv| session.queue.lock().unwrap().push_back(ev);
+    let mut builder = crate::api::TurnBuilder::new();
+    // `Turn` deliberately has no reasoning field — it is observed, not kept in
+    // conversation history — so it is accumulated beside the builder and emitted with
+    // the result, which is the only way the caller can draw it.
+    let mut reasoning = String::new();
     let chat = Chat::connect_with(http_client().clone(), &config, tools);
     let mut stream = match chat.stream_turn(&messages).await {
         Ok(s) => s,
@@ -243,11 +262,26 @@ async fn drive(
             break; // the response ended: normal completion
         };
         match event {
-            Ok(TurnEvent::Content(s)) => push(TurnEv::Content(s)),
-            Ok(TurnEvent::Reasoning(s)) => push(TurnEv::Reasoning(s)),
-            Ok(TurnEvent::ToolCallDelta(d)) => push(TurnEv::ToolCall(d)),
-            Ok(TurnEvent::Usage(v)) => push(TurnEv::Usage(v)),
-            Ok(TurnEvent::Timings(v)) => push(TurnEv::Timings(v)),
+            Ok(TurnEvent::Content(s)) => {
+                builder.apply(TurnEvent::Content(s.clone()));
+                push(TurnEv::Content(s));
+            }
+            Ok(TurnEvent::Reasoning(s)) => {
+                reasoning.push_str(&s);
+                push(TurnEv::Reasoning(s));
+            }
+            Ok(TurnEvent::ToolCallDelta(d)) => {
+                builder.apply(TurnEvent::ToolCallDelta(d.clone()));
+                push(TurnEv::ToolCall(d));
+            }
+            Ok(TurnEvent::Usage(v)) => {
+                builder.apply(TurnEvent::Usage(v.clone()));
+                push(TurnEv::Usage(v));
+            }
+            Ok(TurnEvent::Timings(v)) => {
+                builder.apply(TurnEvent::Timings(v.clone()));
+                push(TurnEv::Timings(v));
+            }
             // A truncated body: the stream failed part-way rather than refusing.
             Err(e) => {
                 push(TurnEv::Error(format!("{e:#}")));
@@ -255,16 +289,23 @@ async fn drive(
             }
         }
     }
-    push(TurnEv::Done);
+    let turn = builder.finish();
+    push(TurnEv::Done {
+        content: turn.content,
+        reasoning,
+        tool_calls: turn.tool_calls,
+        usage: turn.usage,
+        timings: turn.timings,
+    });
 }
 
-/// `agent.api.stream_turn_step(handle) -> event | nil`
+/// `agent.api.turn_step(handle) -> event | nil`
 ///
 /// `nil` when nothing has arrived yet — the caller is expected to wait on
 /// `agent.on_timeout` and come back, which is what every other pump in the tree
 /// does. A terminal event (`done` or `error`) unregisters the handle, so it cannot
 /// be stepped again.
-pub(super) fn lua_stream_turn_step(lua: &Lua, handle: i64) -> mlua::Result<Option<Table>> {
+pub(super) fn lua_turn_step(lua: &Lua, handle: i64) -> mlua::Result<Option<Table>> {
     let session = transport().posts.lock().unwrap().get(&handle).cloned();
     let Some(session) = session else {
         return Ok(None);
@@ -316,8 +357,31 @@ fn event_to_lua(lua: &Lua, ev: TurnEv) -> mlua::Result<(Table, bool)> {
             t.set("kind", "timings")?;
             t.set("timings", lua_to_lua(lua, &v)?)?;
         }
-        TurnEv::Done => {
+        TurnEv::Done {
+            content,
+            reasoning,
+            tool_calls,
+            usage,
+            timings,
+        } => {
             t.set("kind", "done")?;
+            t.set("content", content)?;
+            t.set("reasoning", reasoning)?;
+            let calls = lua.create_table()?;
+            for (i, c) in tool_calls.iter().enumerate() {
+                let call = lua.create_table()?;
+                call.set("id", c.id.as_str())?;
+                call.set("name", c.name.as_str())?;
+                call.set("arguments", c.arguments.as_str())?;
+                calls.set(i + 1, call)?;
+            }
+            t.set("tool_calls", calls)?;
+            if let Some(u) = usage {
+                t.set("usage", lua_to_lua(lua, &u)?)?;
+            }
+            if let Some(tm) = timings {
+                t.set("timings", lua_to_lua(lua, &tm)?)?;
+            }
             return Ok((t, true));
         }
         TurnEv::Error(m) => {
@@ -360,12 +424,12 @@ fn lua_to_lua(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Value> {
     })
 }
 
-/// `agent.api.stream_turn_close(handle) -> nothing`
+/// `agent.api.turn_close(handle) -> nothing`
 ///
 /// Aborts the request and drops the queue. The spawned task notices the flag before
 /// its next event and returns, so this is prompt rather than a cancellation the
 /// caller has to wait out.
-pub(super) fn lua_stream_turn_close(_lua: &Lua, handle: i64) -> mlua::Result<()> {
+pub(super) fn lua_turn_close(_lua: &Lua, handle: i64) -> mlua::Result<()> {
     if let Some(session) = transport().posts.lock().unwrap().remove(&handle) {
         session.abort.store(true, Ordering::Relaxed);
     }
@@ -374,14 +438,8 @@ pub(super) fn lua_stream_turn_close(_lua: &Lua, handle: i64) -> mlua::Result<()>
 
 /// Register the three primitives on the bridge.
 pub(super) fn install(lua: &Lua, api: &Table) -> mlua::Result<()> {
-    api.set("stream_turn", lua.create_function(lua_stream_turn)?)?;
-    api.set(
-        "stream_turn_step",
-        lua.create_function(lua_stream_turn_step)?,
-    )?;
-    api.set(
-        "stream_turn_close",
-        lua.create_function(lua_stream_turn_close)?,
-    )?;
+    api.set("turn", lua.create_function(lua_turn)?)?;
+    api.set("turn_step", lua.create_function(lua_turn_step)?)?;
+    api.set("turn_close", lua.create_function(lua_turn_close)?)?;
     Ok(())
 }
