@@ -461,3 +461,144 @@ async fn turn_run_returns_the_assembled_turn() {
         "and reasoning is there to draw even when empty"
     );
 }
+
+// ===================== the main-loop seam: `turn` event → assembled turn =====================
+
+/// Step an `EventRun` to completion the way the loop would, answering each
+/// `on_timeout` wait immediately (with a small real sleep, so the transport
+/// task gets to fill the queue between polls).
+async fn drive_event(run: &mut EventRun<'_>, mut step: EventStep) {
+    for _ in 0..1000 {
+        match step {
+            EventStep::Returned => return,
+            EventStep::Waiting { .. } => {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                step = run.step().expect("step the handler");
+            }
+        }
+    }
+    panic!("the handler never finished — a hang, not a test to wait out");
+}
+
+#[tokio::test]
+async fn the_shipped_turn_handler_drives_a_request_and_returns_the_turn() {
+    // The whole Lua half of the main turn, as the loop drives it: fire the
+    // "turn" event on the shipped configuration, and the registered handler
+    // (`agent.main_turn`) drives `agent.turn` on the payload's history and
+    // hands the assembled turn back as its return value.
+    let body = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = body.clone();
+    let fake = FakeHttpServer::start(move |req| {
+        *sink.lock().unwrap() = req.body.clone();
+        FakeServerReply::Response(FakeResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "text/event-stream".into())],
+            body: "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking…\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"the answer\"}}]}\n\n\
+                   data: [DONE]\n\n"
+                .into(),
+        })
+    });
+    let vm = shipped_vm();
+    vm.load(format!(
+        "agent.llm = agent.llm or {{}}
+         agent.llm.base_url = \"{}\"",
+        fake.url("/v1")
+    ))
+    .eval::<()>()
+    .expect("configure");
+    // The sink the loop would install: the handler's drawing has to reach it,
+    // or the stream the user watches is the one thing the test never checked.
+    let sink = crate::panels::PanelSink::continuing_from(0);
+    install_sink(&vm, &sink).expect("install the sink");
+
+    let payload = serde_json::json!({
+        "history": [ { "role": "user", "content": "the question" } ]
+    });
+    let (mut run, step) = EventRun::start(&vm, "turn", &payload)
+        .expect("start")
+        .expect("the shipped tree registers a turn handler");
+    drive_event(&mut run, step).await;
+    let ops = sink.drain();
+    let drew = |title: &str| {
+        let id = ops.iter().find_map(|op| match op {
+            crate::panels::PanelOp::Create { id, title: t, .. } if t == title => Some(*id),
+            _ => None,
+        });
+        let id = id.unwrap_or_else(|| panic!("a \"{title}\" block was drawn: {ops:?}"));
+        ops.iter().any(|op| matches!(op, crate::panels::PanelOp::Append { id: a, text } if *a == id && !text.is_empty()))
+    };
+    assert!(
+        drew("reasoning"),
+        "reasoning streams into its own block: {ops:?}"
+    );
+    assert!(
+        drew("response"),
+        "and the answer into the response block: {ops:?}"
+    );
+    let returned = run
+        .take_returned()
+        .expect("a request handler's return is the answer");
+    let (turn, reasoning) = turn_from_lua(returned).expect("the assembled turn decodes");
+    assert_eq!(turn.content, "the answer");
+    assert!(!turn.wants_tools(), "a plain answer asks for no tool round");
+    assert!(
+        reasoning.contains("thinking…"),
+        "reasoning comes back with the turn, for the log: {reasoning:?}"
+    );
+
+    // And the request the handler sent is the conversation it was given, with
+    // the configured endpoint reached through the route — not a default.
+    let sent = body.lock().unwrap().clone();
+    assert!(
+        sent.contains("the question"),
+        "the payload's history is what was sent: {sent}"
+    );
+}
+
+#[test]
+fn turn_from_lua_decodes_the_assembled_turn_table() {
+    let vm = new_vm().expect("vm");
+    let value = vm
+        .load(
+            r#"return {
+                content = "done",
+                reasoning = "because",
+                tool_calls = { { id = "c1", name = "fs.read", arguments = "{\"path\":\"x\"}" } },
+                usage = { prompt_tokens = 3, completion_tokens = 4 },
+            }"#,
+        )
+        .eval::<mlua::Value>()
+        .expect("table");
+    let (turn, reasoning) = turn_from_lua(value).expect("decode");
+    assert_eq!(turn.content, "done");
+    assert_eq!(reasoning, "because");
+    assert_eq!(turn.tool_calls.len(), 1);
+    assert_eq!(turn.tool_calls[0].name, "fs.read");
+    let tokens = turn.tokens();
+    assert_eq!(tokens.prompt, Some(3));
+    assert_eq!(tokens.completion, Some(4));
+
+    // A hand-built table needs only the keys it has: the rest are the empty
+    // answer, not an error.
+    let value = vm
+        .load(r#"return { content = "just text" }"#)
+        .eval::<mlua::Value>()
+        .expect("table");
+    let (turn, reasoning) = turn_from_lua(value).expect("decode");
+    assert_eq!(turn.content, "just text");
+    assert!(!turn.wants_tools());
+    assert!(reasoning.is_empty());
+    assert_eq!(turn.tokens().prompt, None);
+
+    // A non-table answer is the error it looks like.
+    let value = vm
+        .load(r#"return "not a turn""#)
+        .eval::<mlua::Value>()
+        .expect("string");
+    let err = turn_from_lua(value).expect_err("a string is not a turn");
+    assert!(
+        err.contains("expected the assembled-turn table"),
+        "the error says what was expected: {err}"
+    );
+}

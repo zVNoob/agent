@@ -436,6 +436,63 @@ pub(super) fn lua_turn_close(_lua: &Lua, handle: i64) -> mlua::Result<()> {
     Ok(())
 }
 
+/// Decode a `turn` handler's return value — the assembled-turn table the
+/// `agent.turn` route's `:run()` produces — into the [`Turn`] the loop's
+/// end-of-turn path runs on, plus the reasoning, which `Turn` deliberately
+/// drops (it is not conversation history; the loop archives it separately).
+///
+/// Missing fields take the empty answer, so a handler that built the table by
+/// hand — a test double, a canned reply — needs only the keys it has. A value
+/// that is not a table at all is the error it looks like.
+pub fn turn_from_lua(value: mlua::Value) -> Result<(crate::api::Turn, String), String> {
+    let json = crate::mcp::lua_to_json(&value).map_err(|e| format!("turn handler result: {e}"))?;
+    if !json.is_object() {
+        return Err(format!(
+            "turn handler result: expected the assembled-turn table, got {}",
+            match &json {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "a boolean",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Array(_) => "an array",
+                serde_json::Value::Object(_) => unreachable!(),
+            }
+        ));
+    }
+    let obj = || json.as_object();
+    let text = |key: &str| {
+        obj()
+            .and_then(|o| o.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let tool_calls = obj()
+        .and_then(|o| o.get("tool_calls"))
+        .and_then(|v| v.as_array())
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|c| {
+                    Some(crate::api::ToolCall {
+                        id: c.get("id")?.as_str()?.to_string(),
+                        name: c.get("name")?.as_str()?.to_string(),
+                        arguments: c.get("arguments")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let reasoning = text("reasoning");
+    let turn = crate::api::Turn {
+        content: text("content"),
+        tool_calls,
+        usage: obj().and_then(|o| o.get("usage")).cloned(),
+        timings: obj().and_then(|o| o.get("timings")).cloned(),
+    };
+    Ok((turn, reasoning))
+}
+
 /// Register the three primitives on the bridge.
 pub(super) fn install(lua: &Lua, api: &Table) -> mlua::Result<()> {
     api.set("turn", lua.create_function(lua_turn)?)?;

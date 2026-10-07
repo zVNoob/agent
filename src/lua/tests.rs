@@ -588,6 +588,7 @@ use super::sandbox::{
     resolve_path,
 };
 use super::tree::{load_init, lua_dir_candidates, lua_dir_in, missing_tree_message};
+use super::turn::turn_from_lua;
 use super::usage::{Usage, record_usage, usage_guard};
 use super::vm::{
     AskAnswer, AskHandler, STDLIB, eval_reactor, install_sink, new_vm, new_vm_with_ask,

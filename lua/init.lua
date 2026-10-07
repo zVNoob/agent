@@ -441,7 +441,16 @@ end
 -- re-triggers itself forever. Stop when the history is short enough, which is
 -- what the automatic handler below does with a `state` flag.
 --
--- Two events fire today, and they are not the same kind of thing.
+-- Three events fire today, and they are not the same kind of thing.
+--
+--   "turn"            a request. Fired when the user submits a line, when a
+--                     tool round needs the model again, and when
+--                     `agent.trigger` forces an inference. The handler is
+--                     given the conversation and drives one request; its
+--                     return value *is* the assembled turn. The handler below
+--                     (`agent.main_turn`, from lua/lib/main_turn.lua) is what
+--                     runs every turn you watch. Unregister it and the loop
+--                     falls back to driving the request itself.
 --
 --   "turn_completed"  a notification. The handler is told what happened and its
 --                     return value is ignored. This section's own handler.
@@ -458,6 +467,16 @@ function agent.on_event(name, fn)
   if type(fn) ~= "function" then error("agent.on_event: handler must be a function", 2) end
   agent._events[name] = fn
 end
+
+-- The main turn itself: every submitted line, every tool-round continuation and
+-- every `agent.trigger` inference is driven by this handler — one request,
+-- streamed into the transcript, the assembled turn handed back as the return
+-- value. The mechanism is `agent.turn` (lua/lib/turn.lua); the drawing is two
+-- borderless blocks, "reasoning" and "response". Replace this one line to run
+-- the conversation your own way (a different prompt strategy, a router model,
+-- several drafts judged and merged) — the loop only asks that a handler return
+-- the assembled-turn table.
+agent.on_event("turn", agent.main_turn)
 
 -- Force the agent loop to run a new inference. No argument: a continuation of
 -- the current conversation. A string: behaves like a submitted user message. An

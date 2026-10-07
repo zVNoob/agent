@@ -131,6 +131,61 @@ fn event_run_drives_the_handler_as_a_single_threaded_coroutine() {
 }
 
 #[test]
+fn event_run_captures_the_handlers_return_value() {
+    // A *request* event (`turn`, where the return is the assembled turn) needs
+    // its answer back: `take_returned` hands the coroutine's return value to
+    // the loop once the handler finishes — across waits, not just at `start`.
+    let lua = vm();
+    apply_config_source(
+        &lua,
+        r#"
+            agent.on_event("turn", function(ev)
+              agent.on_timeout(5)   -- a real turn suspends; the answer still lands
+              return { content = "answer for " .. ev.message, tool_calls = {} }
+            end)
+            agent.on_event("notify", function() end)
+            "#,
+    )
+    .expect("apply");
+
+    let (mut run, step) = EventRun::start(
+        &lua,
+        "turn",
+        &serde_json::json!({ "message": "hi", "history": [] }),
+    )
+    .expect("start")
+    .expect("handler registered");
+    assert_eq!(step, EventStep::Waiting { ms: 5 });
+    assert!(
+        run.take_returned().is_none(),
+        "a suspended handler has answered nothing yet"
+    );
+    assert_eq!(run.step().expect("resume"), EventStep::Returned);
+    let returned = run.take_returned().expect("the answer is kept");
+    let content: String = returned
+        .as_table()
+        .expect("a table")
+        .get("content")
+        .expect("content");
+    assert_eq!(
+        content, "answer for hi",
+        "the payload went in, the answer out"
+    );
+    assert!(
+        run.take_returned().is_none(),
+        "and the answer is taken, once"
+    );
+
+    // A notification handler's plain `nil` return is "nothing back", the same
+    // as never having asked.
+    let (mut run, step) = EventRun::start(&lua, "notify", &serde_json::json!({}))
+        .expect("start")
+        .expect("handler registered");
+    assert_eq!(step, EventStep::Returned);
+    assert!(run.take_returned().is_none(), "nil is no answer");
+}
+
+#[test]
 fn event_run_rejects_a_stray_non_timeout_yield() {
     // A handler yielding a raw value (not an agent.on_timeout request)
     // surfaces an error instead of hanging the driver.

@@ -38,6 +38,17 @@
 //! bar exists before the TUI does, so a message set during startup is on screen
 //! the moment there is a screen.
 //!
+//! A turn is **driven by Lua**. On a submission, a tool-round continuation,
+//! or an `agent.trigger` inference, the loop fires a `turn` event carrying
+//! `{ history = {...} }`; the registered handler (`agent.main_turn` in the
+//! shipped tree) drives one request through `agent.turn` — polling its queue
+//! between `agent.on_timeout` waits, so the loop keeps rendering while the
+//! model streams — draws the reasoning/response blocks, and returns the
+//! assembled turn as the handler's return value. Everything around the
+//! request stays here: the history it reads, the tool loop the answer feeds,
+//! the archiving. With no `turn` handler registered the loop drives the
+//! request itself, the built-in default — events are opt-in.
+//!
 //! Compaction primitives: after a full user turn ends, the loop fires
 //! `turn_completed` (the conversation travels as `{ history = {...} }`) to
 //! any `agent.on_event` handler — driven as a coroutine **cooperatively on
@@ -398,6 +409,9 @@ enum Tick {
     /// The reactor's timer fired: resume the suspended `turn_completed`
     /// handler coroutine (see `start_turn_completed`).
     Event(()),
+    /// The reactor's timer fired for the Lua-driven turn: resume the `turn`
+    /// handler coroutine (see `start_lua_turn`).
+    LuaTurn,
     Pulse,
 }
 
@@ -1082,6 +1096,186 @@ fn start_event_timer(ms: u64) -> mpsc::UnboundedReceiver<()> {
     rx
 }
 
+/// Start one request of the main conversation as a Lua `turn` event: the
+/// handler (`agent.on_event("turn", …)` — `agent.main_turn` in the shipped
+/// tree) drives `agent.turn` on `history`, drawing the stream into the
+/// transcript as it goes, and hands the assembled turn back as its return
+/// value. Returns `true` when a handler took the turn; `false` when none is
+/// registered — events are opt-in, and the built-in stream is the default
+/// that stands.
+///
+/// Same cooperative-coroutine shape as `turn_completed` (the handler suspends
+/// on `agent.on_timeout` waits while the loop keeps rendering), but its own
+/// pair of slots: a suspended `turn_completed` handler may legitimately span
+/// into the turn that follows it, and one slot would have each clobber the
+/// other.
+#[allow(clippy::too_many_arguments)]
+fn start_lua_turn<'a>(
+    vm: &'a mlua::Lua,
+    history: &[Value],
+    app: &mut App,
+    turn_event: &mut Option<agent::lua::EventRun<'a>>,
+    turn_event_rx: &mut Option<mpsc::UnboundedReceiver<()>>,
+    turn_sink: &mut Option<agent::panels::PanelSink>,
+    next_panel_id: u64,
+) -> bool {
+    let payload = json!({ "history": history });
+    // The sink goes on before the first resume: the handler can draw before
+    // its first wait (a fast server, a large first chunk), and an op emitted
+    // with no sink to catch it goes nowhere.
+    let sink = agent::panels::PanelSink::continuing_from(next_panel_id);
+    if let Err(e) = agent::lua::install_sink(vm, &sink) {
+        app.push_boxed(Role::Assistant, format!("panel sink: {e}"), "error".into());
+        // The turn is consumed either way — report rather than fall through
+        // into a second, built-in request answering the same message.
+        return true;
+    }
+    match agent::lua::EventRun::start(vm, "turn", &payload) {
+        Ok(Some((run, step))) => {
+            *turn_sink = Some(sink);
+            // The bar is the only place that says a request is live — the
+            // first chunk can take a while, with the last frame still up.
+            app.set_status_text("streaming...", StatusKind::Info);
+            // A handler that returned without a single wait (a canned reply,
+            // a test double) still finishes on the tick path — arm a 0ms
+            // timer so the result lands exactly where a streamed one does.
+            let ms = match step {
+                agent::lua::EventStep::Waiting { ms } => ms,
+                agent::lua::EventStep::Returned => 0,
+            };
+            *turn_event = Some(run);
+            *turn_event_rx = Some(start_event_timer(ms));
+        }
+        Ok(None) => {
+            let _ = agent::lua::clear_sink(vm);
+            return false;
+        }
+        Err(e) => {
+            let _ = agent::lua::clear_sink(vm);
+            app.push_boxed(Role::Assistant, format!("turn failed: {e}"), "error".into());
+        }
+    }
+    true
+}
+
+/// Take down the Lua turn's drawing state: the sink comes off the VM (a panel
+/// opened with no round in flight must reach no panel), its last ops drain to
+/// the transcript, and its id counter carries forward so the next round's
+/// first panel never reuses an id this turn handed out.
+///
+/// The drained ops are *not* archived — unlike a tool round's. The reasoning
+/// and response blocks the handler draws are reconstructed on resume from the
+/// archived reasoning records and the assistant message, and logging the ops
+/// too would draw every streamed block twice.
+fn teardown_turn_sink(
+    vm: &mlua::Lua,
+    app: &mut App,
+    turn_sink: &mut Option<agent::panels::PanelSink>,
+    next_panel_id: &mut u64,
+) {
+    let _ = agent::lua::clear_sink(vm);
+    if let Some(s) = turn_sink.take() {
+        app.drain_panel_ops(&s);
+        *next_panel_id = s.next_id();
+    }
+}
+
+/// The end of a turn, however it was driven: record what it cost, fold what
+/// the model said into the conversation, and either queue the tool round it
+/// asked for or close the user turn out (`turn_completed`). Both drivers land
+/// here — the built-in stream (`Tick::Turn(None)`) and a Lua `turn` handler's
+/// assembled return — so the protocol's ordering lives exactly once.
+#[allow(clippy::too_many_arguments)]
+fn end_of_turn<'a>(
+    app: &mut App,
+    vm: &'a mlua::Lua,
+    chat: &mut Chat,
+    history: &mut Vec<Value>,
+    turn: &agent::api::Turn,
+    stop_turn: &mut bool,
+    tool_queue: &mut VecDeque<(String, String, String)>,
+    tool_flight: &mut Option<ToolFlight<'a>>,
+    pending_outcome: &mut Option<ToolOutcome>,
+    round_sink: &mut Option<agent::panels::PanelSink>,
+    next_panel_id: &mut u64,
+    panel_at: &mut PanelInsertAt,
+    event: &mut Option<agent::lua::EventRun<'a>>,
+    event_rx: &mut Option<mpsc::UnboundedReceiver<()>>,
+) -> Result<()> {
+    // What this request cost, for `agent.llm.usage` (read-only, and written
+    // here so a `turn_completed` handler reads the turn that just finished).
+    agent::lua::record_usage(vm, turn.tokens());
+    // The answer content was already streamed live into its block; do not
+    // push it again. The summary line (tokens, tok/s) is not part of it.
+    if let Some(summary) = turn.summary() {
+        app.push(Role::Assistant, summary);
+    }
+
+    // A turn *continues* into another tool round while the model still wants
+    // tools and the user has not stopped it. There is no round cap: a turn
+    // runs as long as the model keeps asking, and `stop_turn` (set by
+    // `Ctrl+c`) is what ends it.
+    //
+    // A stopped turn leaves the model's calls *unanswered* on purpose. It
+    // records them with `answering: false`, so it claims nothing it will not
+    // answer — an assistant message asking for calls whose results never come
+    // is exactly what a server rejects (`incomplete_parallel_tool_calls`, see
+    // `push_assistant_turn`).
+    let continuing = continues(turn.wants_tools(), *stop_turn);
+    // What the model said, then what it asked for — in that order, because
+    // that order is the protocol's. See `push_assistant_turn`.
+    push_assistant_turn(history, turn, continuing);
+    if continuing {
+        // The round's panels will be spliced in immediately before the request
+        // that started them, which `push_assistant_turn` has just written last
+        // (text, then calls). Recording it here — rather than assuming a
+        // position when the ops drain — is what makes the placement follow the
+        // transcript instead of the archive schedule.
+        *panel_at = Some(history.len() - 1);
+        // Queue the round's calls and start the first one. A tool is a
+        // coroutine on the config VM that the loop steps (see
+        // `start_next_tool`), so it only runs between frames; panel ops from
+        // policy Lua and the bash stream panel buffer in the round's shared
+        // sink, drained every frame while the tools run.
+        *tool_queue = turn
+            .tool_calls
+            .iter()
+            .map(|c| (c.id.clone(), c.name.clone(), c.arguments.clone()))
+            .collect();
+        // `continuing_from`, not a fresh sink: a panel id is scoped to the
+        // transcript's id→message map, which outlives the round, so a counter
+        // that restarted here would hand round two's first panel an id round
+        // one had already used — and it would be appended to *that* panel,
+        // putting a write's content and its dialog in the read box above it.
+        *round_sink = Some(agent::panels::PanelSink::continuing_from(*next_panel_id));
+        // A call that never started (refused by the dispatch gate, or not in
+        // the registry) lands in `pending_outcome` and takes the same finish
+        // path a completed call does.
+        let (started, refused) =
+            start_next_tool(vm, tool_queue, round_sink.as_ref(), offered_tools(chat))
+                .map_err(anyhow::Error::msg)?;
+        *tool_flight = started;
+        *pending_outcome = refused;
+    } else if turn.wants_tools() {
+        // The user stopped the turn while the model still wanted tools: say
+        // so, rather than leaving the turn to end with no explanation on
+        // screen.
+        app.push(
+            Role::Assistant,
+            "stopped: you interrupted this turn.".to_string(),
+        );
+        app.set_status_text("turn stopped", StatusKind::Warn);
+    }
+    if !continuing {
+        // The user turn is over: start `turn_completed` so a Lua handler can
+        // inspect the conversation (and compact it — see `agent::lua`'s
+        // config section). It runs as a coroutine on this thread, suspended
+        // by its `agent.on_timeout` waits rather than blocking the loop.
+        start_turn_completed(vm, history, event, event_rx);
+    }
+    Ok(())
+}
+
 /// Archive newly-landed history messages to the conversation log (the
 /// save-to-disk side). A watermark tracks how far the log has seen: every
 /// message is appended exactly once, in order — the log is an append-only raw
@@ -1504,6 +1698,18 @@ async fn run<W: Write>(
     // (the loop keeps rendering) and is resumed when its reactor timer fires.
     let mut event: Option<agent::lua::EventRun<'_>> = None;
     let mut event_rx: Option<mpsc::UnboundedReceiver<()>> = None;
+    // The `turn` event handler — the main conversation's requests, driven by
+    // Lua (`lua/lib/main_turn.lua`) when a handler is registered. Same
+    // cooperative shape as `turn_completed`, but a *request*: the coroutine's
+    // return value is the assembled turn. Separate slots, because a suspended
+    // `turn_completed` handler may legitimately span into the turn that
+    // follows it, and one slot would have each clobber the other.
+    let mut turn_event: Option<agent::lua::EventRun<'_>> = None;
+    let mut turn_event_rx: Option<mpsc::UnboundedReceiver<()>> = None;
+    // The sink the turn handler's panels draw into while it runs. Drained
+    // every frame like a tool round's — but *not* archived (see
+    // `teardown_turn_sink` for why).
+    let mut turn_sink: Option<agent::panels::PanelSink> = None;
 
     // Draw once before the loop: without it the (bare) alternate screen is
     // blank until the first event arrives, so the app looks dead on startup.
@@ -1561,7 +1767,15 @@ async fn run<W: Write>(
                     format!("tools refresh failed: {e:#}"),
                     "error".into(),
                 );
-            } else {
+            } else if !start_lua_turn(
+                vm,
+                &history,
+                app,
+                &mut turn_event,
+                &mut turn_event_rx,
+                &mut turn_sink,
+                next_panel_id,
+            ) {
                 match chat.stream_turn(&request_history(vm, &history)).await {
                     Ok(s) => stream = Some(s),
                     Err(e) => {
@@ -1602,7 +1816,7 @@ async fn run<W: Write>(
             }
         }
 
-        let busy = stream.is_some() || tool_flight.is_some();
+        let busy = stream.is_some() || tool_flight.is_some() || turn_event.is_some();
         let tick = if busy {
             if tool_flight.is_some() {
                 // A tool is executing: also wake on a short pulse so the loop
@@ -1614,6 +1828,7 @@ async fn run<W: Write>(
                     tev = next_turn_event(&mut stream) => Some(Tick::Turn(tev)),
                     cmd = lua_rx.recv() => cmd.map(Tick::Lua),
                     _eev = next_event(&mut event_rx) => Some(Tick::Event(())),
+                    _tev = next_event(&mut turn_event_rx) => Some(Tick::LuaTurn),
                     _ = tokio::time::sleep(Duration::from_millis(20)) => Some(Tick::Pulse),
                 }
             } else {
@@ -1622,6 +1837,7 @@ async fn run<W: Write>(
                     tev = next_turn_event(&mut stream) => Some(Tick::Turn(tev)),
                     cmd = lua_rx.recv() => cmd.map(Tick::Lua),
                     _eev = next_event(&mut event_rx) => Some(Tick::Event(())),
+                    _tev = next_event(&mut turn_event_rx) => Some(Tick::LuaTurn),
                 }
             }
         } else {
@@ -1639,6 +1855,7 @@ async fn run<W: Write>(
                 ev = rx.recv() => ev.map(Tick::Key),
                 cmd = lua_rx.recv() => cmd.map(Tick::Lua),
                 _eev = next_event(&mut event_rx) => Some(Tick::Event(())),
+                _tev = next_event(&mut turn_event_rx) => Some(Tick::LuaTurn),
             }
         };
         let Some(tick) = tick else {
@@ -1832,7 +2049,15 @@ async fn run<W: Write>(
                                     format!("tools refresh failed: {e:#}"),
                                     "error".into(),
                                 );
-                            } else {
+                            } else if !start_lua_turn(
+                                vm,
+                                &history,
+                                app,
+                                &mut turn_event,
+                                &mut turn_event_rx,
+                                &mut turn_sink,
+                                next_panel_id,
+                            ) {
                                 match chat.stream_turn(&request_history(vm, &history)).await {
                                     Ok(s) => stream = Some(s),
                                     Err(e) => {
@@ -1940,7 +2165,15 @@ async fn run<W: Write>(
                             format!("tools refresh failed: {e:#}"),
                             "error".into(),
                         );
-                    } else {
+                    } else if !start_lua_turn(
+                        vm,
+                        &history,
+                        app,
+                        &mut turn_event,
+                        &mut turn_event_rx,
+                        &mut turn_sink,
+                        next_panel_id,
+                    ) {
                         match chat.stream_turn(&request_history(vm, &history)).await {
                             Ok(s) => stream = Some(s),
                             Err(e) => {
@@ -2023,89 +2256,92 @@ async fn run<W: Write>(
                 // than stale. Anything a tool reports sets it again.
                 app.clear_status();
                 let turn = builder.finish();
-                // What this request cost, for `agent.llm.usage` (read-only, and
-                // written here so a `turn_completed` handler reads the turn that
-                // just finished).
-                agent::lua::record_usage(vm, turn.tokens());
-                // The answer content was already streamed live into the panel's
-                // "response" block (content events -> stream_append_boxed); do
-                // not push it again.
-                if let Some(summary) = turn.summary() {
-                    app.push(Role::Assistant, summary);
-                }
-
-                // A turn *continues* into another tool round while the model
-                // still wants tools and the user has not stopped it. There is no
-                // round cap: a turn runs as long as the model keeps asking, and
-                // `stop_turn` (set by `Ctrl+c`) is what ends it.
-                //
-                // A stopped turn leaves the model's calls *unanswered* on purpose.
-                // It records them with `answering: false`, so it claims nothing
-                // it will not answer — an assistant message asking for calls
-                // whose results never come is exactly what a server rejects
-                // (`incomplete_parallel_tool_calls`, see `push_assistant_turn`).
-                let continuing = continues(turn.wants_tools(), stop_turn);
-                // What the model said, then what it asked for — in that order,
-                // because that order is the protocol's. See
-                // `push_assistant_turn`.
-                push_assistant_turn(&mut history, &turn, continuing);
-                if continuing {
-                    // The round's panels will be spliced in immediately before
-                    // the request that started them, which `push_assistant_turn`
-                    // has just written last (text, then calls). Recording it here
-                    // — rather than assuming a position when the ops drain — is
-                    // what makes the placement follow the transcript instead of
-                    // the archive schedule.
-                    panel_at = Some(history.len() - 1);
-                    // Queue the round's calls and start the first one. A tool
-                    // is a coroutine on the config VM that the loop steps (see
-                    // `start_next_tool`), so it only runs between frames; panel
-                    // ops from policy Lua and the bash stream panel buffer in
-                    // the round's shared sink, drained every frame while the
-                    // tools run.
-                    tool_queue = turn
-                        .tool_calls
-                        .iter()
-                        .map(|c| (c.id.clone(), c.name.clone(), c.arguments.clone()))
-                        .collect();
-                    // `continuing_from`, not a fresh sink: a panel id is scoped
-                    // to the transcript's id→message map, which outlives the
-                    // round, so a counter that restarted here would hand round
-                    // two's first panel an id round one had already used — and it
-                    // would be appended to *that* panel, putting a write's
-                    // content and its dialog in the read box above it.
-                    round_sink = Some(agent::panels::PanelSink::continuing_from(next_panel_id));
-                    // A call that never started (refused by the dispatch gate,
-                    // or not in the registry) lands in `pending_outcome` and
-                    // takes the same finish path a completed call does.
-                    let (started, refused) = start_next_tool(
-                        vm,
-                        &mut tool_queue,
-                        round_sink.as_ref(),
-                        offered_tools(chat),
-                    )
-                    .map_err(anyhow::Error::msg)?;
-                    tool_flight = started;
-                    pending_outcome = refused;
-                } else if turn.wants_tools() {
-                    // The user stopped the turn while the model still wanted
-                    // tools: say so, rather than leaving the turn to end with no
-                    // explanation on screen.
-                    app.push(
-                        Role::Assistant,
-                        "stopped: you interrupted this turn.".to_string(),
-                    );
-                    app.set_status_text("turn stopped", StatusKind::Warn);
-                }
-                if !continuing {
-                    // The user turn is over: start `turn_completed` so a Lua
-                    // handler can inspect the conversation (and compact it —
-                    // see `agent::lua`'s config section). It runs as a
-                    // coroutine on this thread, suspended by its
-                    // `agent.on_timeout` waits rather than blocking the loop.
-                    start_turn_completed(vm, &history, &mut event, &mut event_rx);
-                }
+                end_of_turn(
+                    app,
+                    vm,
+                    chat,
+                    &mut history,
+                    &turn,
+                    &mut stop_turn,
+                    &mut tool_queue,
+                    &mut tool_flight,
+                    &mut pending_outcome,
+                    &mut round_sink,
+                    &mut next_panel_id,
+                    &mut panel_at,
+                    &mut event,
+                    &mut event_rx,
+                )?;
                 builder = TurnBuilder::new();
+            }
+            Tick::LuaTurn => {
+                // The reactor's timer fired for the Lua-driven turn: resume the
+                // handler where it yielded. It polls its request's queue
+                // between `agent.on_timeout` waits, and those waits are what
+                // the timers pace — so this arm *is* the stream pump.
+                let step = turn_event.as_mut().map(|run| run.step());
+                match step {
+                    Some(Ok(agent::lua::EventStep::Waiting { ms })) => {
+                        turn_event_rx = Some(start_event_timer(ms));
+                    }
+                    Some(Ok(agent::lua::EventStep::Returned)) => {
+                        let mut run = turn_event.take().expect("stepped Some");
+                        turn_event_rx = None;
+                        let returned = run.take_returned();
+                        teardown_turn_sink(vm, app, &mut turn_sink, &mut next_panel_id);
+                        app.clear_status();
+                        match returned.map(agent::lua::turn_from_lua) {
+                            Some(Ok((turn, reasoning))) => {
+                                // Reasoning streamed live into its block; the
+                                // full text comes back with the turn so the log
+                                // keeps the thinking, not just the conclusions.
+                                archive_reasoning(&reasoning, &mut reasoning_log);
+                                end_of_turn(
+                                    app,
+                                    vm,
+                                    chat,
+                                    &mut history,
+                                    &turn,
+                                    &mut stop_turn,
+                                    &mut tool_queue,
+                                    &mut tool_flight,
+                                    &mut pending_outcome,
+                                    &mut round_sink,
+                                    &mut next_panel_id,
+                                    &mut panel_at,
+                                    &mut event,
+                                    &mut event_rx,
+                                )?;
+                            }
+                            Some(Err(e)) => {
+                                app.push_boxed(Role::Assistant, e, "error".into());
+                            }
+                            // A handler that answered nil drove nothing: say
+                            // so, because a turn that silently did not happen
+                            // looks like a lost message.
+                            None => app.push_boxed(
+                                Role::Assistant,
+                                "turn failed: the `turn` handler returned nothing \
+                                 (agent.on_event(\"turn\", …) must return the \
+                                 assembled turn — see lua/lib/main_turn.lua)"
+                                    .into(),
+                                "error".into(),
+                            ),
+                        }
+                    }
+                    Some(Err(e)) => {
+                        turn_event = None;
+                        turn_event_rx = None;
+                        teardown_turn_sink(vm, app, &mut turn_sink, &mut next_panel_id);
+                        app.clear_status();
+                        app.push_boxed(
+                            Role::Assistant,
+                            format!("turn failed: {e}"),
+                            "error".into(),
+                        );
+                    }
+                    None => turn_event_rx = None,
+                }
             }
             Tick::Pulse => {} // periodic wake while a tool runs: drained + redrawn below
         }
@@ -2115,6 +2351,12 @@ async fn run<W: Write>(
         // as the loop steps it, so the box fills live.
         if let Some(s) = &round_sink {
             archive_panels(app.drain_panel_ops(s), &mut panel_records);
+        }
+        // The Lua turn handler's drawing, drained the same way — but not
+        // archived: resume reconstructs those blocks from the reasoning
+        // records and the assistant message (see `teardown_turn_sink`).
+        if let Some(s) = &turn_sink {
+            app.drain_panel_ops(s);
         }
 
         // Grammars, in three steps: notice what the transcript asked for, start
@@ -2190,7 +2432,10 @@ async fn run<W: Write>(
         save_history(
             &history,
             &mut saved_upto,
-            stream.is_none() && tool_flight.is_none() && pending_outcome.is_none(),
+            stream.is_none()
+                && tool_flight.is_none()
+                && pending_outcome.is_none()
+                && turn_event.is_none(),
             &mut panel_records,
             panel_at,
             &mut reasoning_log,

@@ -689,6 +689,10 @@ pub enum EventStep {
 pub struct EventRun<'lua> {
     lua: &'lua Lua,
     thread: mlua::Thread,
+    /// What the handler returned, set as the coroutine finishes. `nil` returns
+    /// stay `None`: a notification handler (`turn_completed`) and a request
+    /// handler that answered `nil` are read the same way — "nothing back".
+    returned: Option<mlua::Value>,
 }
 
 impl<'lua> EventRun<'lua> {
@@ -724,11 +728,24 @@ impl<'lua> EventRun<'lua> {
         let thread = lua
             .create_thread(handler)
             .map_err(|e| format!("event: coroutine: {e}"))?;
-        let mut run = EventRun { lua, thread };
+        let mut run = EventRun {
+            lua,
+            thread,
+            returned: None,
+        };
         let step = run
             .resume_with(Some(payload_lua))
             .map_err(|e| format!("event {name}: {e}"))?;
         Ok(Some((run, step)))
+    }
+
+    /// The handler's return value, once it has returned — the answer when the
+    /// event is a *request* (`turn`, where the return is the assembled turn)
+    /// rather than a notification (`turn_completed`, whose return is ignored).
+    /// `None` while the handler is still suspended, and forever when it
+    /// returned nothing.
+    pub fn take_returned(&mut self) -> Option<mlua::Value> {
+        self.returned.take()
     }
 
     /// Resume the suspension: the reactor's timer for the last
@@ -751,7 +768,15 @@ impl<'lua> EventRun<'lua> {
         let res: mlua::Value = self.thread.resume(arg).map_err(err_to_event)?;
         match self.thread.status() {
             mlua::thread::ThreadStatus::Resumable => decode_await(res),
-            _ => Ok(EventStep::Returned),
+            _ => {
+                // Finished: `res` is the handler's return. Keep it for
+                // `take_returned`; a notification handler's `nil` is the same
+                // as no answer at all.
+                if !matches!(res, mlua::Value::Nil) {
+                    self.returned = Some(res);
+                }
+                Ok(EventStep::Returned)
+            }
         }
     }
 }

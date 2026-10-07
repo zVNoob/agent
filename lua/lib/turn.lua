@@ -6,11 +6,14 @@
 -- be a second source of truth next to `agent.llm`.
 --
 --   local s = agent.turn({ messages = { … } })
---   for ev in s.iter do … draw each event into a panel … end
---   local result = s:run()           -- drive to the end: the assembled turn
+--   local result = s:run(function(ev) … draw each event into a panel … end)
 --   -- result = { content = "...", reasoning = "...",
 --   --            tool_calls = { { id, name, arguments }, … },
 --   --            usage = { prompt = n, completion = n }, timings = {...} }
+--
+-- (`s:iter()` is the lower-level shape — one event per iteration, terminal event
+-- as the iterator's second return — for a caller that needs the loop, not the
+-- accumulation.)
 --
 -- What it is for: running a conversation *off to the side* — a subagent, a
 -- summarizer, a reviewer — on its own messages, its own tools, its own model, without
@@ -134,11 +137,12 @@ function M.turn(opts)
     end
   end
 
-  ---Drive the stream to its terminal event and return the assembled turn. The
-  ---events are still available to a caller that also wants to draw them; this is the
-  ---accumulation, done by Rust (`TurnBuilder`), so the route does not grow a second
-  ---one.
-  function s:run()
+  ---Drive the stream to its terminal event and return the assembled turn.
+  ---`draw`, when given, sees each non-terminal event as it arrives (content,
+  ---reasoning, tool_call, usage, timings) — the main-loop handler draws the
+  ---stream live through it. The accumulation itself is done by Rust
+  ---(`TurnBuilder`), so the route does not grow a second one.
+  function s:run(draw)
     while true do
       local ev = self:step()
       if ev == nil then
@@ -153,6 +157,8 @@ function M.turn(opts)
         }
       elseif ev.kind == "error" then
         error("agent.turn: " .. tostring(ev.message), 0)
+      elseif draw then
+        draw(ev)
       end
     end
   end

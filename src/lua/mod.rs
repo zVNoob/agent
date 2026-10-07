@@ -409,6 +409,7 @@ pub use run::{
     AgentCommand, EventRun, EventStep, InputOp, ToolRun, ToolStep, bind_trigger_channel,
     fire_event_on_vm, fire_event_returning,
 };
+pub use turn::turn_from_lua;
 pub use usage::{Usage, record_usage};
 pub use vm::{
     AskAnswer, AskHandler, clear_sink, install_sink, new_agent_vm, new_vm, new_vm_with_ask,
