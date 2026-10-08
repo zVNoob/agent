@@ -1392,6 +1392,17 @@ fn drive_lua_turn(
                 return Ok(());
             }
             Some(Ok(agent::lua::EventStep::Tools { turn: table })) => {
+                // The handler parks on the round — its last timer is spent.
+                // Clearing the receiver is not hygiene: a spent unbounded
+                // receiver's sender is gone (the timer task drops it after
+                // firing), so `recv` answers `None` *immediately* rather than
+                // pending — and the select arm maps any completed recv to
+                // `Tick::LuaTurn`, which would resume the parked handler with
+                // `true` (a busy loop of spurious ticks, the first of which
+                // crashes the handler on its boolean `round`). The select may
+                // only ever see a live timer. The round's own machinery —
+                // pulses, keys, the outcome fold — wakes the loop from here.
+                *d.turn_event_rx = None;
                 let (turn, reasoning) = match agent::lua::turn_from_lua(mlua::Value::Table(table)) {
                     Ok(pair) => pair,
                     Err(e) => {
