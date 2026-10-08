@@ -543,6 +543,9 @@ fn drive_event_to_completion(mut run: EventRun, mut step: EventStep) -> (EventRu
                 step = run.step().expect("event timer fired");
             }
             EventStep::Returned => return (run, waits),
+            EventStep::Tools { .. } => {
+                panic!("a tools yield has no round here to run — this helper drives waits only")
+            }
         }
     }
 }
@@ -588,7 +591,9 @@ use super::sandbox::{
     resolve_path,
 };
 use super::tree::{load_init, lua_dir_candidates, lua_dir_in, missing_tree_message};
-use super::turn::turn_from_lua;
+use super::turn::{
+    TurnReply, round_results_reply, stopped_reply, turn_from_lua, turn_reply_from_lua,
+};
 use super::usage::{Usage, record_usage, usage_guard};
 use super::vm::{
     AskAnswer, AskHandler, STDLIB, eval_reactor, install_sink, new_vm, new_vm_with_ask,

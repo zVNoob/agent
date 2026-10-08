@@ -443,14 +443,16 @@ end
 --
 -- Three events fire today, and they are not the same kind of thing.
 --
---   "turn"            a request. Fired when the user submits a line, when a
---                     tool round needs the model again, and when
+--   "turn"            a request. Fired when the user submits a line and when
 --                     `agent.trigger` forces an inference. The handler is
---                     given the conversation and drives one request; its
---                     return value *is* the assembled turn. The handler below
---                     (`agent.main_turn`, from lua/lib/main_turn.lua) is what
---                     runs every turn you watch. Unregister it and the loop
---                     falls back to driving the request itself.
+--                     given the conversation and drives the whole turn —
+--                     requests *and* the tool loop between them, suspending
+--                     on `agent.await_tools(turn)` while the loop runs each
+--                     round — and its return value *is* the turn's final
+--                     answer. The handler below (`agent.main_turn`, from
+--                     lua/lib/main_turn.lua) is what runs every turn you
+--                     watch. Unregister it and the loop falls back to driving
+--                     the request itself.
 --
 --   "turn_completed"  a notification. The handler is told what happened and its
 --                     return value is ignored. This section's own handler.

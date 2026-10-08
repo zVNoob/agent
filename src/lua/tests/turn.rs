@@ -466,8 +466,13 @@ async fn turn_run_returns_the_assembled_turn() {
 
 /// Step an `EventRun` to completion the way the loop would, answering each
 /// `on_timeout` wait immediately (with a small real sleep, so the transport
-/// task gets to fill the queue between polls).
-async fn drive_event(run: &mut EventRun<'_>, mut step: EventStep) {
+/// task gets to fill the queue between polls) and each `agent.await_tools`
+/// yield with `on_tools`'s resume value — the round's answer.
+async fn drive_event_with_tools(
+    run: &mut EventRun<'_>,
+    mut step: EventStep,
+    mut on_tools: impl FnMut(&mlua::Table) -> mlua::Value,
+) {
     for _ in 0..1000 {
         match step {
             EventStep::Returned => return,
@@ -475,9 +480,21 @@ async fn drive_event(run: &mut EventRun<'_>, mut step: EventStep) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 step = run.step().expect("step the handler");
             }
+            EventStep::Tools { turn } => {
+                let reply = on_tools(&turn);
+                step = run.resume_value(reply).expect("resume with the round");
+            }
         }
     }
     panic!("the handler never finished — a hang, not a test to wait out");
+}
+
+/// The same drive for a turn with no tool calls in it.
+async fn drive_event(run: &mut EventRun<'_>, step: EventStep) {
+    drive_event_with_tools(run, step, |_| {
+        panic!("a tools yield has no round here to run")
+    })
+    .await
 }
 
 #[tokio::test]
@@ -600,5 +617,147 @@ fn turn_from_lua_decodes_the_assembled_turn_table() {
     assert!(
         err.contains("expected the assembled-turn table"),
         "the error says what was expected: {err}"
+    );
+}
+
+#[tokio::test]
+async fn the_shipped_turn_handler_runs_the_tool_loop() {
+    // The whole Stage 2 contract on the Lua side: the handler drives the
+    // first request, suspends on `agent.await_tools` with the assembled turn,
+    // and — resumed with the round's results — extends its history and drives
+    // the next request. The fake server answers request 1 with a tool call
+    // and request 2 (recognisable by the tool result in its body) with the
+    // final answer.
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = bodies.clone();
+    let fake = FakeHttpServer::start(move |req| {
+        sink.lock().unwrap().push(req.body.clone());
+        let body = if req.body.contains("\"role\":\"tool\"") {
+            // The continuation: prove the handler's history grew by the call
+            // and its result by answering with a phrase of our own.
+            "data: {\"choices\":[{\"delta\":{\"content\":\"the tool said hi\"}}]}\n\n\
+             data: [DONE]\n\n"
+                .to_string()
+        } else {
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"fs.read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\"}}]}}]}\n\n\
+             data: [DONE]\n\n"
+                .to_string()
+        };
+        FakeServerReply::Response(FakeResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "text/event-stream".into())],
+            body,
+        })
+    });
+    let vm = shipped_vm();
+    vm.load(format!(
+        "agent.llm = agent.llm or {{}}
+         agent.llm.base_url = \"{}\"",
+        fake.url("/v1")
+    ))
+    .eval::<()>()
+    .expect("configure");
+    let sink_handle = crate::panels::PanelSink::continuing_from(0);
+    install_sink(&vm, &sink_handle).expect("install the sink");
+
+    let payload = serde_json::json!({
+        "history": [ { "role": "user", "content": "read x for me" } ]
+    });
+    let (mut run, step) = EventRun::start(&vm, "turn", &payload)
+        .expect("start")
+        .expect("the shipped tree registers a turn handler");
+
+    let mut yielded_turns = Vec::new();
+    let lua = run.lua();
+    drive_event_with_tools(&mut run, step, |turn| {
+        // The yield must carry the assembled turn — the loop folds *that*.
+        let calls: mlua::Table = turn.get("tool_calls").expect("tool_calls");
+        assert_eq!(
+            calls.len().expect("len"),
+            1,
+            "the yield carries the turn that asked for the round"
+        );
+        yielded_turns.push(turn.get::<String>("content").unwrap_or_default());
+        // The loop's answer: one folded result per call, in order.
+        round_results_reply(
+            lua,
+            &[(
+                "call_1".to_string(),
+                "{\"ok\":true,\"result\":\"hi\"}".to_string(),
+            )],
+            false,
+        )
+        .expect("the round's reply")
+    })
+    .await;
+
+    assert_eq!(yielded_turns.len(), 1, "one round was handed to the loop");
+    let returned = run.take_returned().expect("the handler answered");
+    let (turn, _) = turn_from_lua(returned).expect("the final turn decodes");
+    assert_eq!(turn.content, "the tool said hi");
+    assert!(!turn.wants_tools(), "the final turn ends the loop");
+
+    // And the second request really carried the extended history: the
+    // assistant's wire-shaped calls and the tool's result, in order.
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2, "two requests went out");
+    let second = &bodies[1];
+    let calls_at = second.find("\"tool_calls\"").expect("the calls message");
+    let result_at = second
+        .find("\\\"ok\\\":true")
+        .expect("the tool result message");
+    assert!(
+        calls_at < result_at,
+        "the calls precede the results — the protocol's order: {second}"
+    );
+    assert!(
+        second.contains("\"name\":\"fs.read\"") && second.contains("call_1"),
+        "the wire shape the server expects: {second}"
+    );
+}
+
+#[tokio::test]
+async fn a_stopped_round_comes_back_as_the_sentinel() {
+    // Interrupting the round ends the turn: the loop resumes the handler with
+    // `{ stopped = true }`, and the handler passes the sentinel straight back
+    // — everything about the turn is folded already, so returning the turn
+    // itself would fold it twice.
+    let fake = FakeHttpServer::start(move |_req| {
+        FakeServerReply::Response(FakeResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "text/event-stream".into())],
+            body: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"fs.read\",\"arguments\":\"{}\"}}]}}]}\n\n\
+                   data: [DONE]\n\n"
+                .into(),
+        })
+    });
+    let vm = shipped_vm();
+    vm.load(format!(
+        "agent.llm = agent.llm or {{}}
+         agent.llm.base_url = \"{}\"",
+        fake.url("/v1")
+    ))
+    .eval::<()>()
+    .expect("configure");
+
+    let payload = serde_json::json!({
+        "history": [ { "role": "user", "content": "read x for me" } ]
+    });
+    let (mut run, step) = EventRun::start(&vm, "turn", &payload)
+        .expect("start")
+        .expect("the shipped tree registers a turn handler");
+    let lua = run.lua();
+    drive_event_with_tools(&mut run, step, |_turn| {
+        stopped_reply(lua).expect("the stopped reply")
+    })
+    .await;
+
+    let returned = run.take_returned().expect("the handler answered");
+    assert!(
+        matches!(
+            turn_reply_from_lua(returned).expect("decodes"),
+            TurnReply::Stopped
+        ),
+        "the handler passes the stopped sentinel straight back"
     );
 }

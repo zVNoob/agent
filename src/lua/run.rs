@@ -268,6 +268,12 @@ pub(super) fn decode_await(yielded: mlua::Value) -> Result<EventStep, String> {
                 ms: ms.max(0) as u64,
             })
         }
+        Some("tools") => {
+            let turn: mlua::Table = t
+                .get("turn")
+                .map_err(|e| format!("event handler: await tools without a turn table: {e}"))?;
+            Ok(EventStep::Tools { turn })
+        }
         other => Err(format!("event handler: unknown await request {other:?}")),
     }
 }
@@ -656,7 +662,7 @@ pub fn fire_event_on_vm(
 }
 
 /// One step of a reactor-driven event handler coroutine ([`EventRun`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EventStep {
     /// The handler returned.
     Returned,
@@ -664,6 +670,13 @@ pub enum EventStep {
     /// reactor must resume it after `ms` milliseconds (it passes `true` back
     /// into the yield site).
     Waiting { ms: u64 },
+    /// The handler suspended on an `agent.await_tools(turn)` call: the
+    /// assembled turn asked for tools, and the loop — which owns the tool
+    /// mechanics — must fold the turn into the conversation, run the round,
+    /// and resume the handler with the results. Only a `turn` handler may
+    /// suspend this way: the round is driven by the turn's own machinery, and
+    /// anywhere else there is nothing to run it.
+    Tools { turn: mlua::Table },
 }
 
 /// A `turn_completed`-style event handler driven **cooperatively** on the
@@ -755,9 +768,19 @@ impl<'lua> EventRun<'lua> {
         self.resume_with(Some(mlua::Value::Boolean(true)))
     }
 
+    /// Resume the suspension with a value: it lands as the return of the
+    /// `coroutine.yield` the handler is parked on — the answer to an
+    /// `agent.await_tools(turn)` call, where `step`'s bare `true` would say
+    /// nothing.
+    pub fn resume_value(&mut self, value: mlua::Value) -> Result<EventStep, String> {
+        self.resume_with(Some(value))
+    }
+
     /// The VM the handler runs on — the agent's own config VM, borrowed for as
-    /// long as the run lasts (tests inspect its globals afterwards).
-    pub fn lua(&self) -> &Lua {
+    /// long as the run lasts (tests inspect its globals afterwards). The
+    /// reference is the run's own lifetime, so a caller can hold it across a
+    /// `&mut self` resume (a round-resume building its reply on the same VM).
+    pub fn lua(&self) -> &'lua Lua {
         self.lua
     }
 

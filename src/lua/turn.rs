@@ -436,10 +436,36 @@ pub(super) fn lua_turn_close(_lua: &Lua, handle: i64) -> mlua::Result<()> {
     Ok(())
 }
 
+/// What a `turn` handler handed back at the end of its run.
+pub enum TurnReply {
+    /// The assembled final turn and its reasoning — folded and closed out by
+    /// the loop's end-of-turn path.
+    Turn(crate::api::Turn, String),
+    /// The stopped sentinel: `{ stopped = true }`, returned when the loop
+    /// answered an `agent.await_tools` yield with `stopped = true`. Everything
+    /// about the turn is already folded (the interrupted round completed), so
+    /// the close-out says the turn was stopped and fires `turn_completed` —
+    /// and folds nothing twice.
+    Stopped,
+}
+
 /// Decode a `turn` handler's return value — the assembled-turn table the
-/// `agent.turn` route's `:run()` produces — into the [`Turn`] the loop's
-/// end-of-turn path runs on, plus the reasoning, which `Turn` deliberately
-/// drops (it is not conversation history; the loop archives it separately).
+/// `agent.turn` route's `:run()` produces, or the stopped sentinel — into the
+/// [`TurnReply`] the loop's close-out runs on.
+pub fn turn_reply_from_lua(value: mlua::Value) -> Result<TurnReply, String> {
+    if let mlua::Value::Table(t) = &value {
+        if let Ok(true) = t.get::<bool>("stopped") {
+            return Ok(TurnReply::Stopped);
+        }
+    }
+    turn_from_lua(value).map(|(turn, reasoning)| TurnReply::Turn(turn, reasoning))
+}
+
+/// Decode the assembled-turn table the `agent.turn` route's `:run()` produces
+/// into the [`Turn`] the loop's end-of-turn path runs on, plus the reasoning,
+/// which `Turn` deliberately drops (it is not conversation history; the loop
+/// archives it separately). Also the shape an `agent.await_tools` yield
+/// carries — the same decoding, per round rather than per turn.
 ///
 /// Missing fields take the empty answer, so a handler that built the table by
 /// hand — a test double, a canned reply — needs only the keys it has. A value
@@ -491,6 +517,41 @@ pub fn turn_from_lua(value: mlua::Value) -> Result<(crate::api::Turn, String), S
         timings: obj().and_then(|o| o.get("timings")).cloned(),
     };
     Ok((turn, reasoning))
+}
+
+/// The resume value for an `agent.await_tools` yield: `{ stopped = true }` —
+/// the user interrupted before (or during) the round, so the handler's next
+/// move is to end the turn (by returning the same sentinel back).
+pub fn stopped_reply(lua: &Lua) -> Result<mlua::Value, String> {
+    let t = lua
+        .create_table()
+        .map_err(|e| format!("stopped reply: {e}"))?;
+    t.set("stopped", true)
+        .map_err(|e| format!("stopped reply: {e}"))?;
+    Ok(mlua::Value::Table(t))
+}
+
+/// The resume value for an `agent.await_tools` yield after a completed round:
+/// `{ results = { { id, content }, … }, stopped = bool }` — one entry per
+/// call, in the order the model made them, so the handler's own view of the
+/// conversation grows by exactly what the loop's did.
+pub fn round_results_reply(
+    lua: &Lua,
+    results: &[(String, String)],
+    stopped: bool,
+) -> Result<mlua::Value, String> {
+    let err = |e: mlua::Error| format!("round results reply: {e}");
+    let t = lua.create_table().map_err(err)?;
+    let arr = lua.create_table().map_err(err)?;
+    for (i, (id, content)) in results.iter().enumerate() {
+        let r = lua.create_table().map_err(err)?;
+        r.set("id", id.as_str()).map_err(err)?;
+        r.set("content", content.as_str()).map_err(err)?;
+        arr.set(i + 1, r).map_err(err)?;
+    }
+    t.set("results", arr).map_err(err)?;
+    t.set("stopped", stopped).map_err(err)?;
+    Ok(mlua::Value::Table(t))
 }
 
 /// Register the three primitives on the bridge.

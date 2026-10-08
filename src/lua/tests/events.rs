@@ -484,3 +484,83 @@ fn the_loop_primitives_report_false_with_no_loop_attached() {
         assert!(!got, "{call} reports that nothing was queued");
     }
 }
+
+#[test]
+fn a_tools_yield_decodes_to_the_tools_step() {
+    // `agent.await_tools(turn)` is the turn handler's way of handing a round
+    // to the loop: the yield decodes to `EventStep::Tools` carrying the
+    // assembled turn, and the loop's answer lands back at the yield site as
+    // `await_tools`'s return.
+    let lua = vm();
+    apply_config_source(
+        &lua,
+        r#"
+            agent.on_event("turn", function(_ev)
+              local round = agent.await_tools({ content = "", tool_calls = {
+                { id = "call_1", name = "fs.read", arguments = "{}" },
+              } })
+              agent._seen_round = round
+              return { content = "done", tool_calls = {} }
+            end)
+            "#,
+    )
+    .expect("apply");
+
+    let (mut run, step) = EventRun::start(&lua, "turn", &serde_json::json!({ "history": [] }))
+        .expect("start")
+        .expect("handler registered");
+    let EventStep::Tools { turn } = step else {
+        panic!("a tools yield decodes to the tools step, got {step:?}");
+    };
+    let calls: Table = turn
+        .get("tool_calls")
+        .expect("the assembled turn rides along");
+    assert_eq!(calls.len().expect("len"), 1);
+
+    let reply = round_results_reply(
+        &lua,
+        &[("call_1".to_string(), "content of x".to_string())],
+        false,
+    )
+    .expect("the round's reply");
+    assert_eq!(
+        run.resume_value(reply).expect("resume"),
+        EventStep::Returned
+    );
+    let agent: Table = lua.globals().get("agent").expect("agent");
+    let round: Table = agent.get("_seen_round").expect("the answer landed");
+    let results: Table = round.get("results").expect("results");
+    let first: Table = results.get(1).expect("one result");
+    assert_eq!(
+        first.get::<String>("content").expect("content"),
+        "content of x"
+    );
+    assert!(!round.get::<bool>("stopped").expect("stopped"));
+}
+
+#[test]
+fn a_tools_yield_without_a_turn_table_is_an_error() {
+    // The loop folds the yielded turn into the conversation — a yield with no
+    // turn to fold is the bug it reports, not a round to run.
+    let lua = vm();
+    apply_config_source(
+        &lua,
+        r#"
+            agent.on_event("turn", function(_ev)
+              coroutine.yield({ __agent_await = "tools", turn = "not a table" })
+              return { content = "", tool_calls = {} }
+            end)
+            "#,
+    )
+    .expect("apply");
+
+    let err = match EventRun::start(&lua, "turn", &serde_json::json!({ "history": [] })) {
+        Err(e) => e,
+        Ok(Some((_, step))) => panic!("the yield must not decode, got {step:?}"),
+        Ok(None) => panic!("handler registered"),
+    };
+    assert!(
+        err.contains("await tools without a turn table"),
+        "the error names the contract: {err}"
+    );
+}
