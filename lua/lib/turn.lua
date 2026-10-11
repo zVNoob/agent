@@ -86,10 +86,26 @@ local function resolve(opts)
   local system = opts.system
   if system == nil then system = llm and llm.system_prompt end
 
+  -- The conversation: the caller's `messages`, or — absent — `agent.history`,
+  -- which is the main conversation. A subagent that owns its own transcript
+  -- passes `messages` and never touches the history; the main turn passes
+  -- nothing and gets the conversation it is part of.
+  --
+  -- Copied, not aliased: the bridge encodes it into the request immediately, and
+  -- a caller mid-turn must be able to append the round's results afterwards
+  -- without reaching into a table the request already used.
   local messages = opts.messages
+  if messages == nil then messages = agent.history end
   if type(messages) ~= "table" then
-    error("agent.turn: `messages` is required (an array of OpenAI messages)", 2)
+    error(
+      "agent.turn: `messages` must be an array of OpenAI messages " ..
+      "(absent means agent.history, which is not a table)",
+      2
+    )
   end
+  local copy = {}
+  for i, m in ipairs(messages) do copy[i] = m end
+  messages = copy
   if system ~= nil and system ~= "" then
     local with_system = { { role = "system", content = system } }
     for i, m in ipairs(messages) do with_system[i + 1] = m end

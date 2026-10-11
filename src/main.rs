@@ -85,7 +85,7 @@
 //! All server-communicating logic lives in `api`; rendering and interaction
 //! state live in `agent::tui`; the terminal setup mirrors `bin/chat.rs`.
 
-use agent::api::{Chat, TurnBuilder, TurnEvent, assistant_tool_message};
+use agent::api::Chat;
 use agent::grammars::Catalog;
 use agent::status::StatusKind;
 use agent::tui::{Action, App, Click, Effect, MarkdownHighlighter, Role};
@@ -110,35 +110,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// How many of the newest log blocks a fresh session replays into the transcript
-/// and request history (cold-start context, chronological).
-///
-/// Blocks, not messages. A block is the log's unit of storage — records are
-/// appended into it, and the loop seals one at the end of every turn — so it is the
-/// only unit a byte offset can name, and in practice a block is a turn. Counting
-/// *messages* instead cut the window mid-block, so it began partway through a turn (a
-/// tool's panel with no sentence introducing it) and left the paging cursor addressing
-/// a position no offset could name — the source of records appearing twice, or not at
-/// all, when scrolling back.
-///
-/// The count is therefore a bound in blocks, not in tokens: see
-/// [`agent::memory::Options::block_target`] for what actually bounds a block's size,
-/// and be aware that two blocks of a log written before turn-end sealing existed is
-/// the whole log. That is not a fault — there is nothing to page when everything is
-/// already resident — but the cold-start context is then the whole log rather than a
-/// window, which is a trade this constant does not get to make quietly.
-///
-/// This is the *window*, not the extent of the history: it is what is resident at
-/// startup and what the model is sent, and scrolling past it pages older blocks in
-/// on demand ([`paging`]). Growing it grows the context — and the bill — for
-/// everything it covers, which is not a knob to turn because the transcript happens
-/// to be scrollable.
 const REPLAY_BLOCKS: usize = 2;
 
-/// Mouse capture: press/release + SGR coordinates only. crossterm's
-/// `EnableMouseCapture` also enables the `?1002`/`?1003` *motion* modes, which
-/// make every pointer wiggle over the terminal wake the event loop and redraw;
-/// the agent only needs deliberate clicks and wheel notches.
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
 const MOUSE_OFF: &str = "\x1b[?1000l\x1b[?1006l";
 
@@ -203,7 +176,7 @@ async fn main() -> Result<()> {
             "warning: no api_key in the Lua config; requests will lack an Authorization header"
         );
     }
-    let mut chat = Chat::connect(&config, tool_defs(&config_vm)?);
+    let chat = Chat::connect(&config, tool_defs(&config_vm)?);
     println!("model: {} · endpoint: {}", chat.model(), chat.endpoint());
 
     // The conversation log (save-to-disk): open one `Memory` per process when
@@ -241,9 +214,15 @@ async fn main() -> Result<()> {
         None => Replayed::empty(),
     };
     let replayed = resumed.records;
-    let request_history = replayed_request_history(&replayed);
-    if !replayed.is_empty() {
-        println!("memory: resumed {} archived messages", replayed.len());
+    // The conversation resumes into `agent.history` — the table the turn handler
+    // reads and appends. This is the one place Rust writes it, once, at startup:
+    // the archived prefix is already in the log, so it is a *table*, not an
+    // archive, and a session that never turns is a table nothing appends to.
+    let resumed_messages = replayed_request_history(&replayed);
+    match agent::lua::seed_history(&config_vm, &resumed_messages) {
+        Ok(n) if n > 0 => println!("memory: resumed {} archived messages", n),
+        Ok(_) => {}
+        Err(e) => println!("warning: conversation history not seeded: {e:#}"),
     }
 
     enable_raw_mode()?;
@@ -371,14 +350,8 @@ async fn main() -> Result<()> {
         &mut rx,
         &mut lua_rx,
         &mut app,
-        &mut chat,
-        &config,
         &config_vm,
         &mut catalog,
-        // The request half, already split off by `cold_start`: it carries no panel
-        // records, which the transcript above has replayed and which must not be
-        // sent to the model as if they were conversation.
-        request_history,
         &mut pager,
     )
     .await;
@@ -397,23 +370,10 @@ async fn main() -> Result<()> {
     outcome
 }
 
-/// One unit of work the agent loop multiplexes: a terminal event, the next
-/// turn event (`None` = the current turn's stream ended), a step of the tool
-/// call in flight (which finishes on its own, not on a thread of its own), a
-/// pending user-permission ask from the running tool (`None` = the ask channel
-/// closed), the reactor's timer poke for a suspended `turn_completed` handler,
-/// or a periodic pulse while a tool runs.
 enum Tick {
     Key(CrosstermEvent),
-    Turn(Option<Result<TurnEvent, anyhow::Error>>),
-    /// A forced inference queued by Lua (`agent.trigger`), possibly with a
-    /// replaced history — drained on the idle select.
     Lua(agent::lua::AgentCommand),
-    /// The reactor's timer fired: resume the suspended `turn_completed`
-    /// handler coroutine (see `start_turn_completed`).
     Event(()),
-    /// The reactor's timer fired for the Lua-driven turn: resume the `turn`
-    /// handler coroutine (see `start_lua_turn`).
     LuaTurn,
     Pulse,
 }
@@ -423,38 +383,11 @@ fn is_submit_key(key: &KeyEvent) -> bool {
     key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
-/// Await the in-flight turn's next event (parks forever when no turn is
-/// active — the branch is only polled while `stream.is_some()`).
-async fn next_turn_event(
-    stream: &mut Option<agent::api::TurnStream>,
-) -> Option<Result<TurnEvent, anyhow::Error>> {
-    match stream {
-        Some(s) => s.next().await,
-        None => futures_util::future::pending().await,
-    }
-}
-
-/// A finished tool call: the identity the `tool` message must quote, and the
-/// outcome — `Ok((body, content))` or an executor error message. Produced by
-/// the flight below, whether it finished normally, was refused by the dispatch
-/// gate, or raised.
-///
-/// The name and the arguments are deliberately **not** here. They were, until
-/// this stopped putting a box in the transcript: the box was the only reader.
-/// What a call was, and how it went, is now either something the tool drew or
-/// something it did not.
 struct ToolOutcome {
     id: String,
     result: Result<(String, String), String>,
 }
 
-/// A tool call in flight, driven by the event loop **on the agent's own config
-/// VM** — no thread, no second VM.
-///
-/// The call is a Lua coroutine ([`agent::lua::ToolRun`]) and `step` is where it
-/// is suspended: on a question ([`agent::lua::ToolStep::Ask`]), on a reactor wait
-/// (the sandbox's own cooperative cadence, or an `agent.on_timeout` inside the
-/// tool), or finished. The loop resumes it — see `advance_tool`.
 struct ToolFlight<'lua> {
     id: String,
     run: agent::lua::ToolRun<'lua>,
@@ -471,13 +404,6 @@ impl ToolFlight<'_> {
     }
 }
 
-/// The three answers a permission question can take, as the *user* gives them.
-///
-/// `Always` is only reachable when the question offered it: Lua passes that flag
-/// to `agent.api.ask_user`, and only a question with a path to remember offers
-/// it (see `agent.ask.for_syscall`). It arrives at the asking side as
-/// [`agent::lua::AskAnswer::AllowAndTrust`], which makes `agent.ask` record the
-/// path — so the same question is not asked again in this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AskChoice {
     Yes,
@@ -496,64 +422,6 @@ fn default_key(app: &mut App, key: crossterm::event::KeyEvent, busy: bool) -> Ef
     } else {
         app.handle_key(key)
     }
-}
-
-/// Put an assistant turn into the history, in the order the protocol requires.
-///
-/// **The text comes first, then the calls.** They are one turn the model
-/// produced together, and `assistant_tool_message` carries `content: null`, so
-/// they are two messages — and the protocol only accepts them in this order:
-///
-/// ```text
-/// assistant: "I'll start by looking at the README."
-/// assistant: tool_calls=[read(README), read(Makefile)]
-/// tool: …        <- one per call, immediately after
-/// tool: …
-/// ```
-///
-/// The other order — calls, then the text — puts an assistant message *between* a
-/// call and its answers, which is the model's next turn arriving before the group
-/// it opened has been answered. HuggingFace's router rejects that with
-/// `400 incomplete_parallel_tool_calls: every tool call in a parallel group must
-/// be answered before the next turn`, which is what a `moonshotai/Kimi-K3` turn
-/// through this loop produced.
-///
-/// It is invisible with one call per turn, because then there is no group to
-/// complete and the single result still lands before the next request. Every test
-/// in this repository does one call at a time, and llama.cpp emits one — so the
-/// only way to see it is a model that asks for two.
-///
-/// `answering` says whether the loop will actually run this turn's calls — which
-/// is [`continues`]'s answer. A stopped turn, or one that wanted no tools, is
-/// recorded as the text it produced and nothing more: claiming calls that will
-/// never be answered is what makes the *next* request invalid, so the calls
-/// message is simply not written.
-fn push_assistant_turn(history: &mut Vec<Value>, turn: &agent::api::Turn, answering: bool) {
-    if !turn.content.is_empty() {
-        history.push(json!({"role": "assistant", "content": turn.content}));
-    }
-    if answering && turn.wants_tools() {
-        history.push(assistant_tool_message(&turn.tool_calls));
-    }
-}
-
-/// Whether a turn that ended with `turn` chains into another round of tool
-/// calls: the model still wants tools, and the user has not stopped the turn.
-///
-/// **No round cap.** There used to be one (`MAX_TOOL_ROUNDS`, 8), and it was
-/// the wrong shape of limit for this: a count says nothing about how long the
-/// work is, so it truncated real tasks — a diff to read, an edit to verify, a
-/// build to run — at a number chosen without knowing any of that, and stopped
-/// with the model's calls unanswered. Time or round counts both misprice
-/// "enough"; the user watching the turn *is* the one who knows.
-///
-/// So the loop runs as long as the model asks. The cost of that is a model
-/// stuck in a loop, which is why `Ctrl+c` stops the turn rather than only the
-/// tool running at the time: killing the tool alone just hands the model an
-/// `interrupted` result to read, and a model that ignores that asks again, with
-/// nothing left to stop it but `Ctrl+d`.
-fn continues(turn_wants_tools: bool, stopped: bool) -> bool {
-    turn_wants_tools && !stopped
 }
 
 /// Ask the Lua `key` handler what a key press should do.
@@ -636,9 +504,6 @@ fn ask_choice(code: KeyCode, remember: &agent::panels::Remember) -> Option<AskCh
     }
 }
 
-/// Await the suspended `turn_completed` handler's timer poke (parks forever
-/// when no handler is waiting — the branch is only polled while the event
-/// coroutine is suspended).
 async fn next_event(event_rx: &mut Option<mpsc::UnboundedReceiver<()>>) -> Option<()> {
     match event_rx {
         Some(rx) => rx.recv().await,
@@ -767,148 +632,48 @@ fn advance_tool(
 ///
 /// The consequence to be aware of: a tool that draws nothing is invisible, and
 /// nothing in the loop will draw for it.
-/// Fold a finished tool call into the conversation, and hand back what was
-/// folded — the `(id, content)` pair a suspended `turn` handler is waiting
-/// for, so its own view of the conversation can grow by exactly what the
-/// loop's did.
-fn fold_tool_outcome(
-    app: &mut App,
-    history: &mut Vec<serde_json::Value>,
-    outcome: ToolOutcome,
-    round_sink: Option<&agent::panels::PanelSink>,
-    panel_log: &mut Vec<serde_json::Value>,
-) -> (String, String) {
+/// What a finished tool call says, as the `(id, content)` pair the suspended
+/// `turn` handler gets back from its `agent.await_tools` yield.
+///
+/// The loop does *not* put the result in the conversation: the handler does,
+/// from this same pair, through `agent.api.history_append` — which archives it as
+/// it appends. What leaves the loop is the content alone.
+fn tool_result(outcome: ToolOutcome) -> (String, String) {
     let ToolOutcome { id, result, .. } = outcome;
     let content = match result {
         Ok((_body, content)) => content,
         Err(msg) => json!({"error": msg}).to_string(),
     };
-    history.push(json!({
-        "role": "tool",
-        "tool_call_id": id,
-        "content": content,
-    }));
-    if let Some(s) = round_sink {
-        archive_panels(app.drain_panel_ops(s), panel_log);
-    }
     (id, content)
 }
 
-/// Collect drained panel ops as log records, in the order they were applied.
+/// Archive the panel ops a round has drawn, as they drain.
 ///
-/// Buffering rather than writing is deliberate: the ops belong in the log
-/// *between* the model's words and the tool-call request that produced them, and
-/// the two are written by different code at different moments. [`save_history`]
-/// splices the buffer in at that point; see [`PANEL_INSERT_NOTE`].
-fn archive_panels(ops: Vec<agent::panels::PanelOp>, into: &mut Vec<serde_json::Value>) {
-    into.extend(ops.iter().map(agent::panels::panel_record));
-}
-
-/// Why the panel records are spliced rather than appended, in one place.
+/// Straight to the log, with no buffer and no splice position: a panel is
+/// written where it happens, and the messages around it are written where
+/// *they* happen — the handler appends the round's text and calls before it hands
+/// the round over, and the results when they come back. So the log order is the
+/// transcript's own order: the words, then the panels, then the results.
 ///
-/// Live, a tool round reads: the model speaks, the tool's panel appears, and the
-/// request that started it sits with the round that drew it. In the log the two
-/// messages around the panel are written by `save_history` and the panel is
-/// written here, and the panel drains *before* that frame's `save_history` — so
-/// appending would put every panel before the words that introduced it, and a
-/// resumed session would open with a wall of tool output and then the requests
-/// that caused it.
+/// The splice that used to place panels *before* the request that started them
+/// existed because Rust buffered panels and messages separately and drained both
+/// at the end of a frame; nothing buffers now.
 ///
-/// The index is recorded where the request is written (`push_assistant_turn`
-/// pushes text then calls, so the calls message is last) and the records are
-/// spliced in as `save_history` writes the slice that contains it. `None` until a
-/// round has recorded one, which is also the honest "no panel belongs to a
-/// position yet".
-type PanelInsertAt = Option<usize>;
-
-/// Buffer one streamed reasoning chunk for the log, and say whether it was worth
-/// buffering at all.
-///
-/// Returns false for an empty delta, which is the same test the stream applies
-/// before drawing: an all-empty reasoning stream must leave neither a block on
-/// screen nor records in the log. The two halves are one function so they cannot
-/// disagree — a chunk drawn but not archived is a resumed session missing its
-/// thinking, which is the bug this exists to fix.
-fn archive_reasoning(chunk: &str, into: &mut Vec<Value>) -> bool {
-    if chunk.is_empty() {
-        return false;
+/// A failure to write is reported and dropped: the panels are on screen, and the
+/// transcript is rebuilt from reasoning records and assistant messages either
+/// way, so an I/O error must not take the loop down with it.
+fn archive_panel_ops(ops: Vec<agent::panels::PanelOp>) {
+    if ops.is_empty() {
+        return;
     }
-    into.push(agent::panels::reasoning_record(chunk));
-    true
-}
-
-/// The log batch for one frame, in the order the transcript had it.
-///
-/// **Reasoning first.** It streamed before any of these messages — the model
-/// thinks, then answers — and it never entered the conversation history, so
-/// there is nothing to interleave it *with*; putting it at the front of the batch
-/// puts it before the answer, which is where it was. The user's own message is
-/// already on disk by then: it is pushed and saved before the request goes out,
-/// so the front of this batch is the turn's own messages.
-///
-/// Then the messages, with the round's drawings spliced in among them.
-///
-/// Pure, so the shape of the log is testable without writing one.
-fn archive_batch(
-    slice: &[Value],
-    saved_upto: usize,
-    at: PanelInsertAt,
-    panels: &[Value],
-    reasoning: &[Value],
-) -> Vec<Value> {
-    let mut out = Vec::with_capacity(slice.len() + panels.len() + reasoning.len());
-    out.extend_from_slice(reasoning);
-    out.extend(splice_panel_records(slice, saved_upto, at, panels));
-    out
-}
-
-/// Splice `records` into the log so they land immediately before `history[at]`
-/// — `at` being the index of the assistant message that carried the tool calls.
-///
-/// Returns the messages to write in order, with the records between the two
-/// halves. Pure, so the ordering is testable without a log.
-fn splice_panel_records(
-    slice: &[serde_json::Value],
-    saved_upto: usize,
-    at: PanelInsertAt,
-    records: &[serde_json::Value],
-) -> Vec<serde_json::Value> {
-    let mut out = Vec::with_capacity(slice.len() + records.len());
-    let cut = at
-        .filter(|&i| i >= saved_upto && i <= saved_upto + slice.len())
-        .map(|i| i - saved_upto);
-    match cut {
-        Some(i) => {
-            out.extend_from_slice(&slice[..i]);
-            out.extend_from_slice(records);
-            out.extend_from_slice(&slice[i..]);
-        }
-        // No place to splice — and **append, never drop**. The common case is a
-        // streamed tool: its chunks arrive over several frames, long after the
-        // round that started it was archived, so the recorded position is already
-        // behind the watermark. Dropping them is what left every `bash` panel
-        // bare on resume — the `Create` made it into the same frame as the
-        // request, and everything the command then printed was thrown away.
-        //
-        // Appending is safe, and not merely a consolation prize: panel ops are
-        // addressed by *id*, not by position, so replay applies an `Append` to
-        // the panel its `Create` opened wherever it sits in the log. Only the op
-        // that materialises a box cares about position, and that is the one this
-        // splice exists for.
-        None => {
-            out.extend_from_slice(slice);
-            out.extend_from_slice(records);
-        }
+    let records: Vec<serde_json::Value> = ops.iter().map(agent::panels::panel_record).collect();
+    if let Err(e) = agent::lua::memory_append_many(&records) {
+        eprintln!("[agent] save to disk failed (panels): {e}");
     }
-    out
 }
 
-/// A question the tool is waiting on, as the loop holds it: the wording to show
-/// and whether `[a]lways` is one of the answers.
 struct PendingQuestion {
     text: String,
-    /// What the third answer is called, if there is one — `panels::Remember`,
-    /// drawn by the panel and consulted here only for whether it is present.
     remember: agent::panels::Remember,
 }
 
@@ -925,19 +690,6 @@ fn tool_defs(vm: &mlua::Lua) -> Result<Vec<agent::api::ToolDef>> {
     ))
 }
 
-/// What the loop knows about grammars it has been asked for.
-///
-/// Its own type because the rules are the interesting part and the loop body is a
-/// poor place to find them: the loop is six hundred lines, and the failure this
-/// exists to prevent — a fetch that reported nothing leaving the queue wedged for
-/// the session — is invisible there and obvious here.
-///
-/// Two rules, both of which cost something to learn:
-/// * a language is fetched at most once per session, so a registry that is down or
-///   a fence naming a language nobody published costs one attempt rather than one
-///   per frame until the session ends;
-/// * a fetch is only started when the previous one has reported back, *including
-///   when it failed*. Forgetting the second half is a silent, session-long wedge.
 #[derive(Default)]
 struct GrammarQueue {
     pending: VecDeque<String>,
@@ -979,19 +731,8 @@ impl GrammarQueue {
     }
 }
 
-/// How a background grammar acquisition ended.
-///
-/// The distinction is not cosmetic: the loop's "one fetch at a time" flag is only
-/// cleared by receiving one of these, so a task that failed *silently* would leave
-/// the flag set and every later grammar queued behind it would never be fetched —
-/// one unknown fence language permanently disabling highlighting for the session.
-/// A failure therefore has to travel the same path as a success.
 enum GrammarOutcome {
-    /// The worker wrote it to the cache. The loop can now `ensure` it, which is a
-    /// `dlopen` and nothing else.
     Ready(String),
-    /// It could not be obtained. `why` is for the status line; the language stays
-    /// un-inlined, which is the degradation it already had.
     Failed(String, String),
 }
 
@@ -1012,47 +753,18 @@ fn may_run(name: &str, offered: &std::collections::HashSet<String>) -> Result<()
     }
 }
 
-/// The names the current request offered the model: the gate a tool call has to
-/// pass before it runs (see `start_next_tool`). Read off the chat, which holds
-/// the tool list this turn was sent with.
-fn offered_tools(chat: &Chat) -> std::collections::HashSet<String> {
-    chat.tools()
-        .iter()
-        .map(|t| t.function.name.clone())
-        .collect()
-}
-
-/// Re-derive the advertised tool list from the live registry before a request
-/// and swap the chat only when the set actually changed (reindexing every
-/// request is what keeps a config edit immediate; the swap is the minimal step
-/// that surfaces the change to the frozen [`Chat`], which fixes its tools at
-/// connect time).
-fn refresh_chat_tools(
-    chat: &mut Chat,
-    config: &agent::api::ChatConfig,
-    vm: &mlua::Lua,
-) -> Result<()> {
-    let tools = tool_defs(vm)?;
-    if serde_json::to_string(&tools)? != serde_json::to_string(chat.tools())? {
-        *chat = Chat::connect(config, tools);
-    }
-    Ok(())
-}
-
-/// The request's messages: the user's system prompt (read fresh from the
-/// config VM, so `/reload` picks up an edit) as the leading message, then the
-/// conversation. An empty prompt contributes nothing, leaving the history as
-/// it stands.
-fn request_history(vm: &mlua::Lua, history: &[Value]) -> Vec<Value> {
-    let mut messages = Vec::with_capacity(history.len() + 1);
-    if let Some(prompt) = agent::lua::system_prompt(vm)
-        .ok()
-        .filter(|p| !p.trim().is_empty())
-    {
-        messages.push(json!({"role": "system", "content": prompt}));
-    }
-    messages.extend_from_slice(history);
-    messages
+/// Re-derive the advertised tool list from the live registry, at the start of
+/// every turn.
+///
+/// This is the dispatch gate (`may_run`): a call the model invented — or one the
+/// registry no longer offers after a `/reload` — never runs. Reindexing per turn
+/// is what keeps a config edit immediate, and it is why the loop needs no cached
+/// copy of anything `agent.mcps` says.
+fn refresh_offered(vm: &mlua::Lua) -> Result<std::collections::HashSet<String>> {
+    Ok(tool_defs(vm)?
+        .into_iter()
+        .map(|t| t.function.name)
+        .collect())
 }
 
 /// Start the `turn_completed` event after a full user turn: hands the
@@ -1069,12 +781,12 @@ fn request_history(vm: &mlua::Lua, history: &[Value]) -> Vec<Value> {
 /// `agent.trigger(...)` command arrives back here through the trigger channel.
 fn start_turn_completed<'a>(
     vm: &'a mlua::Lua,
-    history: &[Value],
     event: &mut Option<agent::lua::EventRun<'a>>,
     event_rx: &mut Option<mpsc::UnboundedReceiver<()>>,
 ) {
-    let payload = json!({ "history": history });
-    match agent::lua::EventRun::start(vm, "turn_completed", &payload) {
+    // No payload: the conversation is `agent.history`, which a handler reads
+    // directly. There is nothing to hand it that it cannot already see.
+    match agent::lua::EventRun::start(vm, "turn_completed", &json!({})) {
         Ok(Some((run, step))) => match step {
             // The handler suspended on a timer (pump cadence, a sleep, ...):
             // keep the coroutine alive and arm the reactor timer; the loop
@@ -1112,63 +824,71 @@ fn start_event_timer(ms: u64) -> mpsc::UnboundedReceiver<()> {
     rx
 }
 
-/// Start one request of the main conversation as a Lua `turn` event: the
-/// handler (`agent.on_event("turn", …)` — `agent.main_turn` in the shipped
-/// tree) drives `agent.turn` on `history`, drawing the stream into the
-/// transcript as it goes, and hands the assembled turn back as its return
-/// value. Returns `true` when a handler took the turn; `false` when none is
-/// registered — events are opt-in, and the built-in stream is the default
-/// that stands.
+/// Start a turn as a Lua `turn` event: the handler (`agent.on_event("turn", …)`
+/// — `agent.main_turn` in the shipped tree) runs the whole turn on
+/// `agent.history`, drawing each request's stream into the transcript as it
+/// arrives and appending every message to the conversation and to the log.
 ///
-/// Same cooperative-coroutine shape as `turn_completed` (the handler suspends
-/// on `agent.on_timeout` waits while the loop keeps rendering), but its own
-/// pair of slots: a suspended `turn_completed` handler may legitimately span
-/// into the turn that follows it, and one slot would have each clobber the
-/// other.
-#[allow(clippy::too_many_arguments)]
+/// `text` is the user's line, or `None` for a turn nobody asked for — an
+/// `agent.trigger()` with no argument. The handler records it as a user message;
+/// the loop's part was echoing it to the transcript, which has already happened
+/// by the time this fires.
+///
+/// There is no built-in fallback: the loop no longer knows how to hold a
+/// conversation, so a turn with no handler registered is reported and dropped.
+/// The shipped tree registers one (`lua/lib/main_turn.lua`), and a config that
+/// replaces it with nothing is told so in as many words.
+///
+/// Same cooperative-coroutine shape as `turn_completed` (the handler suspends on
+/// `agent.on_timeout` waits while the loop keeps rendering), but its own pair of
+/// slots: a suspended `turn_completed` handler may legitimately span into the
+/// turn that follows it, and one slot would have each clobber the other.
 fn start_lua_turn<'a>(
     vm: &'a mlua::Lua,
-    history: &[Value],
+    text: Option<&str>,
     app: &mut App,
     turn_event: &mut Option<agent::lua::EventRun<'a>>,
     turn_sink: &mut Option<agent::panels::PanelSink>,
     pending_turn_step: &mut Option<agent::lua::EventStep>,
     next_panel_id: u64,
-) -> bool {
-    let payload = json!({ "history": history });
-    // The sink goes on before the first resume: the handler can draw before
-    // its first wait (a fast server, a large first chunk), and an op emitted
-    // with no sink to catch it goes nowhere.
+) {
+    let payload = json!({ "text": text });
+    // The sink goes on before the first resume: the handler can draw before its
+    // first wait (a fast server, a large first chunk), and an op emitted with no
+    // sink to catch it goes nowhere.
     let sink = agent::panels::PanelSink::continuing_from(next_panel_id);
     if let Err(e) = agent::lua::install_sink(vm, &sink) {
         app.push_boxed(Role::Assistant, format!("panel sink: {e}"), "error".into());
-        // The turn is consumed either way — report rather than fall through
-        // into a second, built-in request answering the same message.
-        return true;
+        return;
     }
     match agent::lua::EventRun::start(vm, "turn", &payload) {
         Ok(Some((run, step))) => {
             *turn_sink = Some(sink);
-            // The bar is the only place that says a request is live — the
-            // first chunk can take a while, with the last frame still up.
+            // The bar is the only place that says a request is live — the first
+            // chunk can take a while, with the last frame still up.
             app.set_status_text("streaming...", StatusKind::Info);
             *turn_event = Some(run);
-            // The first step is handled where every later step is — at the top
-            // of the next pass — so a handler that suspends on its tools
-            // *immediately* (a replay, a canned round) starts the same round a
-            // streamed answer would.
+            // The first step is handled where every later step is — at the top of
+            // the next pass — so a handler that suspends on its tools *immediately*
+            // (a replay, a canned round) starts the same round a streamed answer
+            // would.
             *pending_turn_step = Some(step);
         }
         Ok(None) => {
             let _ = agent::lua::clear_sink(vm);
-            return false;
+            app.push_boxed(
+                Role::Assistant,
+                "no `turn` event handler: nothing can run a turn — see \
+                 lua/lib/main_turn.lua (agent.main_turn is the shipped one)"
+                    .into(),
+                "error".into(),
+            );
         }
         Err(e) => {
             let _ = agent::lua::clear_sink(vm);
             app.push_boxed(Role::Assistant, format!("turn failed: {e}"), "error".into());
         }
     }
-    true
 }
 
 /// Take down the Lua turn's drawing state: the sink comes off the VM (a panel
@@ -1206,183 +926,92 @@ fn note_turn_meta(vm: &mlua::Lua, app: &mut App, turn: &agent::api::Turn) {
     }
 }
 
-/// Fold a tool-wanting turn into the conversation and start its round: what
-/// the model said, then what it asked for (in that order — the protocol's,
-/// see `push_assistant_turn`), then the queued calls driven one by one on the
-/// config VM. Both drivers land here — the built-in stream's `end_of_turn`
-/// and a `turn` handler's `agent.await_tools` yield.
 #[allow(clippy::too_many_arguments)]
-fn begin_tool_round<'a>(
+fn begin_tool_calls<'a>(
     vm: &'a mlua::Lua,
-    chat: &mut Chat,
-    history: &mut Vec<Value>,
     turn: &agent::api::Turn,
+    offered: &std::collections::HashSet<String>,
     tool_queue: &mut VecDeque<(String, String, String)>,
     tool_flight: &mut Option<ToolFlight<'a>>,
     pending_outcome: &mut Option<ToolOutcome>,
     round_sink: &mut Option<agent::panels::PanelSink>,
     next_panel_id: &mut u64,
-    panel_at: &mut PanelInsertAt,
 ) -> Result<()> {
-    push_assistant_turn(history, turn, true);
-    // The round's panels will be spliced in immediately before the request
-    // that started them, which `push_assistant_turn` has just written last
-    // (text, then calls). Recording it here — rather than assuming a
-    // position when the ops drain — is what makes the placement follow the
-    // transcript instead of the archive schedule.
-    *panel_at = Some(history.len() - 1);
-    // Queue the round's calls and start the first one. A tool is a
-    // coroutine on the config VM that the loop steps (see
-    // `start_next_tool`), so it only runs between frames; panel ops from
-    // policy Lua and the bash stream panel buffer in the round's shared
-    // sink, drained every frame while the tools run.
     *tool_queue = turn
         .tool_calls
         .iter()
         .map(|c| (c.id.clone(), c.name.clone(), c.arguments.clone()))
         .collect();
     // `continuing_from`, not a fresh sink: a panel id is scoped to the
-    // transcript's id→message map, which outlives the round, so a counter
-    // that restarted here would hand round two's first panel an id round
-    // one had already used — and it would be appended to *that* panel,
-    // putting a write's content and its dialog in the read box above it.
+    // transcript's id→message map, which outlives the round, so a counter that
+    // restarted here would hand round two's first panel an id round one had
+    // already used — and it would be appended to *that* panel, putting a write's
+    // content and its dialog in the read box above it.
     *round_sink = Some(agent::panels::PanelSink::continuing_from(*next_panel_id));
-    // A call that never started (refused by the dispatch gate, or not in
-    // the registry) lands in `pending_outcome` and takes the same finish
-    // path a completed call does.
-    let (started, refused) =
-        start_next_tool(vm, tool_queue, round_sink.as_ref(), offered_tools(chat))
-            .map_err(anyhow::Error::msg)?;
+    // A call that never started (refused by the dispatch gate, or not in the
+    // registry) lands in `pending_outcome` and takes the same finish path a
+    // completed call does.
+    let (started, refused) = start_next_tool(vm, tool_queue, round_sink.as_ref(), offered.clone())
+        .map_err(anyhow::Error::msg)?;
     *tool_flight = started;
     *pending_outcome = refused;
     Ok(())
 }
 
-/// The end of a turn, however it was driven: record what it cost, fold what
-/// the model said into the conversation, and either queue the tool round it
-/// asked for or close the user turn out (`turn_completed`). Both drivers land
-/// here — the built-in stream (`Tick::Turn(None)`) and a Lua `turn` handler's
-/// assembled return — so the protocol's ordering lives exactly once.
-#[allow(clippy::too_many_arguments)]
-fn end_of_turn<'a>(
-    app: &mut App,
-    vm: &'a mlua::Lua,
-    chat: &mut Chat,
-    history: &mut Vec<Value>,
-    turn: &agent::api::Turn,
-    stop_turn: &mut bool,
-    tool_queue: &mut VecDeque<(String, String, String)>,
-    tool_flight: &mut Option<ToolFlight<'a>>,
-    pending_outcome: &mut Option<ToolOutcome>,
-    round_sink: &mut Option<agent::panels::PanelSink>,
-    next_panel_id: &mut u64,
-    panel_at: &mut PanelInsertAt,
-    event: &mut Option<agent::lua::EventRun<'a>>,
-    event_rx: &mut Option<mpsc::UnboundedReceiver<()>>,
-) -> Result<()> {
-    note_turn_meta(vm, app, turn);
-
-    // A turn *continues* into another tool round while the model still wants
-    // tools and the user has not stopped it. There is no round cap: a turn
-    // runs as long as the model keeps asking, and `stop_turn` (set by
-    // `Ctrl+c`) is what ends it.
-    //
-    // A stopped turn leaves the model's calls *unanswered* on purpose. It
-    // records them with `answering: false`, so it claims nothing it will not
-    // answer — an assistant message asking for calls whose results never come
-    // is exactly what a server rejects (`incomplete_parallel_tool_calls`, see
-    // `push_assistant_turn`).
-    let continuing = continues(turn.wants_tools(), *stop_turn);
-    if continuing {
-        begin_tool_round(
-            vm,
-            chat,
-            history,
-            turn,
-            tool_queue,
-            tool_flight,
-            pending_outcome,
-            round_sink,
-            next_panel_id,
-            panel_at,
-        )?;
-    } else {
-        // What the model said, folded with no calls answered — the stopped
-        // and the plain-answer cases both record the text and nothing more.
-        push_assistant_turn(history, turn, false);
-        if turn.wants_tools() {
-            // The user stopped the turn while the model still wanted tools: say
-            // so, rather than leaving the turn to end with no explanation on
-            // screen.
-            app.push(
-                Role::Assistant,
-                "stopped: you interrupted this turn.".to_string(),
-            );
-            app.set_status_text("turn stopped", StatusKind::Warn);
-        }
-    }
-    if !continuing {
-        // The user turn is over: start `turn_completed` so a Lua handler can
-        // inspect the conversation (and compact it — see `agent::lua`'s
-        // config section). It runs as a coroutine on this thread, suspended
-        // by its `agent.on_timeout` waits rather than blocking the loop.
-        start_turn_completed(vm, history, event, event_rx);
-    }
-    Ok(())
-}
-
-/// The moving parts of a Lua-driven turn, bundled so the three places the
-/// handler's coroutine is advanced — its first step after `start_lua_turn`,
-/// its reactor timer tick, and the end of the tool round it suspended on —
-/// run one body of code ([`drive_lua_turn`]).
-struct LuaTurnDrive<'a, 'lua> {
+struct TurnDrive<'a, 'lua> {
     vm: &'lua mlua::Lua,
     app: &'a mut App,
-    chat: &'a mut Chat,
-    history: &'a mut Vec<Value>,
+    offered: &'a std::collections::HashSet<String>,
     stop_turn: &'a mut bool,
     tool_queue: &'a mut VecDeque<(String, String, String)>,
     tool_flight: &'a mut Option<ToolFlight<'lua>>,
     pending_outcome: &'a mut Option<ToolOutcome>,
     round_sink: &'a mut Option<agent::panels::PanelSink>,
     next_panel_id: &'a mut u64,
-    panel_at: &'a mut PanelInsertAt,
     event: &'a mut Option<agent::lua::EventRun<'lua>>,
     event_rx: &'a mut Option<mpsc::UnboundedReceiver<()>>,
-    reasoning_log: &'a mut Vec<Value>,
     turn_event: &'a mut Option<agent::lua::EventRun<'lua>>,
     turn_event_rx: &'a mut Option<mpsc::UnboundedReceiver<()>>,
     turn_sink: &'a mut Option<agent::panels::PanelSink>,
-    lua_round: &'a mut Option<Vec<(String, String)>>,
+    round_results: &'a mut Option<Vec<(String, String)>>,
 }
 
 /// Report a turn that failed before it produced anything to fold, and take
 /// its drawing state down — the same close the normal return path runs, with
 /// nothing to show for the request but the message.
-fn fail_lua_turn(d: &mut LuaTurnDrive, msg: String) {
+fn fail_turn<'a, 'lua: 'a>(d: &mut TurnDrive<'a, 'lua>, msg: String) {
     *d.turn_event = None;
     *d.turn_event_rx = None;
     teardown_turn_sink(d.vm, d.app, d.turn_sink, d.next_panel_id);
     d.app.clear_status();
     d.app.push_boxed(Role::Assistant, msg, "error".into());
+    close_turn(d);
 }
 
-/// Advance the Lua-driven turn by one handler step, looping while the
-/// handler's own answer immediately produces the next step (a malformed
-/// yield's report, a stopped round's resume). Returns when the handler is
-/// parked — on a timer, or on the tool round now in flight — or finished.
+/// The user turn is over: fire `turn_completed` so a Lua handler can inspect the
+/// conversation and compact it (see `lua/init.lua` §7). Every path that ends a
+/// turn comes through here — a returned answer, a stopped round, a failure — so
+/// it fires exactly once whatever the turn ended as.
+fn close_turn<'a, 'lua: 'a>(d: &mut TurnDrive<'a, 'lua>) {
+    start_turn_completed(d.vm, d.event, d.event_rx);
+}
+
+/// Advance the Lua-driven turn by one handler step, looping while the handler's
+/// own answer immediately produces the next step (a malformed yield's report, a
+/// stopped round's resume). Returns when the handler is parked — on a timer, or
+/// on the tool round now in flight — or finished.
 ///
 /// This is the *whole* contract between the loop and the `turn` handler:
 ///
 /// - `Waiting` — arm the reactor timer; the tick resumes the pump.
-/// - `Tools` — the request's answer wanted tools: fold the turn, queue the
-///   round, and park the handler until the last outcome lands. The handler
-///   and the tool coroutines never run nested — the loop alternates them,
-///   which is the re-entrancy answer for a tool loop written in Lua.
-/// - `Returned` — the assembled final turn (or the stopped sentinel) closes
-///   the user turn out.
-fn drive_lua_turn(
-    d: &mut LuaTurnDrive,
+/// - `Tools` — the answer wanted tools: note what the round cost, run it, and
+///   park the handler until the last outcome lands. Handler and tool coroutines
+///   never run nested — the loop alternates them, which is the re-entrancy
+///   answer for a tool loop written in Lua.
+/// - `Returned` — the assembled final turn (or the stopped sentinel) closes the
+///   user turn out.
+fn drive_lua_turn<'a, 'lua: 'a>(
+    d: &mut TurnDrive<'a, 'lua>,
     mut step: Option<Result<agent::lua::EventStep, String>>,
 ) -> Result<()> {
     loop {
@@ -1403,42 +1032,41 @@ fn drive_lua_turn(
                 // only ever see a live timer. The round's own machinery —
                 // pulses, keys, the outcome fold — wakes the loop from here.
                 *d.turn_event_rx = None;
-                let (turn, reasoning) = match agent::lua::turn_from_lua(mlua::Value::Table(table)) {
+                let (turn, _reasoning) = match agent::lua::turn_from_lua(mlua::Value::Table(table))
+                {
                     Ok(pair) => pair,
                     Err(e) => {
-                        fail_lua_turn(d, format!("turn failed: {e}"));
+                        fail_turn(d, format!("turn failed: {e}"));
                         return Ok(());
                     }
                 };
-                // The round's meta lands where the round is: each folded turn
-                // cost something, and each round's thinking goes to the log.
-                archive_reasoning(&reasoning, d.reasoning_log);
+                // What the round cost, and `agent.llm.usage` showing the request
+                // that just finished — which is what the compaction policy reads to
+                // know the conversation is near the window's edge. Reasoning is not
+                // recorded here: the handler is the code that received it, and it
+                // archived it.
                 note_turn_meta(d.vm, d.app, &turn);
                 if *d.stop_turn {
-                    // Stopped before the round began: fold the text, leave the
-                    // calls unanswered (the built-in path's stopped
-                    // semantics), and tell the handler — it ends the turn by
-                    // returning the same sentinel back.
-                    push_assistant_turn(d.history, &turn, false);
+                    // Stopped before the round began: tell the handler, and it ends
+                    // the turn by returning the sentinel back. Nothing is answered —
+                    // the calls were never run.
                     let reply = agent::lua::stopped_reply(d.vm).map_err(anyhow::Error::msg)?;
                     step = d.turn_event.as_mut().map(|run| run.resume_value(reply));
                     continue;
                 }
-                *d.lua_round = Some(Vec::new());
-                begin_tool_round(
+                *d.round_results = Some(Vec::new());
+                begin_tool_calls(
                     d.vm,
-                    d.chat,
-                    d.history,
                     &turn,
+                    d.offered,
                     d.tool_queue,
                     d.tool_flight,
                     d.pending_outcome,
                     d.round_sink,
                     d.next_panel_id,
-                    d.panel_at,
                 )?;
-                // The handler parks until the round's last outcome folds —
-                // the resume comes from the loop's tool-finish path.
+                // The handler parks until the round's last outcome lands — the
+                // resume comes from the loop's tool-finish path.
                 return Ok(());
             }
             Some(Ok(agent::lua::EventStep::Returned)) => {
@@ -1449,44 +1077,22 @@ fn drive_lua_turn(
                 d.app.clear_status();
                 match returned.map(agent::lua::turn_reply_from_lua) {
                     Some(Ok(agent::lua::TurnReply::Stopped)) => {
-                        // The round ran and was interrupted; everything is
-                        // folded already. What remains is to say so and close
-                        // the user turn out.
+                        // The round ran and was interrupted; the handler closed the
+                        // turn out by returning the sentinel. Say so and end it.
                         d.app.push(
                             Role::Assistant,
                             "stopped: you interrupted this turn.".to_string(),
                         );
                         d.app.set_status_text("turn stopped", StatusKind::Warn);
-                        start_turn_completed(d.vm, d.history, d.event, d.event_rx);
                     }
-                    Some(Ok(agent::lua::TurnReply::Turn(turn, reasoning))) => {
-                        // Reasoning streamed live into its block; the
-                        // full text comes back with the turn so the log
-                        // keeps the thinking, not just the conclusions.
-                        archive_reasoning(&reasoning, d.reasoning_log);
-                        end_of_turn(
-                            d.app,
-                            d.vm,
-                            d.chat,
-                            d.history,
-                            &turn,
-                            d.stop_turn,
-                            d.tool_queue,
-                            d.tool_flight,
-                            d.pending_outcome,
-                            d.round_sink,
-                            d.next_panel_id,
-                            d.panel_at,
-                            d.event,
-                            d.event_rx,
-                        )?;
+                    Some(Ok(agent::lua::TurnReply::Turn(turn, _reasoning))) => {
+                        // What the turn cost and how fast it answered. The handler
+                        // has already appended it to the conversation and the log.
+                        note_turn_meta(d.vm, d.app, &turn);
                     }
-                    Some(Err(e)) => {
-                        d.app.push_boxed(Role::Assistant, e, "error".into());
-                    }
-                    // A handler that answered nil drove nothing: say
-                    // so, because a turn that silently did not happen
-                    // looks like a lost message.
+                    Some(Err(e)) => d.app.push_boxed(Role::Assistant, e, "error".into()),
+                    // A handler that answered nil drove nothing: say so, because a
+                    // turn that silently did not happen looks like a lost message.
                     None => d.app.push_boxed(
                         Role::Assistant,
                         "turn failed: the `turn` handler returned nothing \
@@ -1496,10 +1102,11 @@ fn drive_lua_turn(
                         "error".into(),
                     ),
                 }
+                close_turn(d);
                 return Ok(());
             }
             Some(Err(e)) => {
-                fail_lua_turn(d, format!("turn failed: {e}"));
+                fail_turn(d, format!("turn failed: {e}"));
                 return Ok(());
             }
             None => {
@@ -1507,61 +1114,6 @@ fn drive_lua_turn(
                 return Ok(());
             }
         }
-    }
-}
-
-/// Archive newly-landed history messages to the conversation log (the
-/// save-to-disk side). A watermark tracks how far the log has seen: every
-/// message is appended exactly once, in order — the log is an append-only raw
-/// transcript, so compaction that *replaces* the history with a shorter one
-/// just clamps the watermark down to the new end (messages already logged stay
-/// logged; the compacted summary is never re-archived). `turn_over` (no stream
-/// or tool in flight) triggers the group-commit flush so each finished turn is
-/// durably on disk. No log open (disabled, or a failed open) → no-op.
-fn save_history(
-    history: &[Value],
-    saved_upto: &mut usize,
-    turn_over: bool,
-    panel_records: &mut Vec<Value>,
-    panel_at: PanelInsertAt,
-    reasoning: &mut Vec<Value>,
-) {
-    if !agent::lua::memory_is_bound() {
-        return;
-    }
-    // Compaction shrank the history below the watermark: don't point past the
-    // end, and don't re-archive what the log already has.
-    *saved_upto = (*saved_upto).min(history.len());
-    if *saved_upto < history.len() {
-        // Reasoning first, then the round's drawings among the messages: see
-        // `archive_batch`.
-        let batch = archive_batch(
-            &history[*saved_upto..],
-            *saved_upto,
-            panel_at,
-            panel_records,
-            reasoning,
-        );
-        match agent::lua::memory_append_many(&batch) {
-            Ok(_) => {
-                *saved_upto = history.len();
-                // Written, so not to be spliced again on the next frame — the
-                // log has them, and a repeat would duplicate every panel.
-                panel_records.clear();
-                reasoning.clear();
-            }
-            // A persistent I/O error must not stall the loop: advance past the
-            // failing block (it would only fail again next frame) and report.
-            Err(e) => {
-                eprintln!("[agent] save to disk failed: {e}");
-                *saved_upto = history.len();
-                panel_records.clear();
-                reasoning.clear();
-            }
-        }
-    }
-    if turn_over && let Err(e) = agent::lua::memory_flush() {
-        eprintln!("[agent] save to disk failed (flush): {e}");
     }
 }
 
@@ -1700,15 +1252,8 @@ fn replay_records(path: &std::path::Path, blocks: usize) -> Replayed {
     }
 }
 
-/// The archived records a cold start resumes from, and where in the log they end.
-///
-/// The cursor travels with the records because the two have to come from the same
-/// read: it is a byte offset into a log that is still being appended to, so only the
-/// read that found the window knows where that window's oldest block began.
 struct Replayed {
-    /// The window, oldest → newest.
     records: Vec<Value>,
-    /// Offset the first block older than the window is read from.
     cursor: u64,
 }
 
@@ -1854,32 +1399,20 @@ fn elided_line(who: &str, bytes: usize) -> String {
     format!("[used {who}; {value:.1} {unit} of output not replayed]")
 }
 
-/// The agent loop: multiplex crossterm events with the LLM turn stream, keep
-/// conversation history, and drive the tool-call round-trip through `tools`.
-/// The extra parameters (config, vm, initial history) are all loop state that
-/// does not merit a struct yet.
 #[allow(clippy::too_many_arguments)]
 async fn run<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     rx: &mut mpsc::UnboundedReceiver<CrosstermEvent>,
     lua_rx: &mut mpsc::UnboundedReceiver<agent::lua::AgentCommand>,
     app: &mut App,
-    chat: &mut Chat,
-    config: &agent::api::ChatConfig,
     vm: &mlua::Lua,
     catalog: &mut Catalog,
-    initial_history: Vec<Value>,
     pager: &mut paging::Pager,
 ) -> Result<()> {
-    // The starting conversation: whatever earlier sessions archived and this
-    // startup replayed (see `main`), else empty.
-    let mut history = initial_history;
-    // How much of `history` the conversation log has already seen (save-to-disk
-    // watermark; see `save_history`). The replayed prefix already lives in the
-    // log, so the watermark starts past it: only *new* messages get archived.
-    let mut saved_upto: usize = history.len();
-    let mut stream: Option<agent::api::TurnStream> = None;
-    let mut builder = TurnBuilder::new();
+    // What the model was offered this turn: the dispatch gate every call that
+    // comes back has to pass (`may_run`), read fresh from Lua at the start of
+    // each turn so a `/reload` is effective immediately.
+    let mut offered: std::collections::HashSet<String> = refresh_offered(vm)?;
     // Tool-round state: queued calls (id, name, arguments) still waiting to
     // run, the in-flight call's completion channel, the same call's
     // permission-ask channel (both live while a tool runs), the round's
@@ -1893,29 +1426,32 @@ async fn run<W: Write>(
     // for it (handed to the coroutine on the next step).
     let mut pending_question: Option<PendingQuestion> = None;
     let mut pending_verdict: Option<mlua::Value> = None;
-    // A call that finished (or never started) and is waiting to be folded into
-    // the conversation at the top of the next iteration.
+    // A call that finished (or never started) and is waiting to be answered —
+    // handed to the parked `turn` handler — at the top of the next iteration.
     let mut pending_outcome: Option<ToolOutcome> = None;
     // The user asked to stop the *turn*, not just the tool it was watching.
-    // There is no round cap any more (see `stop_turn`), so this is the only
-    // thing standing between a model that keeps asking for tools and a session
-    // that never ends: cleared at every new user turn, and checked wherever a
-    // turn would otherwise chain into another round.
+    // There is no round cap any more, so this is the only thing standing between
+    // a model that keeps asking for tools and a session that never ends: cleared
+    // at every new user turn, and checked wherever a turn would otherwise chain
+    // into another round.
+    //
+    // Killing the tool alone is deliberately not enough: that only answers the
+    // run, and a model that ignores an `interrupted` result asks again with
+    // nothing left to stop it but `Ctrl+d`. There used to be a cap
+    // (`MAX_TOOL_ROUNDS`, 8) and it was the wrong shape of limit — a count says
+    // nothing about how long the work is, so it truncated real tasks (a diff to
+    // read, an edit to verify, a build to run) at a number chosen without knowing
+    // any of that, and stopped with the model's calls unanswered. Time or round
+    // counts both misprice "enough"; the user watching the turn is the one who
+    // knows.
     let mut stop_turn = false;
-    // Panel ops drained this round, and where they belong in the log. The buffer
-    // is spliced in by `save_history`; see `splice_panel_records`.
-    let mut panel_records: Vec<Value> = Vec::new();
-    let mut panel_at: PanelInsertAt = None;
-    // Streamed reasoning, buffered the same way. It never entered the
-    // conversation history, so without this a resumed session shows the
-    // conclusions and none of the thinking that reached them.
-    let mut reasoning_log: Vec<Value> = Vec::new();
-    // The pager is armed by the caller, against the same window this history came
-    // from; see `paging::Pager::resume_after`.
+    // A tool round's panel sink, and the highest panel id handed out so far: an
+    // id has to outlive its sink (see `PanelSink::continuing_from`), which is why
+    // the round's sink continues the turn's numbering rather than restarting it.
     let mut round_sink: Option<agent::panels::PanelSink> = None;
-    // The highest panel id handed out so far, carried across tool rounds: see
-    // `PanelSink::continuing_from` for why an id has to outlive its sink.
-    let mut next_panel_id: u64 = 0;
+    let mut next_panel_id: u64 = 1;
+    // The pager is armed by the caller, against the same window the replayed
+    // transcript came from; see `paging::Pager::resume_after`.
     // Grammars the transcript has asked for, and the ones already asked for.
     // A fetch is seconds of network and `cc`, so it cannot run here — it runs in
     // a task and writes to the cache, and the loop picks the result up by polling
@@ -1947,11 +1483,10 @@ async fn run<W: Write>(
     // The handler's first step, queued by `start_lua_turn` and driven at the
     // top of the next pass so every step runs one code path.
     let mut pending_turn_step: Option<agent::lua::EventStep> = None;
-    // The tool round a suspended `turn` handler is waiting on: the folded
-    // `(id, content)` results to resume it with, collected as each call
-    // lands. `Some` for the whole round — the handler's coroutine is parked
-    // in `turn_event` for the duration.
-    let mut lua_round: Option<Vec<(String, String)>> = None;
+    // The tool round a suspended `turn` handler is waiting on: the results to
+    // resume it with, collected as each call lands. `Some` for the whole round —
+    // the handler's coroutine is parked in `turn_event` for the duration.
+    let mut round_results: Option<Vec<(String, String)>> = None;
 
     // Draw once before the loop: without it the (bare) alternate screen is
     // blank until the first event arrives, so the app looks dead on startup.
@@ -1974,56 +1509,51 @@ async fn run<W: Write>(
         // The `turn` handler's first step, queued by `start_lua_turn` on the
         // previous pass: driven here so every step — first, timer-ticked, and
         // round-resumed — runs the one `drive_lua_turn` path.
+        // The `turn` handler's first step, queued by `start_lua_turn` on the
+        // previous pass: driven here so every step — first, timer-ticked, and
+        // round-resumed — runs the one `drive_lua_turn` path.
         if let Some(first) = pending_turn_step.take() {
-            let mut d = LuaTurnDrive {
+            let mut d = TurnDrive {
                 vm,
                 app,
-                chat,
-                history: &mut history,
+                offered: &offered,
                 stop_turn: &mut stop_turn,
                 tool_queue: &mut tool_queue,
                 tool_flight: &mut tool_flight,
                 pending_outcome: &mut pending_outcome,
                 round_sink: &mut round_sink,
                 next_panel_id: &mut next_panel_id,
-                panel_at: &mut panel_at,
                 event: &mut event,
                 event_rx: &mut event_rx,
-                reasoning_log: &mut reasoning_log,
                 turn_event: &mut turn_event,
                 turn_event_rx: &mut turn_event_rx,
                 turn_sink: &mut turn_sink,
-                lua_round: &mut lua_round,
+                round_results: &mut round_results,
             };
             drive_lua_turn(&mut d, Some(Ok(first)))?;
         }
 
         if let Some(outcome) = pending_outcome.take() {
-            // The call is over: no question can be outstanding, and the VM's
-            // panel sink goes with it, so a panel opened outside a round reaches
-            // no panel at all — as it did when every call had a VM of its own.
+            // The call is over: no question can be outstanding, and the VM's panel
+            // sink goes with it, so a panel opened outside a round reaches no panel
+            // at all — as it did when every call had a VM of its own.
             pending_question = None;
             let _ = agent::lua::clear_sink(vm);
-            let (id, content) = fold_tool_outcome(
-                app,
-                &mut history,
-                outcome,
-                round_sink.as_ref(),
-                &mut panel_records,
-            );
-            if let Some(results) = &mut lua_round {
-                // A suspended `turn` handler collects every folded result; the
-                // resume hands it exactly what the loop's history grew by.
+            // What the call said, and whatever it drew on the way — archived here,
+            // in the order both happened.
+            let (id, content) = tool_result(outcome);
+            if let Some(s) = round_sink.as_ref() {
+                archive_panel_ops(app.drain_panel_ops(s));
+            }
+            if let Some(results) = &mut round_results {
+                // A suspended `turn` handler collects every result; the resume hands
+                // it exactly what the call said, and it appends them itself.
                 results.push((id, content));
             }
             if !tool_queue.is_empty() {
-                let (started, refused) = start_next_tool(
-                    vm,
-                    &mut tool_queue,
-                    round_sink.as_ref(),
-                    offered_tools(chat),
-                )
-                .map_err(anyhow::Error::msg)?;
+                let (started, refused) =
+                    start_next_tool(vm, &mut tool_queue, round_sink.as_ref(), offered.clone())
+                        .map_err(anyhow::Error::msg)?;
                 tool_flight = started;
                 pending_outcome = refused;
                 continue;
@@ -2033,78 +1563,51 @@ async fn run<W: Write>(
             // numbering. Carried here, where the sink is still in hand.
             next_panel_id = round_sink.as_ref().map_or(next_panel_id, |s| s.next_id());
             round_sink = None;
-            // The continuation is another request: re-index the registry again so
-            // the tools stay current even between rounds of one turn.
-            if let Err(e) = refresh_chat_tools(chat, config, vm) {
-                app.push_boxed(
-                    Role::Assistant,
-                    format!("tools refresh failed: {e:#}"),
-                    "error".into(),
-                );
+            let Some(results) = round_results.take() else {
+                // A round only ever starts from a `turn` handler's await, so a round
+                // finishing with none parked is a bug in the loop rather than a case:
+                // say so instead of dropping the results in silence.
+                eprintln!("[agent] tool round finished with no turn handler waiting");
                 continue;
+            };
+            // The round belonged to a suspended `turn` handler: resume it with the
+            // results, and *it* decides the next request. The turn sink goes back on
+            // first — re-created at the carried panel counter, so a panel the handler
+            // opens next never reuses an id the round handed out.
+            let sink = agent::panels::PanelSink::continuing_from(next_panel_id);
+            if let Err(e) = agent::lua::install_sink(vm, &sink) {
+                eprintln!("[agent] turn sink reinstall: {e}");
             }
-            if let Some(results) = lua_round.take() {
-                // This round belonged to a suspended `turn` handler: resume it
-                // with the results, and *it* decides the next request. The turn
-                // sink goes back on first — re-created at the carried counter,
-                // so a panel the handler opens next never reuses an id the round
-                // handed out.
-                let sink = agent::panels::PanelSink::continuing_from(next_panel_id);
-                if let Err(e) = agent::lua::install_sink(vm, &sink) {
-                    eprintln!("[agent] turn sink reinstall: {e}");
+            turn_sink = Some(sink);
+            let reply = match agent::lua::round_results_reply(vm, &results, stop_turn) {
+                Ok(reply) => reply,
+                Err(e) => {
+                    eprintln!("[agent] round results reply: {e}");
+                    continue;
                 }
-                turn_sink = Some(sink);
-                let reply = match agent::lua::round_results_reply(vm, &results, stop_turn) {
-                    Ok(reply) => reply,
-                    Err(e) => {
-                        eprintln!("[agent] round results reply: {e}");
-                        continue;
-                    }
-                };
-                let step = turn_event.as_mut().map(|run| run.resume_value(reply));
-                let mut d = LuaTurnDrive {
-                    vm,
-                    app,
-                    chat,
-                    history: &mut history,
-                    stop_turn: &mut stop_turn,
-                    tool_queue: &mut tool_queue,
-                    tool_flight: &mut tool_flight,
-                    pending_outcome: &mut pending_outcome,
-                    round_sink: &mut round_sink,
-                    next_panel_id: &mut next_panel_id,
-                    panel_at: &mut panel_at,
-                    event: &mut event,
-                    event_rx: &mut event_rx,
-                    reasoning_log: &mut reasoning_log,
-                    turn_event: &mut turn_event,
-                    turn_event_rx: &mut turn_event_rx,
-                    turn_sink: &mut turn_sink,
-                    lua_round: &mut lua_round,
-                };
-                drive_lua_turn(&mut d, step)?;
-            } else if !start_lua_turn(
+            };
+            let step = turn_event.as_mut().map(|run| run.resume_value(reply));
+            let mut d = TurnDrive {
                 vm,
-                &history,
                 app,
-                &mut turn_event,
-                &mut turn_sink,
-                &mut pending_turn_step,
-                next_panel_id,
-            ) {
-                match chat.stream_turn(&request_history(vm, &history)).await {
-                    Ok(s) => stream = Some(s),
-                    Err(e) => {
-                        app.push_boxed(
-                            Role::Assistant,
-                            format!("request failed: {e:#}"),
-                            "error".into(),
-                        );
-                    }
-                }
-            }
+                offered: &offered,
+                stop_turn: &mut stop_turn,
+                tool_queue: &mut tool_queue,
+                tool_flight: &mut tool_flight,
+                pending_outcome: &mut pending_outcome,
+                round_sink: &mut round_sink,
+                next_panel_id: &mut next_panel_id,
+                event: &mut event,
+                event_rx: &mut event_rx,
+                turn_event: &mut turn_event,
+                turn_event_rx: &mut turn_event_rx,
+                turn_sink: &mut turn_sink,
+                round_results: &mut round_results,
+            };
+            drive_lua_turn(&mut d, step)?;
             continue;
         }
+
         if let Some(flight) = tool_flight.as_mut() {
             let (outcome, question) = match advance_tool(flight, pending_verdict.take()) {
                 Ok(pair) => pair,
@@ -2132,7 +1635,7 @@ async fn run<W: Write>(
             }
         }
 
-        let busy = stream.is_some() || tool_flight.is_some() || turn_event.is_some();
+        let busy = tool_flight.is_some() || turn_event.is_some();
         let tick = if busy {
             if tool_flight.is_some() {
                 // A tool is executing: also wake on a short pulse so the loop
@@ -2141,7 +1644,6 @@ async fn run<W: Write>(
                 // gives a suspended sandbox run its next step.
                 tokio::select! {
                     ev = rx.recv() => ev.map(Tick::Key),
-                    tev = next_turn_event(&mut stream) => Some(Tick::Turn(tev)),
                     cmd = lua_rx.recv() => cmd.map(Tick::Lua),
                     _eev = next_event(&mut event_rx) => Some(Tick::Event(())),
                     _tev = next_event(&mut turn_event_rx) => Some(Tick::LuaTurn),
@@ -2150,7 +1652,6 @@ async fn run<W: Write>(
             } else {
                 tokio::select! {
                     ev = rx.recv() => ev.map(Tick::Key),
-                    tev = next_turn_event(&mut stream) => Some(Tick::Turn(tev)),
                     cmd = lua_rx.recv() => cmd.map(Tick::Lua),
                     _eev = next_event(&mut event_rx) => Some(Tick::Event(())),
                     _tev = next_event(&mut turn_event_rx) => Some(Tick::LuaTurn),
@@ -2321,7 +1822,9 @@ async fn run<W: Write>(
                                 ),
                                 Ok(loaded) => match tool_defs(vm) {
                                     Ok(tools) => {
-                                        *chat = Chat::connect(config, tools.clone());
+                                        // The gate reads the registry per turn, so
+                                        // reloading needs no Rust-side refresh — only
+                                        // the notice that says what changed.
                                         let names: Vec<&str> = tools
                                             .iter()
                                             .map(|t| t.function.name.as_str())
@@ -2354,36 +1857,27 @@ async fn run<W: Write>(
                                 },
                             }
                         } else {
-                            history.push(json!({"role": "user", "content": text}));
                             stop_turn = false;
-                            // Reindex `agent.mcps` for this request (never
-                            // cached) so the registry is already current in
-                            // the tools offered to the model.
-                            if let Err(e) = refresh_chat_tools(chat, config, vm) {
-                                app.push_boxed(
+                            // Reindex the dispatch gate for this turn (never cached
+                            // across one, so a `/reload` is effective immediately).
+                            match refresh_offered(vm) {
+                                Ok(names) => {
+                                    offered = names;
+                                    start_lua_turn(
+                                        vm,
+                                        Some(&text),
+                                        app,
+                                        &mut turn_event,
+                                        &mut turn_sink,
+                                        &mut pending_turn_step,
+                                        next_panel_id,
+                                    );
+                                }
+                                Err(e) => app.push_boxed(
                                     Role::Assistant,
                                     format!("tools refresh failed: {e:#}"),
                                     "error".into(),
-                                );
-                            } else if !start_lua_turn(
-                                vm,
-                                &history,
-                                app,
-                                &mut turn_event,
-                                &mut turn_sink,
-                                &mut pending_turn_step,
-                                next_panel_id,
-                            ) {
-                                match chat.stream_turn(&request_history(vm, &history)).await {
-                                    Ok(s) => stream = Some(s),
-                                    Err(e) => {
-                                        app.push_boxed(
-                                            Role::Assistant,
-                                            format!("request failed: {e:#}"),
-                                            "error".into(),
-                                        );
-                                    }
-                                }
+                                ),
                             }
                         }
                     }
@@ -2450,56 +1944,38 @@ async fn run<W: Write>(
                 // reach it through. It falls through to the redraw below like
                 // every other tick, which is what makes the change visible.
                 agent::lua::AgentCommand::Input(op) => app.apply_input_op(op),
-                // A Lua handler forced a new inference (agent.trigger): it may
-                // have replaced the in-memory history (a compacted history
-                // handed back — the write side of compaction) and/or supplied
-                // a user message. Only the idle select polls the channel, so
-                // the loop is between turns here.
-                agent::lua::AgentCommand::RunTurn {
-                    history: replacement,
-                    user,
-                } => {
-                    if let Some(replacement) = replacement {
-                        let n = replacement.len();
-                        history = replacement;
-                        app.push_boxed(
-                            Role::Assistant,
-                            format!("history replaced by Lua ({n} messages); continuing."),
-                            "config".into(),
-                        );
-                    }
+                // A Lua handler forced a new inference (`agent.trigger`),
+                // optionally with a user line. There is no replacement history
+                // here: the conversation is `agent.history`, so a compaction has
+                // already assigned it and the turn reads it as it stands. Only
+                // the idle select polls the channel, so the loop is between
+                // turns here.
+                agent::lua::AgentCommand::RunTurn { user } => {
                     if let Some(text) = user {
-                        // Mirror a normal submission: `App::send` also records the
-                        // user line in the transcript.
-                        app.push(Role::User, text.clone());
-                        history.push(json!({"role": "user", "content": text}));
+                        // Mirror a normal submission: the transcript records the
+                        // line too, and the `turn` handler appends it to the
+                        // conversation.
+                        app.push(Role::User, text);
                     }
                     stop_turn = false;
-                    if let Err(e) = refresh_chat_tools(chat, config, vm) {
-                        app.push_boxed(
+                    match refresh_offered(vm) {
+                        Ok(names) => {
+                            offered = names;
+                            start_lua_turn(
+                                vm,
+                                None,
+                                app,
+                                &mut turn_event,
+                                &mut turn_sink,
+                                &mut pending_turn_step,
+                                next_panel_id,
+                            );
+                        }
+                        Err(e) => app.push_boxed(
                             Role::Assistant,
                             format!("tools refresh failed: {e:#}"),
                             "error".into(),
-                        );
-                    } else if !start_lua_turn(
-                        vm,
-                        &history,
-                        app,
-                        &mut turn_event,
-                        &mut turn_sink,
-                        &mut pending_turn_step,
-                        next_panel_id,
-                    ) {
-                        match chat.stream_turn(&request_history(vm, &history)).await {
-                            Ok(s) => stream = Some(s),
-                            Err(e) => {
-                                app.push_boxed(
-                                    Role::Assistant,
-                                    format!("request failed: {e:#}"),
-                                    "error".into(),
-                                );
-                            }
-                        }
+                        ),
                     }
                 }
             },
@@ -2533,95 +2009,28 @@ async fn run<W: Write>(
                 }
             }
 
-            Tick::Turn(Some(Err(e))) => {
-                stream = None;
-                builder = TurnBuilder::new();
-                app.clear_status();
-                app.push_boxed(
-                    Role::Assistant,
-                    format!("turn failed: {e:#}"),
-                    "error".into(),
-                );
-            }
-            Tick::Turn(Some(Ok(ev))) => {
-                // The turn is live. The bar is the only place that says so —
-                // a streamed answer can take a while to say anything, and the
-                // request's own latency is spent *before* this first event,
-                // with the last frame still up.
-                app.set_status_text_if_changed("streaming...", StatusKind::Info);
-                match &ev {
-                    TurnEvent::Reasoning(d) => {
-                        // Streamed live into its own borderless "reasoning"
-                        // block (never enters conversation history); the
-                        // reasoning text renders dimmed, darker than the
-                        // answer. Empty deltas are skipped so an all-empty
-                        // reasoning stream never draws an empty block.
-                        if archive_reasoning(d, &mut reasoning_log) {
-                            app.stream_append_boxed(d, "reasoning".into());
-                        }
-                    }
-                    TurnEvent::Content(d) => {
-                        // The answer streams into its own "response" block;
-                        // the seamless title switch breaks the reasoning block.
-                        app.stream_append_boxed(d, "response".into());
-                    }
-                    TurnEvent::ToolCallDelta(_) | TurnEvent::Usage(_) | TurnEvent::Timings(_) => {}
-                }
-                builder.apply(ev);
-            }
-            Tick::Turn(None) => {
-                // Turn over: surface everything, then run the tool round.
-                // Reasoning and answer content were already streamed live into
-                // their "reasoning"/"response" blocks; nothing to flush.
-                stream = None;
-                // "streaming..." described a turn that has now ended, and a
-                // tool round is not streaming — so the bar goes empty rather
-                // than stale. Anything a tool reports sets it again.
-                app.clear_status();
-                let turn = builder.finish();
-                end_of_turn(
-                    app,
-                    vm,
-                    chat,
-                    &mut history,
-                    &turn,
-                    &mut stop_turn,
-                    &mut tool_queue,
-                    &mut tool_flight,
-                    &mut pending_outcome,
-                    &mut round_sink,
-                    &mut next_panel_id,
-                    &mut panel_at,
-                    &mut event,
-                    &mut event_rx,
-                )?;
-                builder = TurnBuilder::new();
-            }
             Tick::LuaTurn => {
                 // The reactor's timer fired for the Lua-driven turn: resume the
                 // handler where it yielded. It polls its request's queue
                 // between `agent.on_timeout` waits, and those waits are what
                 // the timers pace — so this arm *is* the stream pump.
                 let step = turn_event.as_mut().map(|run| run.step());
-                let mut d = LuaTurnDrive {
+                let mut d = TurnDrive {
                     vm,
                     app,
-                    chat,
-                    history: &mut history,
+                    offered: &offered,
                     stop_turn: &mut stop_turn,
                     tool_queue: &mut tool_queue,
                     tool_flight: &mut tool_flight,
                     pending_outcome: &mut pending_outcome,
                     round_sink: &mut round_sink,
                     next_panel_id: &mut next_panel_id,
-                    panel_at: &mut panel_at,
                     event: &mut event,
                     event_rx: &mut event_rx,
-                    reasoning_log: &mut reasoning_log,
                     turn_event: &mut turn_event,
                     turn_event_rx: &mut turn_event_rx,
                     turn_sink: &mut turn_sink,
-                    lua_round: &mut lua_round,
+                    round_results: &mut round_results,
                 };
                 drive_lua_turn(&mut d, step)?;
             }
@@ -2632,7 +2041,7 @@ async fn run<W: Write>(
         // running bash command appends its stdout chunks to the round's sink
         // as the loop steps it, so the box fills live.
         if let Some(s) = &round_sink {
-            archive_panels(app.drain_panel_ops(s), &mut panel_records);
+            archive_panel_ops(app.drain_panel_ops(s));
         }
         // The Lua turn handler's drawing, drained the same way — but not
         // archived: resume reconstructs those blocks from the reasoning
@@ -2707,21 +2116,21 @@ async fn run<W: Write>(
             }
         }
 
-        // Archive this iteration's new history messages (watermark-backed, so
-        // each message is logged exactly once). Flush when the turn is fully
-        // over — no stream and no tool in flight — so every finished turn is
-        // durably on disk (group commit; `/save` flushes early).
-        save_history(
-            &history,
-            &mut saved_upto,
-            stream.is_none()
-                && tool_flight.is_none()
-                && pending_outcome.is_none()
-                && turn_event.is_none(),
-            &mut panel_records,
-            panel_at,
-            &mut reasoning_log,
-        );
+        // Seal the log when the turn is fully over — no tool in flight, no handler
+        // running — so every finished turn is durably on disk (group commit;
+        // `/save` flushes early).
+        //
+        // The *contents* are not the loop's business any more: the handler
+        // appends each message as it produces it (`agent.api.history_append`,
+        // which archives as it appends), and a round's panels were archived as
+        // they drained. All this decides is when buffered bytes reach the file.
+        if tool_flight.is_none()
+            && pending_outcome.is_none()
+            && turn_event.is_none()
+            && let Err(e) = agent::lua::memory_flush()
+        {
+            eprintln!("[agent] save to disk failed (flush): {e}");
+        }
 
         terminal.autoresize()?;
         terminal.draw(|frame| app.render(frame))?;
@@ -2741,33 +2150,12 @@ mod tests {
     use super::*;
     use agent::testutil::unique_path;
 
-    /// The transcript as a user would see it: the whole panel drawn into a
-    /// buffer and read back as text. Assertions about "is it on screen" have to be
-    /// made against the drawn cells — a message being *in* `messages` says nothing
-    /// about whether it is collapsed out of view.
-    fn panel_screen(panel: &mut agent::tui::TurnPanel, w: u16, h: u16) -> String {
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
-        terminal
-            .draw(|frame| panel.render(frame, ratatui::layout::Rect::new(0, 0, w, h)))
-            .expect("draw");
-        let buf = terminal.backend().buffer();
-        (0..h)
-            .map(|y| {
-                (0..w)
-                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     /// The whole app as a user would see it.
     ///
-    /// Unlike [`panel_screen`] this goes through [`App::render`], which is what
-    /// gives the transcript the area it measures and wraps at — so a test that
-    /// needs the app to know its own width has to read it this way. Asserting
-    /// through `panel_screen` alone would leave `panel_area` unset and every
+    /// This goes through [`App::render`], which is what gives the transcript the
+    /// area it measures and wraps at — so a test that needs the app to know its
+    /// own width has to read it this way; drawing the bare panel would leave
+    /// `panel_area` unset and every
     /// width-dependent path untested.
     fn app_screen(app: &mut App, w: u16, h: u16) -> String {
         let mut terminal =
@@ -2784,9 +2172,6 @@ mod tests {
             .join("\n")
     }
 
-    /// The `key` event end to end, from a `KeyEvent` to the action the loop will
-    /// perform: the spec the table matches on, the parsing, and the two ways it
-    /// can come back empty.
     #[test]
     fn a_lua_binding_table_turns_a_key_press_into_an_action() {
         let vm = agent::lua::new_vm().expect("VM");
@@ -2864,8 +2249,6 @@ mod tests {
     /// a user is most likely to want to move, which is the opposite of what a
     /// configurable key is for.
     ///
-    /// `Ctrl+d` is the example because the override is *observable* there: bound
-    /// to `conceal` it does something visibly different from the default `quit`.
     #[test]
     fn a_lua_binding_replaces_the_rust_default_for_that_key() {
         let vm = agent::lua::new_vm().expect("VM");
@@ -2904,10 +2287,6 @@ mod tests {
 
     /// The input primitives report honestly when nothing is listening.
     ///
-    /// `false`, not a silent success: a binding whose edit went nowhere would look
-    /// like a key that does nothing, which is the one failure a keybinding feature
-    /// must not have. Same contract as `agent.trigger`, and for the same reason —
-    /// headless runs and the probe have no loop to drain the command.
     #[test]
     fn the_input_primitives_report_false_with_no_loop_attached() {
         let vm = agent::lua::new_vm().expect("VM");
@@ -2927,58 +2306,6 @@ mod tests {
         unique_path(&format!("agent-mem-{name}"))
     }
 
-    #[test]
-    fn replay_history_parses_the_newest_blocks_chronologically() {
-        let path = unique_log("replay");
-        let messages = [
-            r#"{"role":"user","content":"m0"}"#,
-            r#"{"role":"assistant","content":"a0"}"#,
-            r#"{"role":"user","content":"m1"}"#,
-            r#"{"role":"assistant","content":"a1"}"#,
-            r#"{"role":"user","content":"m2"}"#,
-        ];
-        {
-            // Fresh log, five small messages, sealed one block per two messages so
-            // that "the newest two blocks" and "the newest two messages" are different
-            // answers. At the default block target this log is a single block and the
-            // window would be all of it, which would make the boundary untestable.
-            let mut mem = agent::memory::Memory::with_options(
-                &path,
-                agent::memory::Options {
-                    block_target: 64,
-                    working_set: 1,
-                },
-            )
-            .unwrap();
-            for m in &messages {
-                mem.append(m).unwrap();
-            }
-            mem.flush().unwrap();
-        }
-        let all = replayed_request_history(&cold_start(&path, 100).records);
-        assert_eq!(
-            all.len(),
-            5,
-            "the whole log, when the window is wide enough"
-        );
-        // How many messages land in a block is `block_target`'s business, not this
-        // test's, so the window is checked as what it is: a chronological *suffix* of
-        // the log, and shorter than the log when it is asked to be.
-        let replayed = replayed_request_history(&cold_start(&path, 1).records);
-        assert!(
-            !replayed.is_empty() && replayed.len() < all.len(),
-            "one block is some of the log: {} of {}",
-            replayed.len(),
-            all.len()
-        );
-        assert_eq!(
-            &all[all.len() - replayed.len()..],
-            &replayed[..],
-            "the newest block, oldest-to-newest — a suffix, and in order"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
     /// A replayed tool result becomes a one-line record of the call.
     ///
     /// Four things are pinned, and the last two are the ones that would be easy
@@ -2990,11 +2317,6 @@ mod tests {
     /// request invalid rather than merely terse.
     /// Panel records round-trip through the log and come back as a panel.
     ///
-    /// The whole feature in one test: build what a tool round draws, archive it
-    /// the way the loop does, read it back the way a cold start does, and render
-    /// it. If any link in that chain is wrong the panel does not come back, and
-    /// the failure is a silently absent panel rather than a visible one — which
-    /// is exactly what it was before this existed.
     #[test]
     fn a_panel_is_archived_and_replayed_as_a_panel() {
         // What `apply_patch` emits, in order.
@@ -3049,120 +2371,6 @@ mod tests {
         assert_eq!(decoded, ops, "the drawing survives the round trip");
     }
 
-    /// Panel records are *not* conversation: they must never be sent to the model.
-    #[test]
-    fn panel_records_are_kept_out_of_the_request() {
-        let panel = agent::panels::panel_record(&agent::panels::PanelOp::Split {
-            id: 1,
-            title: "apply_patch".into(),
-            panes: vec![agent::panels::PaneInit {
-                caption: "after".into(),
-                lang: None,
-            }],
-        });
-        let records = vec![
-            json!({"role": "user", "content": "do the thing"}),
-            panel,
-            json!({"role": "assistant", "content": "done"}),
-        ];
-        let sent = replayed_request_history(&records);
-        assert!(
-            sent.iter().all(|m| m.get("role").is_some()),
-            "everything sent has a role: {sent:?}"
-        );
-        assert_eq!(sent.len(), 2, "the panel is gone: {sent:?}");
-    }
-
-    /// The splice: a round's drawings go in *between* the model's words and the
-    /// request that produced them, which is where they sit live.
-    #[test]
-    fn the_drawing_is_spliced_in_before_the_request_that_produced_it() {
-        let panel = agent::panels::panel_record(&agent::panels::PanelOp::Create {
-            id: 1,
-            title: "bash".into(),
-            boxed: true,
-            conceal_box: false,
-        });
-        // history: [user, assistant text, assistant calls, tool result]
-        let slice = vec![
-            json!({"role": "user", "content": "u"}),
-            json!({"role": "assistant", "content": "on it"}),
-            json!({"role": "assistant", "tool_calls": [{"id": "c1"}]}),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "{}"}),
-        ];
-        // `push_assistant_turn` pushes text then calls, so the calls message is
-        // last so far: index 2.
-        let out = splice_panel_records(&slice, 0, Some(2), std::slice::from_ref(&panel));
-        let kinds: Vec<&str> = out
-            .iter()
-            .map(|r| {
-                if agent::panels::is_panel_record(r) {
-                    "panel"
-                } else {
-                    r["role"].as_str().unwrap_or("?")
-                }
-            })
-            .collect();
-        assert_eq!(
-            kinds,
-            ["user", "assistant", "panel", "assistant", "tool"],
-            "the panel sits between the words and the request: {out:?}"
-        );
-    }
-
-    /// A stale or absent position must not misplace a panel: it is dropped, and
-    /// the messages still go out in order.
-    #[test]
-    fn a_position_outside_the_slice_appends_the_panel_rather_than_dropping_it() {
-        let panel = agent::panels::panel_record(&agent::panels::PanelOp::Create {
-            id: 1,
-            title: "bash".into(),
-            boxed: true,
-            conceal_box: false,
-        });
-        let slice = vec![json!({"role": "user", "content": "u"})];
-        // `None` (no round has claimed a position) and a position past the end
-        // (compaction shortened the history) cannot be spliced — so the records go
-        // after the slice rather than being dropped. A streamed tool's chunks take
-        // this path every time: they arrive long after the round that set the
-        // position was itself written.
-        for at in [None, Some(2), Some(99)] {
-            let out = splice_panel_records(&slice, 0, at, std::slice::from_ref(&panel));
-            assert_eq!(
-                out.len(),
-                2,
-                "the record is kept, not dropped, at {at:?}: {out:?}"
-            );
-            assert!(
-                agent::panels::is_panel_record(&out[1]),
-                "appended after the messages at {at:?}: {out:?}"
-            );
-        }
-        // Behind the watermark is the case that actually bit: the round that set
-        // the position has already been written.
-        let out = splice_panel_records(&slice, 5, Some(2), std::slice::from_ref(&panel));
-        assert!(
-            agent::panels::is_panel_record(&out[1]),
-            "a stale position still keeps the drawing: {out:?}"
-        );
-        // The ends of the slice are *inside* it, and both are legal positions.
-        let first = splice_panel_records(&slice, 0, Some(0), std::slice::from_ref(&panel));
-        assert!(
-            agent::panels::is_panel_record(&first[0]),
-            "before the first message is a real place: {first:?}"
-        );
-        // A position inside the slice is honoured.
-        let slice = vec![
-            json!({"role": "user", "content": "u"}),
-            json!({"role": "x"}),
-        ];
-        let out = splice_panel_records(&slice, 0, Some(1), std::slice::from_ref(&panel));
-        assert!(
-            agent::panels::is_panel_record(&out[1]),
-            "spliced at 1: {out:?}"
-        );
-    }
-
     /// The whole chain against a real log *file*, written the way the loop
     /// actually writes it: frame by frame, through [`splice_panel_records`].
     ///
@@ -3171,181 +2379,6 @@ mod tests {
     /// tool's chunks arrive over the frames after, when that request is already
     /// on disk and the recorded position is behind the watermark. Writing the log
     /// directly would skip exactly the step that lost every `bash` panel.
-    ///
-    /// Uses [`agent::memory::Memory`] rather than the Lua bridge, which binds a
-    /// process-global (`OnceLock`) another test already claims — a second bind
-    /// would be a flaky test rather than a real one.
-    #[test]
-    fn a_panel_survives_a_real_log_file_and_comes_back_on_a_cold_start() {
-        let path = unique_path("panel-archive");
-        let _ = std::fs::remove_file(&path);
-
-        let rec = agent::panels::panel_record;
-        let patch_panel = [
-            agent::panels::PanelOp::Split {
-                id: 1,
-                title: "apply_patch: /tmp/x.lua".into(),
-                panes: vec![
-                    agent::panels::PaneInit {
-                        caption: "before".into(),
-                        lang: Some("lua".into()),
-                    },
-                    agent::panels::PaneInit {
-                        caption: "after".into(),
-                        lang: Some("lua".into()),
-                    },
-                ],
-            },
-            agent::panels::PanelOp::SetPane {
-                id: 1,
-                pane: 1,
-                text: "\t\tlocal a = 1\n".into(),
-            },
-            agent::panels::PanelOp::SetPane {
-                id: 1,
-                pane: 2,
-                text: "        local a = 2\n".into(),
-            },
-        ]
-        .iter()
-        .map(rec)
-        .collect::<Vec<_>>();
-        let stream_create = rec(&agent::panels::PanelOp::Create {
-            id: 9,
-            title: "ls -F".into(),
-            boxed: true,
-            conceal_box: false,
-        });
-        let chunks = ["README.md\n", "lua/\n"]
-            .iter()
-            .map(|c| {
-                rec(&agent::panels::PanelOp::Append {
-                    id: 9,
-                    text: (*c).into(),
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let user = json!({"role": "user", "content": "add the python entry"});
-        let preamble = json!({"role": "assistant", "content": "on it"});
-        let calls = json!({
-            "role": "assistant",
-            "tool_calls": [{"id": "c1", "type": "function",
-                            "function": {"name": "fs.apply_patch", "arguments": "{}"}}],
-        });
-        let result = json!({"role": "tool", "tool_call_id": "c1", "content": "{\"ok\":true}"});
-
-        // --- the frames, as `run` would drive them ---
-        let mut written: Vec<serde_json::Value> = Vec::new();
-        let mut saved_upto = 0usize;
-
-        // Frame A: the model's words and its request are new, and both tools'
-        // opening ops drain in this same frame — so they splice in beside the
-        // request, where they belong.
-        let mut opening = patch_panel;
-        opening.push(stream_create);
-        let frame_a = vec![user.clone(), preamble.clone(), calls.clone()];
-        written.extend(splice_panel_records(
-            &frame_a,
-            saved_upto,
-            Some(2),
-            &opening,
-        ));
-        saved_upto = frame_a.len();
-
-        // Frames B…: the command streams its output. No new messages, so nothing
-        // is written and the chunks pile up in the buffer.
-        //
-        // Frame C: the result lands, so the batch goes out — and the recorded
-        // position is now *behind* the watermark. That is the branch that used to
-        // drop the chunks, leaving every streamed panel bare.
-        written.extend(splice_panel_records(
-            std::slice::from_ref(&result),
-            saved_upto,
-            Some(2),
-            &chunks,
-        ));
-
-        {
-            let mut mem = agent::memory::Memory::open(&path).expect("log opens");
-            for line in &written {
-                mem.append(&serde_json::to_string(line).unwrap())
-                    .expect("append");
-            }
-            mem.flush().expect("flush");
-        }
-
-        // --- read: the transcript half puts the panels back ---
-        // Through `cold_start` — the exact call `main` makes. Reading the records
-        // and splitting them by hand here is what let the startup half go on using
-        // the messages-only path while every test below it stayed green.
-        let resumed = cold_start(&path, 20);
-        let records = resumed.records;
-        let sent = replayed_request_history(&records);
-        let mut app = App::default();
-        replay_transcript(&mut app, &records);
-
-        // Asserted through what a resumed session's user actually sees.
-        let (w, h) = (100u16, 30u16);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
-        terminal
-            .draw(|frame| {
-                app.panel
-                    .render(frame, ratatui::layout::Rect::new(0, 0, w, h))
-            })
-            .expect("draw");
-        let buf = terminal.backend().buffer();
-        let screen: String = (0..h)
-            .flat_map(|y| (0..w).map(move |x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ")))
-            .collect();
-        // A resumed box is *history*, so it comes back collapsed: the title and a
-        // `[+]` are what is on screen, and the output is behind a click. Asserting
-        // the contents here would pin the opposite of what was asked for.
-        for needle in ["apply_patch: /tmp/x.lua", "ls -F"] {
-            assert!(
-                screen.contains(needle),
-                "the collapsed panel still names itself: {needle:?}\n{screen}"
-            );
-        }
-        assert!(
-            screen.contains("[+]"),
-            "and offers itself for expansion:\n{screen}"
-        );
-        for hidden in ["local a = 1", "local a = 2", "README.md", "lua/"] {
-            assert!(
-                !screen.contains(hidden),
-                "collapsed, so {hidden:?} is behind the click, not on screen:\n{screen}"
-            );
-        }
-
-        // The drawing is still there — collapsed, not lost. Opening one back up
-        // must give the panel exactly as it was archived, which is what
-        // `a_panel_rebuilt_from_archived_ops_draws_the_same_box` pins on the
-        // rendering side.
-        assert_eq!(
-            records
-                .iter()
-                .filter(|r| agent::panels::is_panel_record(r))
-                .count(),
-            6,
-            "every op is in the log, the streamed chunks included: {records:?}"
-        );
-
-        // --- and the request half must not see any of it ---
-        assert!(
-            !sent.iter().any(agent::panels::is_panel_record),
-            "a panel is not conversation: {sent:?}"
-        );
-        assert_eq!(
-            sent.iter().filter(|m| m["role"] == "tool").count(),
-            1,
-            "and the tool result is still there, still reduced: {sent:?}"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
     /// The whole chain against a real log *file*, written the way the loop
     /// actually writes it: frame by frame, through [`splice_panel_records`].
     ///
@@ -3356,145 +2389,14 @@ mod tests {
     /// The archive step, and the rule that keeps an empty stream from leaving a mark
     /// anywhere.
     ///
-    /// Empty deltas are common and must leave neither a block on screen nor a
-    /// record in the log — and the stream and the archive are one function so they
-    /// cannot disagree, because a chunk drawn but not archived is a resumed session
-    /// missing its thinking.
-    #[test]
-    fn a_reasoning_chunk_is_buffered_unless_it_is_empty() {
-        let mut buf: Vec<serde_json::Value> = Vec::new();
-        assert!(
-            !archive_reasoning("", &mut buf),
-            "an empty delta is not worth drawing"
-        );
-        assert!(buf.is_empty(), "and leaves nothing in the log: {buf:?}");
-
-        assert!(archive_reasoning("thinking", &mut buf), "a real chunk is");
-        assert_eq!(
-            buf.len(),
-            1,
-            "and is buffered as a reasoning record: {buf:?}"
-        );
-        assert_eq!(buf[0]["kind"], "reasoning");
-        assert_eq!(buf[0]["text"], "thinking", "verbatim: {buf:?}");
-
-        // Reconstructable from the record alone — which is the point — and never
-        // part of a request.
-        assert!(is_transcript_record(&buf[0]));
-        assert!(
-            !serde_json::to_string(&replayed_request_history(std::slice::from_ref(&buf[0])))
-                .unwrap()
-                .contains("thinking"),
-            "but it never reaches the model"
-        );
-    }
-
     /// Reasoning comes back on resume, in its own block and in the right order.
     ///
-    /// Reasoning never entered the conversation history — it is "observed only"
-    /// — so with nothing archived a resumed session showed the conclusions and
-    /// none of the thinking that reached them. It is archived as its own record
-    /// kind and replayed through the same block the live stream draws.
-    #[test]
-    fn reasoning_is_archived_and_replayed_in_its_own_block() {
-        let path = unique_path("reasoning-archive");
-        let _ = std::fs::remove_file(&path);
-
-        // A turn that thinks, then answers, then calls a tool.
-        let mut lines = vec![
-            json!({"role": "user", "content": "why is it slow?"}),
-            agent::panels::reasoning_record("the stat syscall runs per keystroke.\n"),
-            agent::panels::reasoning_record("that is the whole answer.\n"),
-            json!({"role": "assistant", "content": "because it re-reads it."}),
-        ];
-        lines.push(agent::panels::panel_record(
-            &agent::panels::PanelOp::Create {
-                id: 1,
-                title: "wc -l".into(),
-                boxed: true,
-                conceal_box: false,
-            },
-        ));
-        lines.push(agent::panels::panel_record(
-            &agent::panels::PanelOp::Append {
-                id: 1,
-                text: "  42\n".into(),
-            },
-        ));
-        lines.push(json!({"role": "tool", "tool_call_id": "c1", "content": "{}"}));
-        {
-            let mut mem = agent::memory::Memory::open(&path).expect("log opens");
-            for line in &lines {
-                mem.append(&serde_json::to_string(line).unwrap())
-                    .expect("append");
-            }
-            mem.flush().expect("flush");
-        }
-
-        let resumed = cold_start(&path, 20);
-        let records = resumed.records;
-        let sent = replayed_request_history(&records);
-        let mut app = App::default();
-        replay_transcript(&mut app, &records);
-
-        // The blocks are in the order the turn had them: the question, the
-        // thinking, the answer, the tool's box.
-        let screen: String = panel_screen(&mut app.panel, 100, 40);
-        // Folded: on resume the thinking is history, and it is the longest thing in
-        // a turn. A fold that hid it *permanently* would be the opposite of
-        // reconstructing it, so the click has to bring it back — checked below.
-        assert!(
-            screen.contains("[+] reasoning"),
-            "the block is there, folded:\n{screen}"
-        );
-        assert!(
-            !screen.contains("the stat syscall runs per keystroke."),
-            "with the thinking behind the click:\n{screen}"
-        );
-        // In the order the turn had it: the question, then the fold standing for
-        // the thinking, then the answer.
-        let at = |needle: &str| {
-            screen.find(needle).unwrap_or_else(|| {
-                panic!("{needle:?} is not on screen at all:\n{screen}");
-            })
-        };
-        assert!(
-            at("why is it slow?") < at("[+] reasoning")
-                && at("[+] reasoning") < at("because it re-reads it."),
-            "the fold sits where the thinking was — before the answer:\n{screen}"
-        );
-        assert!(
-            screen.contains("because it re-reads it."),
-            "and the answer is still there:\n{screen}"
-        );
-
-        // Reasoning is drawn, not sent. It was never conversation, and archiving
-        // it must not change that.
-        assert!(
-            !sent.iter().any(is_transcript_record),
-            "neither panels nor reasoning reach the model: {sent:?}"
-        );
-        assert!(
-            !serde_json::to_string(&sent)
-                .unwrap()
-                .contains("per keystroke"),
-            "the thinking is not in the request at all; the answer's own words are, \
-             and only those: {sent:?}"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
     /// `PageUp` moves a screen, not a line.
     ///
     /// Both were bound to the one-row scroll, so every key that scrolled moved one
     /// row and going back through a transcript took one press per line — which reads
     /// as scrolling not working at all.
     ///
-    /// A screen less one row, and not a whole screen: the last row of the current view
-    /// has to stay on screen, or consecutive presses skip a line at the seam and no
-    /// scroll position ever shows both. So the step is the viewport minus one, and
-    /// that is what this pins.
     #[test]
     fn a_screen_scroll_moves_the_viewport_less_one_row() {
         let mut app = App::default();
@@ -3557,9 +2459,6 @@ mod tests {
     /// showed none. One log, two reconstructions, one lossy — and the lossy one is
     /// whichever the reader had to scroll to reach.
     ///
-    /// Reasoning belongs in the one ordered list of a turn's records, so it is placed
-    /// where the turn had it rather than appended after it: a block that moved reads as
-    /// though the model thought *after* answering.
     #[test]
     fn reasoning_behind_the_reload_point_is_reconstructed_when_paged_in() {
         let path = unique_log("paging-reasoning");
@@ -3653,8 +2552,6 @@ mod tests {
     /// per-page id ranges and neither draws. The panel silently disappears from a turn
     /// that has it.
     ///
-    /// Built by flushing between the two records, so the split is the shape under test
-    /// rather than a side effect of where a byte threshold happens to fall.
     #[test]
     fn a_panel_split_across_a_block_boundary_still_reconstructs() {
         let path = unique_log("paging-split");
@@ -3758,11 +2655,6 @@ mod tests {
     ///   older chunk's `Create` retitles the newer chunk's box and its output appends
     ///   into it — and every click on either box then opens the wrong thing.
     ///
-    /// Zero-padded numbers so none is a prefix of another (`message 1` is a substring
-    /// of `message 17`, which would make the "does not repeat" check count every
-    /// later number), and a small block target so the trim boundary lands *inside* a
-    /// block — at the 1 MiB default this log is one block, the window already covers
-    /// it, and there is correctly nothing older to page in.
     #[test]
     fn a_page_arrives_when_the_view_reaches_the_top_of_what_is_loaded() {
         let path = unique_log("paging");
@@ -3980,110 +2872,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A frame's log batch is reasoning first, then the messages, with the
     /// round's drawings among them.
     ///
-    /// The reasoning order is not cosmetic: the model thinks *before* it answers,
-    /// and a resumed transcript that put the answer above the thinking would read
-    /// backwards.
-    #[test]
-    fn a_batched_frame_logs_its_reasoning_before_its_messages() {
-        let reasoning = vec![
-            agent::panels::reasoning_record("first thought\n"),
-            agent::panels::reasoning_record("second thought\n"),
-        ];
-        let panel = agent::panels::panel_record(&agent::panels::PanelOp::Create {
-            id: 1,
-            title: "ls".into(),
-            boxed: true,
-            conceal_box: false,
-        });
-        let batch = archive_batch(
-            &[
-                json!({"role": "assistant", "content": "the answer"}),
-                json!({"role": "assistant", "tool_calls": [{"id": "c1"}]}),
-            ],
-            0,
-            Some(1),
-            std::slice::from_ref(&panel),
-            &reasoning,
-        );
-        let kinds: Vec<&str> = batch
-            .iter()
-            .map(|r| {
-                if is_transcript_record(r) {
-                    r["kind"].as_str().unwrap_or("?")
-                } else {
-                    r["role"].as_str().unwrap_or("?")
-                }
-            })
-            .collect();
-        assert_eq!(
-            kinds,
-            [
-                "reasoning",
-                "reasoning",
-                "assistant",
-                "panel_op",
-                "assistant"
-            ],
-            "thinking, then the answer, then the box beside the request: {batch:?}"
-        );
-    }
-
-    #[test]
-    fn a_replayed_tool_result_becomes_one_line_about_the_call() {
-        let bulky = "x".repeat(40_000);
-        let path = unique_log("replay-tool");
-        {
-            let mut mem = agent::memory::Memory::open(&path).unwrap();
-            for m in [
-                r#"{"role":"user","content":"read the file"}"#,
-                r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs.read","arguments":"{\"path\":\"a.rs\"}"}}]}"#,
-                &format!(r#"{{"role":"tool","tool_call_id":"call_1","content":"{bulky}"}}"#),
-            ] {
-                mem.append(m).unwrap();
-            }
-            mem.flush().unwrap();
-        }
-        let resumed = cold_start(&path, 10);
-        let request = replayed_request_history(&resumed.records);
-        let tool = request
-            .iter()
-            .find(|m| m["role"] == "tool")
-            .expect("the result is still a message");
-
-        assert_eq!(tool["role"], "tool", "still a tool message");
-        assert_eq!(tool["tool_call_id"], "call_1", "and still paired by id");
-        let content = tool["content"].as_str().expect("a string");
-        assert!(
-            content.contains("fs.read"),
-            "it names the tool, resolved from the parent: {content}"
-        );
-        assert!(
-            content.contains("not replayed"),
-            "and says the output is gone rather than pretending it was empty: {content}"
-        );
-        assert!(
-            content.len() < 120,
-            "one line, not 40 kB: {} bytes",
-            content.len()
-        );
-        // The user turn is untouched: only results are rebuilt.
-        assert_eq!(request[0]["content"], "read the file");
-        let _ = std::fs::remove_file(&path);
-    }
-
     /// A result whose parent assistant message fell outside the replay window is
     /// **dropped**, not kept and not renamed.
     ///
-    /// This is the ordinary case, not an edge: the window is the newest 20
-    /// messages, so it starts mid-turn whenever the last session ended on a tool
-    /// round. Keeping the orphan would make the first request of the session
-    /// invalid on a strict server — `tool` with no matching `tool_calls` is a 400
-    /// on OpenAI, which is the endpoint the shipped config names. Measured
-    /// llama-server accepts it (200 either way), so this only bites the default
-    /// configuration, which is the wrong place for a landmine.
     #[test]
     fn a_parentless_tool_result_is_dropped_not_repaired() {
         let out = rebuild_tool_results(vec![
@@ -4103,8 +2896,6 @@ mod tests {
     /// The window is a message *count*, so it can also start mid-round in the
     /// other direction — and must not, or a `tool` result loses its request.
     ///
-    /// One paired round in the middle proves the mapping is by id and not by
-    /// position: the rebuild must survive unrelated `tool_calls` elsewhere.
     #[test]
     fn a_result_is_matched_to_its_own_call_not_its_position() {
         let out = rebuild_tool_results(vec![
@@ -4134,9 +2925,6 @@ mod tests {
 
     /// The byte reduction, on a log that looks like a real turn.
     ///
-    /// Measured rather than asserted by eye, because "much smaller" is the whole
-    /// claim and it is worth knowing the ratio. It is also the number to watch if
-    /// the replay window is ever changed: this is what the window is spending.
     #[test]
     fn rebuilding_shrinks_a_realistic_turn_by_an_order_of_magnitude() {
         let file = "fn main() {}\n".repeat(2000); // ~30 kB, a source file
@@ -4190,14 +2978,6 @@ mod tests {
 
     /// A failed fetch must not wedge the queue.
     ///
-    /// This is a regression test, and the bug it pins was in the wiring rather
-    /// than in any logic: the task reported *successes* down the channel and
-    /// logged failures to the status line instead, while the loop's "one at a
-    /// time" flag was cleared only by receiving something. So a single fence naming
-    /// a language that could not be fetched — offline, or a name nobody published —
-    /// left the flag set and every grammar behind it unfetched for the rest of the
-    /// session. Nothing crashed and nothing was logged as an error; highlighting
-    /// just silently stopped improving.
     #[test]
     fn a_failed_fetch_still_releases_the_queue() {
         let mut q = GrammarQueue::default();
@@ -4384,10 +3164,6 @@ mod tests {
     /// fell out. That leaves the request claiming two calls and carrying one
     /// answer, which is precisely what the server rejects.
     ///
-    /// With a single call per turn — what llama.cpp emits, and what every test
-    /// here does — the window has to cut between an assistant message and its one
-    /// result for this to bite, so the suite never saw it. A model that asks for
-    /// two at once makes it ordinary.
     #[test]
     fn a_parallel_group_is_trimmed_to_the_calls_that_were_answered() {
         // The window starts at the assistant message: both calls requested, only
@@ -4419,10 +3195,6 @@ mod tests {
         );
     }
 
-    /// The other half of the same rule: an assistant message whose calls were
-    /// *all* answered outside the window has no `tool_calls` left, and must stop
-    /// claiming any. What is left is a plain assistant message — with its
-    /// content, which is what it actually said.
     #[test]
     fn an_assistant_message_with_no_answers_left_stops_claiming_calls() {
         let out = rebuild_tool_results(vec![
@@ -4449,8 +3221,6 @@ mod tests {
         );
     }
 
-    /// The ordinary case is untouched: a fully-answered group keeps every call and
-    /// every result, and the message keeps its content.
     #[test]
     fn a_fully_answered_group_is_left_exactly_as_it_was() {
         let msgs = vec![
@@ -4489,179 +3259,8 @@ mod tests {
     /// tool: …
     /// ```
     ///
-    /// An assistant message between a call and its answers is the model's next
-    /// turn arriving before the group it opened has been answered, and
-    /// HuggingFace rejects the whole request for it. With one call per turn there
-    /// is no group and the result still precedes the next request, so it is
-    /// invisible — and every test here does one call at a time, as does
-    /// llama.cpp. A model that asks for two at once hits it every turn.
-    #[test]
-    fn an_assistant_turn_records_its_text_before_its_calls() {
-        let mut turn = agent::api::TurnBuilder::new();
-        for p in [
-            r#"{"choices":[{"delta":{"content":"I'll start by reading the README."}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
-        ] {
-            for ev in agent::api::acc_sse(p) {
-                turn.apply(ev);
-            }
-        }
-        let turn = turn.finish();
-        assert!(
-            turn.wants_tools() && !turn.content.is_empty(),
-            "a turn with both"
-        );
-
-        let mut history: Vec<serde_json::Value> = Vec::new();
-        push_assistant_turn(&mut history, &turn, true);
-
-        assert_eq!(
-            history.len(),
-            2,
-            "text and calls, one message each: {history:?}"
-        );
-        assert_eq!(history[0]["role"], "assistant", "the text comes first");
-        assert_eq!(
-            history[0]["content"], "I'll start by reading the README.",
-            "and it is the text the model actually produced"
-        );
-        assert!(
-            history[0]["tool_calls"].is_null(),
-            "…with no calls attached, because the two are separate messages"
-        );
-        assert_eq!(
-            history[1]["tool_calls"].as_array().map(Vec::len),
-            Some(2),
-            "the calls follow, both of them: {history:?}"
-        );
-        assert!(
-            history[1]["content"].is_null(),
-            "and carry no text of their own"
-        );
-    }
-
-    /// A turn whose tool-round budget is spent is recorded as the text it
-    /// produced and **nothing else**. Claiming calls that will never be answered
-    /// is precisely what invalidates the next request, so the calls message is
-    /// not written at all.
-    /// A turn chains as long as the model wants tools and the user has not stopped
-    /// it. The load-bearing half is the second clause: with no round cap, a
-    /// `Ctrl+c` that only killed the running tool would leave a looping model
-    /// with nothing to stop it.
-    #[test]
-    fn a_turn_continues_only_while_the_model_wants_tools_and_the_user_has_not_stopped_it() {
-        assert!(
-            continues(true, false),
-            "a model asking for tools, nobody stopping it: another round"
-        );
-        assert!(
-            !continues(true, true),
-            "the user stopped the turn, so it does NOT chain — this is the escape \
-             hatch that replaces the round cap"
-        );
-        assert!(
-            !continues(false, false),
-            "a final answer ends the turn however long it has been running"
-        );
-        assert!(!continues(false, true), "nothing to continue either way");
-    }
-
     /// The stopped turn must leave the history *valid*, which is the subtle half.
     ///
-    /// Stopping mid-round means the model's calls never got answers. Recording
-    /// them anyway — an assistant message claiming two calls followed by one
-    /// `tool` message — is what a server rejects as
-    /// `incomplete_parallel_tool_calls`, so the next user turn would fail on a
-    /// request the user never caused. Stopping has to be silent about the calls.
-    #[test]
-    fn a_turn_stopped_before_its_calls_ran_claims_none_of_them() {
-        let mut turn = agent::api::TurnBuilder::new();
-        for p in [
-            r#"{"choices":[{"delta":{"content":"still working on it"}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"fs.read","arguments":"{}"}},{"index":1,"id":"call_b","type":"function","function":{"name":"bash.bash","arguments":"{}"}}]}}]}"#,
-        ] {
-            for ev in agent::api::acc_sse(p) {
-                turn.apply(ev);
-            }
-        }
-        let turn = turn.finish();
-        assert!(
-            turn.wants_tools() && turn.tool_calls.len() == 2,
-            "the model asked for two calls, which is what makes this interesting"
-        );
-
-        let mut history: Vec<serde_json::Value> = Vec::new();
-        // What the loop does: `continues` said no, so `answering` is false.
-        push_assistant_turn(&mut history, &turn, continues(turn.wants_tools(), true));
-        assert_eq!(
-            history.len(),
-            1,
-            "the text only — no calls message, so nothing is left unanswered: \
-             {history:?}"
-        );
-        assert_eq!(history[0]["content"], "still working on it");
-        assert!(
-            history[0]["tool_calls"].is_null(),
-            "and no calls claimed: {history:?}"
-        );
-    }
-
-    /// The converse, so the pair cannot be satisfied by never claiming anything:
-    /// an *unstopped* turn does record its calls, or every tool call would be
-    /// dropped from the transcript and the model would never see a result.
-    #[test]
-    fn an_unstopped_turn_still_records_its_calls() {
-        let mut turn = agent::api::TurnBuilder::new();
-        for ev in agent::api::acc_sse(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
-        ) {
-            turn.apply(ev);
-        }
-        let turn = turn.finish();
-
-        let mut history: Vec<serde_json::Value> = Vec::new();
-        push_assistant_turn(&mut history, &turn, continues(turn.wants_tools(), false));
-        // Index 0, not 1: this turn produced no text, so the calls message is
-        // the only one written. (The paired test above *does* carry text, which
-        // is what puts the calls message at index 1 there.)
-        assert_eq!(
-            history[0]["tool_calls"].as_array().map(Vec::len),
-            Some(1),
-            "the call is claimed and will be answered: {history:?}"
-        );
-    }
-
-    #[test]
-    fn a_turn_whose_calls_will_not_run_claims_none_of_them() {
-        let mut turn = agent::api::TurnBuilder::new();
-        // Two payloads: the text, then the call.
-        for p in [
-            r#"{"choices":[{"delta":{"content":"still working on it"}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
-        ] {
-            for ev in agent::api::acc_sse(p) {
-                turn.apply(ev);
-            }
-        }
-        let turn = turn.finish();
-        assert!(turn.wants_tools(), "the model did ask for a tool");
-
-        let mut history: Vec<serde_json::Value> = Vec::new();
-        push_assistant_turn(&mut history, &turn, false);
-        assert_eq!(
-            history.len(),
-            1,
-            "just the text — no calls claimed, because none will be answered: \\
-             {history:?}"
-        );
-        assert_eq!(history[0]["content"], "still working on it");
-    }
-
-    /// The three answers, and the rule that makes "always" conditional: `a` is
-    /// an answer only when the question offered it. Without that, a stray `a`
-    /// would be read as "yes, and remember" for a question that has nothing to
-    /// remember.
     #[test]
     fn the_ask_keys_offer_a_third_answer_only_when_the_question_had_one() {
         use agent::panels::{ALWAYS_LABEL, Remember};
@@ -4710,116 +3309,5 @@ mod tests {
                 "{code:?} is not an answer"
             );
         }
-    }
-    /// A tool call is invisible in the transcript: not its arguments, not its
-    /// result, not an error. A tool reports itself, or does not.
-    ///
-    /// This inverts the rule that was here an hour ago, and the inversion is
-    /// deliberate. The box existed to make a silent call checkable, and it did
-    /// the opposite: raw JSON arguments above a raw result envelope, the
-    /// loudest thing on screen for a tool that had said nothing. And a tool that
-    /// *had* spoken — the shell, `apply_patch` — got its output printed twice.
-    ///
-    /// The model is unaffected, which is the part that must not break: the
-    /// result is still archived as a `tool` message, so a failure the user
-    /// cannot see is still a failure the model can see and act on.
-    #[test]
-    fn a_tool_call_leaves_nothing_in_the_transcript_but_still_reaches_the_model() {
-        let render = |app: &mut App| {
-            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 12))
-                .expect("terminal");
-            terminal.draw(|frame| app.render(frame)).expect("draw");
-            let buf = terminal.backend().buffer();
-            (0..12)
-                .flat_map(|y| {
-                    (0..60).map(move |x| {
-                        buf.cell((x, y))
-                            .map(|c| c.symbol())
-                            .unwrap_or(" ")
-                            .to_string()
-                    })
-                })
-                .collect::<String>()
-        };
-
-        // A success, with a panel in the sink and without. Neither prints.
-        for drew in [true, false] {
-            let mut app = App::default();
-            let mut history = Vec::new();
-            let sink = agent::panels::PanelSink::default();
-            if drew {
-                // `Create` only registers the panel; the message appears on the
-                // first `Append`, so a sink holding a bare `Create` renders as
-                // an empty panel and would make this test pass for the wrong
-                // reason.
-                sink.push(agent::panels::PanelOp::Create {
-                    id: 1,
-                    title: "cat /etc/hostname".into(),
-                    boxed: true,
-                    conceal_box: false,
-                });
-                sink.push(agent::panels::PanelOp::Append {
-                    id: 1,
-                    text: "may-Legion-R9000P-AFR10H\n".into(),
-                });
-            }
-            fold_tool_outcome(
-                &mut app,
-                &mut history,
-                ToolOutcome {
-                    id: "call_1".into(),
-                    result: Ok((r#"{"ok":true,"result":{"n":3}}"#.into(), "{}".into())),
-                },
-                Some(&sink),
-                &mut Vec::new(),
-            );
-            assert_eq!(
-                history.len(),
-                1,
-                "the model reads the result back: {history:?}"
-            );
-            assert_eq!(history[0]["role"], "tool");
-            assert_eq!(history[0]["tool_call_id"], "call_1");
-            // The only thing on screen is what the tool drew — nothing else.
-            let screen = render(&mut app);
-            assert!(
-                !screen.contains("ok\":true") && !screen.contains("tool_call_id"),
-                "the result is not printed (drew={drew}):\n{screen}"
-            );
-            assert_eq!(
-                screen.contains("cat /etc/hostname"),
-                drew,
-                "the tool's own panel is the whole visual (drew={drew}):\n{screen}"
-            );
-        }
-
-        // A failure is silent too. The tool is in charge of saying so; this one
-        // chose not to, and the transcript honours that.
-        let mut app = App::default();
-        let mut history = Vec::new();
-        let sink = agent::panels::PanelSink::default();
-        fold_tool_outcome(
-            &mut app,
-            &mut history,
-            ToolOutcome {
-                id: "call_2".into(),
-                result: Err("the sandbox refused to start".into()),
-            },
-            Some(&sink),
-            &mut Vec::new(),
-        );
-        assert_eq!(history.len(), 1);
-        assert!(
-            history[0]["content"]
-                .as_str()
-                .is_some_and(|c| c.contains("the sandbox refused to start")),
-            "the model still learns it failed: {:?}",
-            history[0]
-        );
-        let screen = render(&mut app);
-        assert!(
-            !screen.contains("refused to start"),
-            "and the user is told nothing by the loop:\n{screen}"
-        );
     }
 }

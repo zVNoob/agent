@@ -388,7 +388,7 @@ fn trigger_queues_run_turn_commands_on_the_bound_channel() {
     let loop_channel = claim_trigger_channel();
     assert!(loop_channel.is_empty(), "a claimed channel starts empty");
 
-    // All three shapes a trigger argument can take.
+    // Both shapes a trigger argument can take.
     let lua = vm();
     apply_config_source(&lua, "").expect("driver");
 
@@ -396,10 +396,7 @@ fn trigger_queues_run_turn_commands_on_the_bound_channel() {
     let ok: bool = lua.load("return agent.trigger()").eval().expect("trigger");
     assert!(ok, "bound channel -> queued");
     match loop_channel.recv().expect("command") {
-        AgentCommand::RunTurn {
-            history: None,
-            user: None,
-        } => {}
+        AgentCommand::RunTurn { user: None } => {}
         other => panic!("continuation expected, got {other:?}"),
     }
 
@@ -410,43 +407,34 @@ fn trigger_queues_run_turn_commands_on_the_bound_channel() {
         .expect("trigger");
     assert!(ok);
     match loop_channel.recv().expect("command") {
-        AgentCommand::RunTurn {
-            history: None,
-            user: Some(u),
-        } => {
-            assert_eq!(u, "compact and continue")
-        }
+        AgentCommand::RunTurn { user: Some(u) } => assert_eq!(u, "compact and continue"),
         other => panic!("user message expected, got {other:?}"),
     }
 
-    // An array of messages: a history replacement — the write side.
-    let ok: bool = lua
+    // A message list is the *old* compaction form, and it is refused rather than
+    // quietly ignored: the conversation is `agent.history`, so a caller passing
+    // messages where a string belongs is about to compact wrongly — and silence
+    // would let a whole turn run on a history it never replaced.
+    let err = lua
         .load(
             "return agent.trigger({ {role='system', content='summary'}, \
                    {role='user', content='tail'} })",
         )
-        .eval()
-        .expect("trigger");
-    assert!(ok);
-    match loop_channel.recv().expect("command") {
-        AgentCommand::RunTurn {
-            history: Some(h),
-            user: None,
-        } => {
-            assert_eq!(h[0]["role"], "system");
-            assert_eq!(h[0]["content"], "summary");
-            assert_eq!(h[1]["role"], "user");
-            assert_eq!(h[1]["content"], "tail");
-        }
-        other => panic!("history replacement expected, got {other:?}"),
-    }
+        .eval::<mlua::Value>();
+    let err = err
+        .expect_err("a message list is the old compaction form")
+        .to_string();
+    assert!(
+        err.contains("agent.history"),
+        "the error names what to do instead: {err}"
+    );
 
-    // A non-array table and other argument types are rejected: agent.trigger
-    // must not silently turn a typo into a history wipe.
+    // Other argument types are rejected for the same reason: a typo must not
+    // become a silent no-op or a surprise continuation.
     let err = lua
         .load("return agent.trigger({role='system'})")
         .eval::<mlua::Value>();
-    assert!(err.is_err(), "an object is not a message array");
+    assert!(err.is_err(), "an object is neither a prompt nor nothing");
     let err = lua.load("return agent.trigger(42)").eval::<mlua::Value>();
     assert!(err.is_err(), "a number is not a prompt");
 }

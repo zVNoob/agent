@@ -15,6 +15,7 @@ use mlua::{Lua, Table};
 
 use crate::panels::{PaneInit, PanelOp, PanelSink, remember_label};
 
+use super::history::lua_history_append;
 use super::memory::{
     lua_memory_append, lua_memory_flush, lua_memory_latest, lua_memory_new, lua_memory_path,
 };
@@ -87,6 +88,7 @@ pub(super) fn install_api(
     api.set("memory_latest", lua.create_function(lua_memory_latest)?)?;
     api.set("memory_flush", lua.create_function(lua_memory_flush)?)?;
     api.set("memory_new", lua.create_function(lua_memory_new)?)?;
+    api.set("history_append", lua.create_function(lua_history_append)?)?;
     install_panel_primitives(lua, &api, &sink_slot)?;
     install_print(lua)?;
     crate::mcp::install_bridge(lua, &api)?;

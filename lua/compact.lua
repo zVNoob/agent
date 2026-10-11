@@ -11,12 +11,11 @@
 -- A long conversation is expensive to resend and hard for the model to hold, so
 -- compaction is the standard fix: replace the history with a summary plus the
 -- recent tail. The usual way to build one is a `turn_completed` handler that
--- summarizes the old part off to the side (`agent.http`) and hands the loop a
--- replacement history via `agent.trigger({ ... })`. This mode is the other half
--- of that trade: instead of a *side* model summarizing a window, the agent
--- itself reads the whole conversation and writes the summary — which is the only
--- thing here that can be worth its own turn, because it is the only actor that
--- has seen all of it.
+-- summarizes the old part off to the side (`agent.http`) and assigns the result
+-- to `agent.history`. This mode is the other half of that trade: instead of a
+-- *side* model summarizing a window, the agent itself reads the whole
+-- conversation and writes the summary — which is the only thing here that can be
+-- worth its own turn, because it is the only actor that has seen all of it.
 --
 -- The mode is therefore deliberately austere:
 --
@@ -31,12 +30,17 @@
 -- ## What it does *not* do
 --
 -- It does not rewrite the history. A mode is a prompt and a tool set; the
--- history lives in the agent loop, and only `agent.trigger` can replace it. So
--- the compaction turn ends with a summary *in the transcript*, and something
--- has to carry that summary forward — a `turn_completed` handler that pulls it
--- out and calls
+-- conversation is `agent.history`, and only a `turn_completed` handler can
+-- replace it. So the compaction turn ends with a summary *in the transcript* and
+-- *in the conversation* — the turn handler appends every message — and something
+-- has to carry that summary forward: a `turn_completed` handler that pulls the
+-- summary out of the last assistant message and assigns
 --
---   agent.trigger({ { role = "system", content = summary }, unpack(keep) })
+--   agent.history = { { role = "system", content = summary }, unpack(keep) }
+--
+-- That assignment is the whole write side of compaction: the messages it drops
+-- are already archived, and the summary replacing them must not be written twice,
+-- so it is deliberately *not* an append.
 --
 -- The handler is deliberately not written here: which messages to keep, how to
 -- pull the summary back out of the last assistant turn, and when a compaction is

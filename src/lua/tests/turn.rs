@@ -501,8 +501,9 @@ async fn drive_event(run: &mut EventRun<'_>, step: EventStep) {
 async fn the_shipped_turn_handler_drives_a_request_and_returns_the_turn() {
     // The whole Lua half of the main turn, as the loop drives it: fire the
     // "turn" event on the shipped configuration, and the registered handler
-    // (`agent.main_turn`) drives `agent.turn` on the payload's history and
-    // hands the assembled turn back as its return value.
+    // (`agent.main_turn`) reads the conversation out of `agent.history`, appends
+    // what the turn produced to it, and hands the assembled turn back as its
+    // return value.
     let body = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let sink = body.clone();
     let fake = FakeHttpServer::start(move |req| {
@@ -529,9 +530,10 @@ async fn the_shipped_turn_handler_drives_a_request_and_returns_the_turn() {
     let sink = crate::panels::PanelSink::continuing_from(0);
     install_sink(&vm, &sink).expect("install the sink");
 
-    let payload = serde_json::json!({
-        "history": [ { "role": "user", "content": "the question" } ]
-    });
+    // What `main` does at startup: seed the conversation from the replay, empty
+    // here. The user line arrives on the event, and the handler appends it.
+    seed_history(&vm, &[]).expect("seed the conversation");
+    let payload = serde_json::json!({ "text": "the question" });
     let (mut run, step) = EventRun::start(&vm, "turn", &payload)
         .expect("start")
         .expect("the shipped tree registers a turn handler");
@@ -564,13 +566,39 @@ async fn the_shipped_turn_handler_drives_a_request_and_returns_the_turn() {
         "reasoning comes back with the turn, for the log: {reasoning:?}"
     );
 
-    // And the request the handler sent is the conversation it was given, with
-    // the configured endpoint reached through the route — not a default.
+    // The conversation grew by exactly what the turn produced, in the protocol's
+    // order: the user's line, then the model's words. This is the half the loop
+    // cannot check — it never sees a message — so the handler is what must.
+    let history = history_json(&vm);
+    let roles: Vec<&str> = history.iter().filter_map(|m| m["role"].as_str()).collect();
+    assert_eq!(
+        roles,
+        ["user", "assistant"],
+        "the line and the answer, in order: {history:?}"
+    );
+    assert_eq!(history[0]["content"], "the question");
+    assert_eq!(history[1]["content"], "the answer");
+
+    // And the request the handler sent is that conversation, with the configured
+    // endpoint reached through the route — not a default.
     let sent = body.lock().unwrap().clone();
     assert!(
         sent.contains("the question"),
-        "the payload's history is what was sent: {sent}"
+        "the conversation is what was sent: {sent}"
     );
+}
+
+/// `agent.history` as JSON: what a Lua handler would see, read through the same
+/// bridge the loop's seeding uses.
+fn history_json(vm: &mlua::Lua) -> Vec<serde_json::Value> {
+    let agent: mlua::Table = vm.globals().get("agent").expect("agent");
+    let table: mlua::Table = agent.get("history").expect("agent.history");
+    let mut out = Vec::new();
+    for i in 1..=table.raw_len() {
+        let v: mlua::Value = table.raw_get(i).expect("a message is readable");
+        out.push(crate::mcp::lua_to_json(&v).expect("a message is data"));
+    }
+    out
 }
 
 #[test]

@@ -385,6 +385,7 @@
 
 mod bridge;
 mod config;
+mod history;
 mod memory;
 mod run;
 mod sandbox;
@@ -401,6 +402,7 @@ pub use config::{
     ensure_config, invoke_mcp_tool, invoke_mcp_tool_with_asks, invoke_tool, invoke_tool_asking,
     llm_config, load_config_file, mcps_tool_defs, system_prompt, verdict_to_lua,
 };
+pub use history::seed_history;
 pub use memory::{
     MemoryConfig, bind_memory, memory_append, memory_append_many, memory_config, memory_flush,
     memory_is_bound, memory_latest, memory_path,

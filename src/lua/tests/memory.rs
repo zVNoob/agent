@@ -140,6 +140,83 @@ fn memory_primitives_append_read_flush_path() {
         .eval()
         .expect("append to the new log");
     assert_eq!(seq, 1, "sequences restart with the new file");
+
+    // --- the two ways a conversation changes, and what each does to the log ---
+    //
+    // The rules are short — **append to add, assign to compact** — and the
+    // mistake is expensive in both directions: appending on compaction writes
+    // the summary to the log a second time, and growing the conversation without
+    // the log loses those messages on the next session. Pinned here, against a
+    // real log, rather than left to the shape of the code that calls it.
+    lua.load("agent.history = {}").exec().expect("start empty");
+
+    // The append: the conversation grows by one *and* the log does — same
+    // message, from the one call. Counted relative to what is already in this
+    // log ("fresh start" above is in it), because the point is the delta.
+    let before: usize = memory_latest(10).expect("read").len();
+    lua.load("agent.history_append({ role='user', content='the question' })")
+        .exec()
+        .expect("append");
+    let read = memory_latest(10).expect("read the log");
+    assert_eq!(
+        read.len(),
+        before + 1,
+        "an appended message is archived at once: {read:?}"
+    );
+    let logged: serde_json::Value =
+        serde_json::from_str(&read[read.len() - 1]).expect("a message is JSON");
+    assert_eq!(logged["role"], "user");
+    assert_eq!(logged["content"], "the question");
+    let len: usize = lua
+        .load("return #agent.history")
+        .eval()
+        .expect("history length");
+    assert_eq!(len, 1, "and the conversation grew by one");
+
+    // The compaction: the conversation is replaced, and the log is not. The
+    // dropped messages are already archived; the summary standing in for them
+    // must not be written twice, which is why compaction assigns.
+    lua.load("agent.history_append({ role='assistant', content='the answer' })")
+        .exec()
+        .expect("append the answer");
+    lua.load("agent.history = { { role='system', content='summary' } }")
+        .exec()
+        .expect("compact");
+    let conversation: String = lua
+        .load("return agent.api.json_encode(agent.history)")
+        .eval()
+        .expect("encode the conversation");
+    assert!(
+        conversation.contains("summary") && !conversation.contains("the question"),
+        "the compacted conversation is the summary alone: {conversation}"
+    );
+    let after_compact = memory_latest(10).expect("read the log");
+    assert_eq!(
+        after_compact.len(),
+        before + 2,
+        "the log still holds both conversation messages: {after_compact:?}"
+    );
+    assert!(
+        !after_compact.iter().any(|line| line.contains("summary")),
+        "and no summary was archived: {after_compact:?}"
+    );
+
+    // One more append after the compaction lands on top: the two stayed in step
+    // across the rewrite.
+    lua.load("agent.history_append({ role='user', content='next' })")
+        .exec()
+        .expect("append after compacting");
+    let tail = memory_latest(10).expect("read the log");
+    assert_eq!(
+        tail.len(),
+        before + 3,
+        "the next message is archived too: {tail:?}"
+    );
+    assert!(
+        tail[tail.len() - 1].contains("next"),
+        "and it is the newest: {tail:?}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

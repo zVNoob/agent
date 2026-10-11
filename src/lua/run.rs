@@ -278,18 +278,6 @@ pub(super) fn decode_await(yielded: mlua::Value) -> Result<EventStep, String> {
     }
 }
 
-/// `agent.trigger(...) -> boolean` — force the agent loop to run a new
-/// inference. With no argument: a continuation of the current conversation.
-/// With a string: the text behaves like a submitted user message. With an
-/// array of message tables: the array **replaces** the loop's in-memory
-/// history (the write side of compaction) before the turn runs — usually a
-/// summary message + the recent tail, exactly the "compacted history" a
-/// `turn_completed` handler computed from the event payload.
-///
-/// The command is queued on the loop's trigger channel (see
-/// [`AgentCommand`]) and the loop starts it at the next idle moment. Returns
-/// `true` when queued; `false` when no loop is bound to the channel (the
-/// headless probe, tests) so Lua can decide what that means.
 /// `agent.api.input_insert(text)` / `input_backspace()` / `input_clear()` — change
 /// the input line from Lua.
 ///
@@ -312,14 +300,22 @@ pub(super) fn lua_input_op(op: InputOp) -> mlua::Result<bool> {
     send_to_loop(AgentCommand::Input(op))
 }
 
+/// `agent.trigger(...) -> boolean` — force the agent loop to run a new
+/// inference. With no argument: a continuation of the current conversation (the
+/// model is asked again on the history as it stands). With a string: the text
+/// behaves like a submitted user message, which the `turn` handler appends to
+/// `agent.history`. To *replace* the conversation — a compaction — assign
+/// `agent.history` yourself; there is no list form, because the loop does not
+/// hold the conversation.
+///
+/// The command is queued on the loop's trigger channel (see
+/// [`AgentCommand`]) and the loop starts it at the next idle moment. Returns
+/// `true` when queued; `false` when no loop is bound to the channel (the
+/// headless probe, tests) so Lua can decide what that means.
 pub(super) fn lua_trigger(_: &Lua, args: mlua::MultiValue) -> mlua::Result<bool> {
     let cmd = match args.into_iter().next() {
-        None => AgentCommand::RunTurn {
-            history: None,
-            user: None,
-        },
+        None => AgentCommand::RunTurn { user: None },
         Some(mlua::Value::String(s)) => AgentCommand::RunTurn {
-            history: None,
             user: Some(s.to_str()?.to_string()),
         },
         Some(mlua::Value::Table(t)) => {
@@ -327,14 +323,19 @@ pub(super) fn lua_trigger(_: &Lua, args: mlua::MultiValue) -> mlua::Result<bool>
                 mlua::Error::RuntimeError(format!("agent.trigger: history decode: {e}"))
             })?;
             match json {
-                // The history replacement must be an array of messages.
-                serde_json::Value::Array(items) => AgentCommand::RunTurn {
-                    history: Some(items),
-                    user: None,
-                },
+                // The old third form handed the loop a replacement history. The
+                // conversation is Lua's now, so a compaction assigns
+                // `agent.history` directly and this is the shape that says so.
+                serde_json::Value::Array(_) => {
+                    return Err(mlua::Error::RuntimeError(
+                        "agent.trigger: the conversation is `agent.history` — assign it \
+                         directly (agent.history = { … }) instead of handing over a list"
+                            .into(),
+                    ));
+                }
                 other => {
                     return Err(mlua::Error::RuntimeError(format!(
-                        "agent.trigger: expected an array of messages, got {}",
+                        "agent.trigger: expected a string or nothing, got {}",
                         json_kind(&other)
                     )));
                 }
@@ -342,7 +343,7 @@ pub(super) fn lua_trigger(_: &Lua, args: mlua::MultiValue) -> mlua::Result<bool>
         }
         Some(v) => {
             return Err(mlua::Error::RuntimeError(format!(
-                "agent.trigger: expected nothing, a string, or an array of messages, got {}",
+                "agent.trigger: expected nothing or a string, got {}",
                 v.type_name()
             )));
         }
@@ -424,18 +425,18 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 /// consumes these on its idle select — the compaction primitives are how Lua
 /// drives the loop: `on_event("turn_completed")` hears that a turn finished
 /// (the conversation travels in the event payload, the **read** side), and
-/// `agent.trigger` starts the next inference, optionally carrying a replaced
-/// history (the **write** side).
+/// `agent.trigger` starts the next inference, optionally carrying a user line.
 #[derive(Debug, Clone)]
 pub enum AgentCommand {
-    /// Force a new inference now. `history` replaces the loop's in-memory
-    /// conversation before the turn runs (a compaction replacement, divided
-    /// into a summary message + recent tail); `user` behaves like a submitted
-    /// user message pushed onto the history. At most one of the two is set.
-    RunTurn {
-        history: Option<Vec<serde_json::Value>>,
-        user: Option<String>,
-    },
+    /// Force a new inference now. `user` behaves like a submitted user line:
+    /// the transcript records it and the `turn` handler appends it to the
+    /// conversation. `None` starts a turn nobody asked for — a continuation, or
+    /// the next step of a policy that decided it wants one.
+    ///
+    /// There is no replacement history here: the conversation is `agent.history`
+    /// (see [`crate::lua::seed_history`]), so compaction assigns that table
+    /// directly and there is nothing for the loop to swap in.
+    RunTurn { user: Option<String> },
     /// Change the input line: [`InputOp`].
     Input(InputOp),
 }

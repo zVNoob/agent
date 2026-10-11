@@ -378,7 +378,7 @@ fn context_pressure_arms_a_compaction_turn_and_lands_its_summary() {
         },
     );
     // Eight messages, so cutting a 6-message tail actually drops something.
-    let mut history: Vec<serde_json::Value> = (1..=4)
+    let history: Vec<serde_json::Value> = (1..=4)
         .flat_map(|i| {
             [
                 json!({ "role": "user", "content": format!("ask {i}") }),
@@ -387,12 +387,15 @@ fn context_pressure_arms_a_compaction_turn_and_lands_its_summary() {
         })
         .collect();
     let before = history.clone();
-    assert!(
-        fire_event_on_vm(&lua, "turn_completed", &json!({ "history": history })).expect("fire")
-    );
+    seed_conversation(&lua, &history);
+    fire_event_on_vm(&lua, "turn_completed", &json!({})).expect("fire");
     assert_eq!(queued(&lua).len(), 0, "plenty of room: nothing queued");
     assert_eq!(mode_current(&lua).as_deref(), Some("work"), "mode kept");
-    assert_eq!(history, before, "and the conversation is untouched");
+    assert_eq!(
+        conversation(&lua),
+        before,
+        "and the conversation is untouched"
+    );
     lua.load("QUEUED = {}").exec().expect("reset the queue");
 
     // Context pressure (20000 - 9000 = 11000 < 15000 headroom): the handler
@@ -405,9 +408,7 @@ fn context_pressure_arms_a_compaction_turn_and_lands_its_summary() {
             completion: Some(50),
         },
     );
-    assert!(
-        fire_event_on_vm(&lua, "turn_completed", &json!({ "history": history })).expect("fire")
-    );
+    fire_event_on_vm(&lua, "turn_completed", &json!({})).expect("fire");
     let asked = queued(&lua);
     assert_eq!(asked.len(), 1, "one queued command: {asked:?}");
     assert!(
@@ -431,26 +432,26 @@ fn context_pressure_arms_a_compaction_turn_and_lands_its_summary() {
 
     // The compaction turn runs and answers: the ask, then the summary. That
     // completion is the second event, and it is what must not re-arm (this
-    // request carried the whole history too).
+    // request carried the whole conversation too).
     lua.load("QUEUED = {}").exec().expect("reset the queue");
     let summary = "## Task\nship the feature\n\n## Next\nwrite the code";
     let mark = history.len();
-    history.push(json!({ "role": "user", "content": "Compact the conversation now…" }));
-    history.push(json!({ "role": "assistant", "content": summary }));
-    assert!(
-        fire_event_on_vm(&lua, "turn_completed", &json!({ "history": history })).expect("fire"),
-        "the summary's own completion"
-    );
-    let replaced = queued(&lua);
+    // What the turn handler appends as the compaction turn runs.
+    let mut grown = history.clone();
+    grown.push(json!({ "role": "user", "content": "Compact the conversation now…" }));
+    grown.push(json!({ "role": "assistant", "content": summary }));
+    seed_conversation(&lua, &grown);
+    fire_event_on_vm(&lua, "turn_completed", &json!({})).expect("fire");
     assert_eq!(
-        replaced.len(),
-        1,
-        "the replacement history is queued: {replaced:?}"
+        queued(&lua).len(),
+        0,
+        "a compaction assigns the conversation; it does not start another turn"
     );
-    let m = replaced[0]
-        .as_array()
-        .expect("a replacement history, not a message");
-    assert_eq!(m[0]["role"], "system", "the summary leads the new history");
+    let m = conversation(&lua);
+    assert_eq!(
+        m[0]["role"], "system",
+        "the summary leads the new conversation"
+    );
     assert_eq!(m[0]["content"], summary);
     assert_eq!(m.len(), 1 + 6, "the summary plus a 6-message tail: {m:?}");
     assert_eq!(
@@ -471,7 +472,7 @@ fn context_pressure_arms_a_compaction_turn_and_lands_its_summary() {
     assert_eq!(
         system_prompt(&lua).expect("prompt"),
         "WORK PROMPT",
-        "so the turn this starts runs in the restored mode"
+        "so the next turn runs in the restored mode"
     );
 
     // And it settles: the compacted history is small, so one more event
@@ -484,7 +485,7 @@ fn context_pressure_arms_a_compaction_turn_and_lands_its_summary() {
             completion: Some(20),
         },
     );
-    assert!(fire_event_on_vm(&lua, "turn_completed", &json!({ "history": m })).expect("fire"));
+    fire_event_on_vm(&lua, "turn_completed", &json!({})).expect("fire");
     assert_eq!(
         queued(&lua).len(),
         0,
@@ -510,8 +511,9 @@ fn compaction_is_off_without_a_context_size() {
             completion: Some(1),
         },
     );
+    seed_conversation(&lua, &[]);
     assert!(
-        fire_event_on_vm(&lua, "turn_completed", &json!({ "history": [] })).expect("fire"),
+        fire_event_on_vm(&lua, "turn_completed", &json!({})).expect("fire"),
         "the handler is registered"
     );
     assert_eq!(queued(&lua).len(), 0, "no window, no automatic compaction");
@@ -566,6 +568,27 @@ fn a_handler_may_yield_on_the_shared_vm_and_keep_its_state() {
         "AFTER THE WAIT",
         "a write made after the wait lands on the live config"
     );
+}
+
+/// `agent.history` as JSON — the conversation a compaction reads and writes.
+fn conversation(lua: &mlua::Lua) -> Vec<serde_json::Value> {
+    let json: String = lua
+        .load("return agent.api.json_encode(agent.history)")
+        .eval()
+        .expect("the conversation is encodable");
+    serde_json::from_str(&json).expect("conversation json")
+}
+
+/// Stand the conversation where a compaction handler finds it: `agent.history`
+/// is the whole contract now, so a test that used to pass history in the event
+/// payload puts it there.
+fn seed_conversation(lua: &mlua::Lua, messages: &[serde_json::Value]) {
+    let encoded = serde_json::to_string(messages).expect("messages encode");
+    lua.load(format!(
+        "agent.history = agent.api.json_decode({encoded:?})"
+    ))
+    .exec()
+    .expect("seed the conversation");
 }
 
 fn queued(lua: &mlua::Lua) -> Vec<serde_json::Value> {

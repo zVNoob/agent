@@ -579,6 +579,7 @@ use super::config::{
     ConfigOrigin, ConfigSource, apply_config_source, ensure_config, invoke_mcp_tool_with_asks,
     invoke_tool, invoke_tool_asking, llm_config, mcps_tool_defs, system_prompt, verdict_to_lua,
 };
+use super::history::seed_history;
 use super::memory::{
     bind_memory, memory_append_many, memory_config, memory_is_bound, memory_latest,
 };

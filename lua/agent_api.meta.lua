@@ -334,10 +334,31 @@ function agent.api.input_clear() end
 ---@return agent.Verdict
 function agent.api.ask_user(text, always) end
 
--- -- the conversation log ------------------------------------------------------
+-- -- the conversation ---------------------------------------------------------
 
----Append a message to the open log. A string is stored verbatim; a table is
----stored as JSON. Raises when nothing is open.
+---Add one message to the conversation: appended to `agent.history` *and*
+---archived to the open log, in that order, so a message cannot be in one and
+---missing from the other. With no log open the table is still the conversation
+---and only the archive is skipped.
+---
+---This is how a message joins the conversation — there is no other way in, and
+---nothing in Rust adds one. The `turn` handler appends the user's line, the
+---model's text, its tool calls, and each result, as they happen. **Compaction
+---is not an append**: it assigns `agent.history` a new list, because the
+---messages it drops are already in the log and the summary that replaces them
+---must not be written twice.
+---
+---The stored message is the JSON round trip of what was passed in, so what a
+---request reads back is exactly what the log holds.
+---@param msg table|string A message table, or its JSON.
+---@return integer The sequence number in the log (0 when no log is open).
+function agent.api.history_append(msg) end
+
+-- -- the conversation log ----------------------------------------------------
+
+---Append a message to the open log *without* touching the conversation. For
+---records that are not messages — a reasoning chunk, a panel op. Raises when
+---nothing is open.
 ---Prefer `agent.memory.append(message)`.
 ---@param msg string|table
 ---@return integer The sequence number it was filed under.

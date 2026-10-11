@@ -31,7 +31,7 @@ fn the_lua_ls_annotations_cover_exactly_the_bridge_once_each() {
     bridge.sort();
     assert_eq!(
         bridge.len(),
-        40,
+        41,
         "the bridge's size is part of the contract"
     );
 

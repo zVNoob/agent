@@ -121,6 +121,46 @@ function agent.memory.path()
   return agent.api.memory_path()
 end
 
+---Add one message to `agent.history` *and* archive it, in that order.
+---
+---The only way a message joins the conversation — see §3b. Distinct from
+---`agent.memory.append` above, which writes the log *without* touching the
+---conversation: that is for records that are not messages (a reasoning chunk, a
+---panel op), and it raises when no log is open.
+function agent.history_append(message)
+  return agent.api.history_append(message)
+end
+
+-- ===========================================================================
+-- 3b. THE CONVERSATION — `agent.history`
+-- ===========================================================================
+--
+-- `agent.history` is the current conversation: every message from the
+-- compaction point on, oldest first, as OpenAI message tables. It is where a
+-- turn reads from and where the messages of a turn are written, and it is the
+-- only copy the agent keeps — the log is the archive, not the working set.
+--
+-- Two rules, and the second is the one that surprises:
+--
+--   **To add a message, append it.** `agent.api.history_append(message)`
+--   (shorthand: `agent.history_append`) adds to this table *and* archives to
+--   the log, in that order, so a message cannot end up in one and missing from
+--   the other. Nothing else may add one: there is no list in Rust to push onto.
+--   (`agent.memory.append` is a different verb — log only, for records that are
+--   not messages.)
+--
+--   **To compact, assign it.** Compaction is not an append —
+--
+--     agent.history = { { role = "system", content = summary }, ...recent tail }
+--
+--   The messages it drops are already archived, and the summary that replaces
+--   them must not be written a second time. So a compaction is a plain
+--   assignment: no primitive, no round trip through the loop.
+--
+-- A resumed session starts from here too: the archived messages replayed at
+-- startup are seeded into this table once, before the first turn (§7).
+agent.history = agent.history or {}
+
 -- ===========================================================================
 -- 4. TOOLS  — what the agent can do
 -- ===========================================================================
@@ -429,30 +469,38 @@ end
 --
 --   agent.on_event("turn_completed", function(info) … end)
 --
--- `info.history` is the conversation the loop just finished — the **read** side
--- of compaction. To compact, summarize it (via `agent.http` against the same
--- endpoint, or a second model), rebuild a short history, and hand it back:
+-- The conversation is `agent.history` (§3b) — the handler reads it directly, so
+-- there is no payload to unpack. Compaction is two halves:
 --
---   agent.trigger({ { role = "system", content = summary }, ...tail })
+--   read    summarize the old part (via `agent.http` against the same endpoint,
+--           or a second model) and keep the recent tail;
+--   write   assign the result:
 --
--- which replaces the history — the **write** side — and immediately runs the
--- next inference. Composing the two is compaction, and there is one trap in it:
--- every triggered turn also ends, so a handler that compacts unconditionally
--- re-triggers itself forever. Stop when the history is short enough, which is
--- what the automatic handler below does with a `state` flag.
+--             agent.history = { { role = "system", content = summary }, ...tail }
+--
+-- An assignment, not an append — §3b says why, and it is the one rule a
+-- compaction gets wrong by accident.
+--
+-- Composing the two is compaction, and there is one trap in it: a compaction
+-- *turn* (the `compact` mode below, which asks the agent to write its own
+-- summary) also ends, so a handler that compacts unconditionally re-triggers
+-- itself forever. Stop when the conversation is short enough, which is what the
+-- automatic handler below does with a `state` flag.
 --
 -- Three events fire today, and they are not the same kind of thing.
 --
 --   "turn"            a request. Fired when the user submits a line and when
---                     `agent.trigger` forces an inference. The handler is
---                     given the conversation and drives the whole turn —
---                     requests *and* the tool loop between them, suspending
---                     on `agent.await_tools(turn)` while the loop runs each
---                     round — and its return value *is* the turn's final
---                     answer. The handler below (`agent.main_turn`, from
---                     lua/lib/main_turn.lua) is what runs every turn you
---                     watch. Unregister it and the loop falls back to driving
---                     the request itself.
+--                     `agent.trigger` forces an inference. `ev.text` is the
+--                     user's line (nil for a forced turn), and the handler is
+--                     the one that appends it to `agent.history`. It drives the
+--                     whole turn — requests *and* the tool loop between them,
+--                     suspending on `agent.await_tools(turn)` while the loop
+--                     runs each round — appending every message to the
+--                     conversation as it goes, and its return value *is* the
+--                     turn's final answer. The handler below
+--                     (`agent.main_turn`, from lua/lib/main_turn.lua) is what
+--                     runs every turn you watch. Unregister it and nothing can
+--                     run a turn: the loop holds no conversation of its own.
 --
 --   "turn_completed"  a notification. The handler is told what happened and its
 --                     return value is ignored. This section's own handler.
@@ -517,17 +565,16 @@ local function last_assistant(history)
   return nil
 end
 
-agent.on_event("turn_completed", function(info)
+agent.on_event("turn_completed", function()
   local state = agent._compaction
-  local history = (type(info) == "table" and type(info.history) == "table")
-      and info.history or {}
+  local history = agent.history
   local window = tonumber(agent.llm.context_size)
   if not window then return end  -- no window configured: never compact
 
   -- Step 1: the conversation is close enough to the limit. Arm the compaction
   -- turn, remembering how long the conversation was *now* — that count is where
-  -- the new history is cut, so the tail stops before the compaction turn itself
-  -- and the summary cannot land in the new history twice.
+  -- the compacted list is cut, so the tail stops before the compaction turn
+  -- itself and the summary cannot land in the new conversation twice.
   if state.state == "idle" then
     local used = tonumber(agent.llm.usage.prompt) or 0
     if used + COMPACT_HEADROOM < window then return end
@@ -539,13 +586,12 @@ agent.on_event("turn_completed", function(info)
   end
 
   -- Step 2: the compaction turn finished. Its summary replaces everything
-  -- before the recent tail, and the mode that was in force comes back — both
-  -- *before* the trigger, so the turn this starts runs in it.
+  -- before the recent tail, and the mode that was in force comes back.
   --
   -- A turn's own completion fires this handler again, which is why the arming
   -- step above checks the state rather than re-arming: the check alone is not
   -- enough, because the compaction turn's own request carries the whole
-  -- history, so its `usage.prompt` is as large as the one that triggered it.
+  -- conversation, so its `usage.prompt` is as large as the one that triggered it.
   if state.state == "armed" then
     local mark = state.mark or #history
     state.state, state.mark = "idle", nil
@@ -553,13 +599,17 @@ agent.on_event("turn_completed", function(info)
     state.mode = nil
     local summary = last_assistant(history)
     if summary == nil then
-      return  -- nothing landed; leave the history alone
+      return  -- nothing landed; leave the conversation alone
     end
     local keep = {}
     for i = math.max(1, mark - COMPACT_KEEP + 1), mark do
       keep[#keep + 1] = history[i]
     end
-    agent.trigger({ { role = "system", content = summary }, unpack(keep) })
+    -- The write side, and it is an assignment rather than an append: the
+    -- dropped messages are already in the log, and the summary standing in for
+    -- them must not be written a second time. No `agent.trigger` — this turn
+    -- is over already; the next one reads the compacted conversation.
+    agent.history = { { role = "system", content = summary }, unpack(keep) }
   end
 end)
 
