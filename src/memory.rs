@@ -171,6 +171,12 @@ impl Memory {
             write_header(&mut f)?;
         } else {
             verify_header(&mut f, len)?;
+            // Back to the end, or the next block lands wherever the header check
+            // left the cursor. `verify_header` reads 8 bytes, so without this a
+            // *resumed* session sealed its first block at offset 8 — on top of
+            // the previous session's, silently: same file, same length, one
+            // session's scrollback replaced by the next one's first message.
+            f.seek(SeekFrom::End(0))?;
         }
         Ok(Self {
             path,
@@ -961,5 +967,51 @@ mod tests {
             "expected >=4x compression: raw={raw_messages} on_disk={on_disk}"
         );
         std::fs::remove_file(&p).ok();
+    }
+
+    /// Reopening a log appends to it. The failure this pins is silent and
+    /// total: without seeking back to the end, the next block is sealed wherever
+    /// the header check left the cursor — offset 8 — so a *resumed* session's
+    /// first write lands on top of the previous session's first block, and the
+    /// file's length never changes to show it.
+    #[test]
+    fn reopening_a_log_appends_to_it_rather_than_overwriting_it() {
+        let path = unique_path("reopen-appends");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut m = Memory::open(&path).expect("open");
+            for i in 0..3 {
+                m.append(&format!("{{\"session\":1,\"n\":{i}}}"))
+                    .expect("append");
+            }
+            m.flush().expect("flush");
+        }
+        let size_before = std::fs::metadata(&path).expect("stat").len();
+        {
+            let mut m = Memory::open(&path).expect("reopen");
+            m.append("{\"session\":2,\"n\":0}").expect("append");
+            m.flush().expect("flush");
+        }
+        let size_after = std::fs::metadata(&path).expect("stat").len();
+        assert!(
+            size_after > size_before,
+            "the second session's block was added, not written over: \
+             {size_before} -> {size_after}"
+        );
+        let tail = read_tail(&path, 10).expect("read back");
+        assert_eq!(
+            tail.len(),
+            4,
+            "every session's records are in the log: {tail:?}"
+        );
+        assert!(
+            tail[0].contains("\"session\":1"),
+            "the earlier session's first record survives: {tail:?}"
+        );
+        assert!(
+            tail[3].contains("\"session\":2"),
+            "and the new one is last: {tail:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
